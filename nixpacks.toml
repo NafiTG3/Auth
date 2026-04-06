@@ -1,8 +1,5 @@
 [phases.setup]
-nixPkgs = ["python311", "zbar"]
+nixPkgs = ["python311", "python311Packages.pip", "zbar"]
 
 [phases.install]
-cmds = ["python -m pip install -r requirements.txt"]
-
-[start]
-cmd = "python bot.py"
+cmds = ["pip install -r requirements.txt"]
