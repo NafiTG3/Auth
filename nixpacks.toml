@@ -1,5 +1,5 @@
 [phases.setup]
-nixPkgs = ["zbar"]
+nixPkgs = ["python3", "zbar"]
 
 [phases.install]
-cmds = ["python3 -m ensurepip --upgrade", "python3 -m pip install -r requirements.txt"]
+cmds = ["pip install -r requirements.txt"]
