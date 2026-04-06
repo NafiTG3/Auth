@@ -1,5 +1,5 @@
 [phases.setup]
-nixPkgs = ["zbar", "libzbar0"]
+nixPkgs = ["zbar"]
 
 [phases.install]
 cmds = ["pip install -r requirements.txt"]
