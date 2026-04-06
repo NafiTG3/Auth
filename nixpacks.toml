@@ -1,6 +1,5 @@
-toml
 [phases.setup]
 nixPkgs = ["zbar"]
 
 [phases.install]
-cmds = ["python3 -m ensurepip", "python3 -m pip install -r requirements.txt"]
+cmds = ["python3 -m ensurepip --upgrade", "python3 -m pip install -r requirements.txt"]
