@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
     EXPORT_PW1_INPUT, EXPORT_PW2_INPUT,
     IMPORT_FILE_WAIT, IMPORT_PW_INPUT,
     TZ_INPUT,
-) = range(29)   # FIXED: was 30, now 29
+) = range(29)   # fixed
 
 DB_PATH     = os.environ.get("DB_PATH", "auth.db")
 SERVER_KEY  = os.environ.get("ENCRYPTION_KEY", "").encode()
@@ -212,7 +212,13 @@ def find_user_by_id_or_vault(raw: str):
             return c.execute("SELECT * FROM users WHERE telegram_id=?", (int(raw),)).fetchone()
     return None
 
+# FIX: Only update tg_name if the logged-in user is the actual owner
 def update_tg_name(vault_id: str, tg_user):
+    u = get_user(vault_id)
+    if not u: return
+    # Only update if the Telegram user ID matches the vault owner's ID
+    if tg_user.id != u["telegram_id"]:
+        return
     name = ((tg_user.first_name or "") + " " + (tg_user.last_name or "")).strip()
     if name:
         with get_db() as c:
@@ -285,10 +291,11 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if vault:
         u = get_user(vault)
         if u:
-            update_tg_name(vault, update.effective_user)
-            name = update.effective_user.first_name or u["tg_name"] or "User"
+            update_tg_name(vault, update.effective_user)  # will only update if owner
+            # Show name from stored owner name if available
+            display_name = u["tg_name"] if u["tg_name"] else update.effective_user.first_name or "User"
             await update.message.reply_text(
-                f"👋 Welcome back, *{em(name)}*\\!\n\nChoose an option:",
+                f"👋 Welcome back, *{em(display_name)}*\\!\n\nChoose an option:",
                 parse_mode="MarkdownV2", reply_markup=kb_main())
             return TOTP_MENU
     await update.message.reply_text(
@@ -429,12 +436,15 @@ async def login_pw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             parse_mode="MarkdownV2", reply_markup=kb_cancel())
         return LOGIN_PASSWORD
     set_session(uid, vid)
-    update_tg_name(vid, update.effective_user)
+    # Only update tg_name if this login is from the actual owner
+    if uid == u["telegram_id"]:
+        update_tg_name(vid, update.effective_user)
     ctx.user_data["password"] = pw
     ctx.user_data["vault_id"] = vid
-    name = update.effective_user.first_name or u["tg_name"] or "User"
+    # Show owner's name from stored data
+    owner_name = u["tg_name"] if u["tg_name"] else "User"
     await update.message.reply_text(
-        f"✅ *Logged in\\!* Welcome, *{em(name)}*\\.",
+        f"✅ *Logged in\\!* Welcome to vault of *{em(owner_name)}*\\.",
         parse_mode="MarkdownV2", reply_markup=kb_main())
     return TOTP_MENU
 
@@ -461,7 +471,7 @@ async def reset_id_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     otp = gen_otp()
     store_otp(vid, otp)
     ctx.user_data["reset_vid"] = vid
-    # Send OTP to the vault owner's Telegram ID (u["telegram_id"])
+    # Send OTP to vault owner's Telegram ID
     owner_tid = u["telegram_id"]
     bot = ctx.bot
     try:
@@ -543,23 +553,28 @@ async def settings_reset_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not vault:
         await q.edit_message_text("Session expired\\.", parse_mode="MarkdownV2", reply_markup=kb_auth())
         return AUTH_MENU
+    u = get_user(vault)
+    if not u:
+        await q.edit_message_text("User not found\\.", parse_mode="MarkdownV2", reply_markup=kb_main())
+        return TOTP_MENU
+    # Always send OTP to the vault owner's Telegram ID (not necessarily the logged-in user)
+    owner_tid = u["telegram_id"]
     otp = gen_otp()
     store_otp(vault, otp)
-    # Send OTP to the logged-in user's own Telegram (they are the owner)
     bot = ctx.bot
     try:
         await bot.send_message(
-            chat_id=uid,
+            chat_id=owner_tid,
             text=f"🔐 *Password Reset OTP*\n\nYour one\\-time code: `{otp}`\n\n⏱ Valid for *60 seconds*\\.",
             parse_mode="MarkdownV2"
         )
         await q.edit_message_text(
-            "✅ *OTP sent to your Telegram account\\!*\n\nEnter the OTP here:",
+            "✅ *OTP sent to the vault owner's Telegram account\\!*\n\nEnter the OTP here:",
             parse_mode="MarkdownV2", reply_markup=kb_cancel())
     except Exception as e:
-        logger.error(f"Settings reset OTP send failed: {e}")
+        logger.error(f"Settings reset OTP send failed to {owner_tid}: {e}")
         await q.edit_message_text(
-            "⚠️ *Failed to send OTP*\\. Please /start the bot again\\.",
+            "⚠️ *Failed to send OTP*\\. The vault owner must /start the bot first\\.",
             parse_mode="MarkdownV2", reply_markup=kb_cancel())
         return TOTP_MENU
     return SETTINGS_RESET_OTP
@@ -635,10 +650,11 @@ async def settings_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         parse_mode="MarkdownV2", reply_markup=kb_settings())
     return TOTP_MENU
 
-# ── PROFILE ─────────────────────────────────────────────────
+# ── PROFILE (FIX: always show owner's name and Telegram ID) ──
 async def show_profile(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
-    uid   = update.effective_user.id; vault = get_session(uid)
+    uid = update.effective_user.id
+    vault = get_session(uid)
     if not vault:
         await q.edit_message_text("Session expired\\. /start", parse_mode="MarkdownV2", reply_markup=kb_auth())
         return AUTH_MENU
@@ -646,20 +662,20 @@ async def show_profile(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not u:
         await q.edit_message_text("⚠️ Profile not found\\.", parse_mode="MarkdownV2", reply_markup=kb_main())
         return TOTP_MENU
-    live = ((update.effective_user.first_name or "") + " " + (update.effective_user.last_name or "")).strip()
-    if live: update_tg_name(vault, update.effective_user); name = live
-    else: name = u["tg_name"] or "Unknown"
+    # Always show owner's data from database
+    owner_name = u["tg_name"] if u["tg_name"] else "Unknown"
+    owner_tid = u["telegram_id"]
     tz = u["timezone"] or "UTC"
     with get_db() as c:
         cnt = c.execute("SELECT COUNT(*) as n FROM totp_accounts WHERE vault_id=?", (vault,)).fetchone()["n"]
     text = (
-        f"👤 *Profile*\n\n"
-        f"*Name:* {em(name)}\n\n"
-        f"*Telegram ID:*\n`{u['telegram_id']}`\n\n"
+        f"👤 *Vault Owner Profile*\n\n"
+        f"*Owner Name:* {em(owner_name)}\n\n"
+        f"*Owner Telegram ID:*\n`{owner_tid}`\n\n"
         f"*BV Vault ID:*\n`{em(vault)}`\n\n"
         f"*TOTP Accounts:* {cnt}\n\n"
         f"*Timezone:* {em(tz)}\n\n"
-        f"*Created:*\n{em(fmt_time(u['created_at'], tz))}"
+        f"*Account Created:*\n{em(fmt_time(u['created_at'], tz))}"
     )
     await q.edit_message_text(text, parse_mode="MarkdownV2",
         reply_markup=InlineKeyboardMarkup([
