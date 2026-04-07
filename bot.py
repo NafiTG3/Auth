@@ -480,10 +480,12 @@ async def handle_add_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 parse_mode="MarkdownV2", reply_markup=kb_cancel())
             return ADD_WAITING
     text = update.message.text.strip()
+
     if text.lower() == "manual":
         await update.message.reply_text("⌨️ Enter *account name*:",
             parse_mode="MarkdownV2", reply_markup=kb_cancel())
         return ADD_MANUAL_NAME
+
     if text.startswith("otpauth://"):
         try: await update.message.delete()
         except: pass
@@ -493,8 +495,30 @@ async def handle_add_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 parse_mode="MarkdownV2", reply_markup=kb_cancel())
             return ADD_WAITING
         return await _save_totp(update, vault, data, pw)
+
+    # Auto-detect Base32 secret — works with spaces, dashes, no separator
+    ok, cleaned = validate_secret(text)
+    if ok and len(cleaned) >= 8:
+        try:
+            totp_now(cleaned)
+            try: await update.message.delete()
+            except: pass
+            ctx.user_data["pending_name_for_secret"] = cleaned
+            await update.message.reply_text(
+                "✅ *Secret key detected\\!*\n\n"
+                "Enter an *account name* for this TOTP:\n"
+                "_Example: GitHub, Google, Discord_",
+                parse_mode="MarkdownV2", reply_markup=kb_cancel())
+            return ADD_MANUAL_NAME
+        except Exception:
+            pass
+
     await update.message.reply_text(
-        "⚠️ Send QR image, `otpauth://` URI, or type `manual`\\.",
+        "⚠️ *Could not recognize input\\.* Please:\n\n"
+        "📷 Send a *QR code image*\n"
+        "🔗 Paste an `otpauth://` URI\n"
+        "🔑 Paste your *Base32 secret key* directly\n"
+        "⌨️ Type `manual` to enter step by step",
         parse_mode="MarkdownV2", reply_markup=kb_cancel())
     return ADD_WAITING
 
@@ -503,6 +527,12 @@ async def handle_manual_name(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not name:
         await update.message.reply_text("⚠️ Name cannot be empty\\.", parse_mode="MarkdownV2")
         return ADD_MANUAL_NAME
+    # If secret was already detected (auto-detect flow), save directly
+    preloaded_secret = ctx.user_data.pop("pending_name_for_secret", None)
+    if preloaded_secret:
+        uid = update.effective_user.id
+        vault = get_session(uid); pw = ctx.user_data.get("password")
+        return await _save_totp(update, vault, {"name": name, "issuer": "", "secret": preloaded_secret}, pw)
     ctx.user_data["pending_name"] = name
     await update.message.reply_text(
         f"✅ Name: *{em(name)}*\n\n"
