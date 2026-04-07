@@ -205,12 +205,11 @@ def mark_otp_used(vault_id: str):
 
 # ── Rate limiting for password reset ───────────────────────
 def record_reset_attempt(vault_id: str) -> bool:
-    """Returns True if account is now frozen."""
     now = int(time.time())
     with get_db() as c:
         row = c.execute("SELECT attempts, frozen_until FROM reset_attempts WHERE vault_id=?", (vault_id,)).fetchone()
         if row and row["frozen_until"] > now:
-            return True  # already frozen
+            return True
         attempts = (row["attempts"] if row else 0) + 1
         frozen_until = 0
         if attempts >= MAX_RESET_ATTEMPTS:
@@ -240,12 +239,10 @@ def get_freeze_remaining(vault_id: str) -> int:
 
 # ── Login alert system ─────────────────────────────────────
 async def send_login_alert(bot, owner_id: int, vault_id: str, new_telegram_id: int, new_username: str):
-    """Send alert to vault owner about new login."""
     now = int(time.time())
     alert_id = f"{vault_id}_{now}"
-    # Prepare message
     dt = datetime.datetime.fromtimestamp(now)
-    tz = "UTC"  # owner's timezone not known here, use UTC
+    tz = "UTC"
     time_str = dt.strftime("%I:%M %p, %d %b %Y") + " (GMT+0)"
     text = (
         f"⚠️ *New Login Detected*\n\n"
@@ -264,7 +261,6 @@ async def send_login_alert(bot, owner_id: int, vault_id: str, new_telegram_id: i
             c.execute("INSERT INTO login_alerts (alert_id, owner_id, vault_id, message_id, chat_id, created_at) VALUES (?,?,?,?,?,?)",
                       (alert_id, owner_id, vault_id, msg.message_id, owner_id, now))
             c.commit()
-        # Schedule auto-delete after 72 hours
         async def delete_alert():
             await asyncio.sleep(ALERT_VISIBLE_HOURS * 3600)
             try:
@@ -279,21 +275,18 @@ async def send_login_alert(bot, owner_id: int, vault_id: str, new_telegram_id: i
         logger.error(f"Failed to send login alert to owner {owner_id}: {e}")
 
 async def handle_alert_ack(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """User clicked 'It's me' – just delete the alert message."""
     q = update.callback_query
     await q.answer("Acknowledged. No action taken.")
     try:
         await q.message.delete()
     except:
         pass
-    # Remove from DB
     alert_id = q.data.split("_")[2]
     with get_db() as c:
         c.execute("DELETE FROM login_alerts WHERE alert_id=?", (alert_id,))
         c.commit()
 
 async def handle_alert_logout(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """User clicked 'Not me' – log out all sessions for that vault."""
     q = update.callback_query
     await q.answer("Logging out all sessions...")
     alert_id = q.data.split("_")[2]
@@ -303,12 +296,10 @@ async def handle_alert_logout(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await q.edit_message_text("Alert expired or already processed.")
             return
         vault_id = row["vault_id"]
-        # Delete all sessions for this vault
         c.execute("DELETE FROM sessions WHERE vault_id=?", (vault_id,))
         c.execute("DELETE FROM login_alerts WHERE alert_id=?", (alert_id,))
         c.commit()
     await q.edit_message_text("✅ All sessions have been logged out. You may now change your password if needed.")
-    # Optionally notify the intruder? Not needed.
 
 # ── Session ─────────────────────────────────────────────────
 def get_session(tid):
@@ -562,9 +553,7 @@ async def login_pw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Wrong password\\. Try again:",
             parse_mode="MarkdownV2", reply_markup=kb_cancel())
         return LOGIN_PASSWORD
-    # Check if this login is from a different Telegram account than the owner
     if uid != u["telegram_id"]:
-        # Send alert to owner
         new_username = update.effective_user.username or str(uid)
         await send_login_alert(ctx.bot, u["telegram_id"], vid, uid, new_username)
     set_session(uid, vid)
@@ -598,7 +587,6 @@ async def reset_id_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             parse_mode="MarkdownV2", reply_markup=kb_cancel())
         return RESET_ID_INPUT
     vid = u["vault_id"]
-    # Check if account is frozen for password reset
     if is_reset_frozen(vid):
         remaining = get_freeze_remaining(vid)
         hours = remaining // 3600
@@ -637,7 +625,6 @@ async def reset_otp_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     except: pass
     vid = ctx.user_data.get("reset_vid")
     if not verify_otp(vid, otp):
-        # Record failed attempt
         frozen = record_reset_attempt(vid)
         if frozen:
             remaining = get_freeze_remaining(vid)
@@ -649,8 +636,6 @@ async def reset_otp_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             ctx.user_data.pop("reset_vid", None)
             return AUTH_MENU
         else:
-            attempts_left = MAX_RESET_ATTEMPTS - (record_reset_attempt(vid) is not True? We need to fetch attempts. Let's simplify.
-            # We'll fetch attempts count
             with get_db() as c:
                 row = c.execute("SELECT attempts FROM reset_attempts WHERE vault_id=?", (vid,)).fetchone()
                 attempts = row["attempts"] if row else 0
@@ -659,7 +644,6 @@ async def reset_otp_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 f"❌ *Invalid or expired OTP\\.* {left} attempt\\(s\\) remaining before freeze\\.",
                 parse_mode="MarkdownV2", reply_markup=kb_cancel())
         return RESET_OTP_INPUT
-    # Success: clear reset attempts
     reset_attempts_clear(vid)
     mark_otp_used(vid)
     ctx.user_data["reset_otp_verified"] = True
@@ -743,7 +727,6 @@ async def settings_reset_otp(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     except: pass
     uid   = update.effective_user.id; vault = get_session(uid)
     if not verify_otp(vault, otp):
-        # Record failed attempt for settings reset as well
         frozen = record_reset_attempt(vault)
         if frozen:
             remaining = get_freeze_remaining(vault)
@@ -939,7 +922,6 @@ async def change_pw_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     return TOTP_MENU
 
 # ── ADD TOTP ────────────────────────────────────────────────
-# (unchanged, keep as is from previous working version)
 async def add_totp_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
     if not get_session(update.effective_user.id):
@@ -1238,7 +1220,6 @@ async def export_pw2_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         caption="🔒 *BlockVeil Encrypted Vault Backup*\n\nImport with 📥 Import Vault\\.\nShare the *file encryption password* with the importer\\.\n\n_This file will be deleted in 60 seconds_\\.",
         parse_mode="MarkdownV2")
     await update.message.reply_text("\u2705 *Vault exported\\!*", parse_mode="MarkdownV2", reply_markup=kb_main())
-    # Auto-delete after 60 seconds
     async def delete_vault_file():
         await asyncio.sleep(60)
         try: await msg.delete()
@@ -1316,7 +1297,7 @@ async def import_pw_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         parse_mode="MarkdownV2", reply_markup=kb_main())
     return TOTP_MENU
 
-# ── DELETE ACCOUNT (with password verification) ──────────────
+# ── DELETE ACCOUNT (with owner notification) ────────────────
 async def delete_account_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
     if not get_session(update.effective_user.id):
@@ -1365,6 +1346,15 @@ async def delete_account_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
         return TOTP_MENU
     uid = update.effective_user.id
     vault = get_session(uid)
+    if not vault:
+        await update.message.reply_text("No active session.", parse_mode="MarkdownV2", reply_markup=kb_auth())
+        return AUTH_MENU
+    # Get owner info before deletion
+    owner_id = None
+    with get_db() as c:
+        row = c.execute("SELECT telegram_id FROM users WHERE vault_id=?", (vault,)).fetchone()
+        if row:
+            owner_id = row["telegram_id"]
     if vault and ctx.user_data.get("delete_verified"):
         with get_db() as c:
             c.execute("DELETE FROM totp_accounts WHERE vault_id=?", (vault,))
@@ -1374,6 +1364,17 @@ async def delete_account_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
             c.execute("DELETE FROM sessions WHERE telegram_id=?", (uid,))
             c.commit()
     ctx.user_data.clear()
+    # Send notification to owner if owner exists and not the current user? But owner might be the one deleting.
+    if owner_id:
+        try:
+            bot = ctx.bot
+            await bot.send_message(
+                chat_id=owner_id,
+                text=f"🗑 *Account Deleted*\n\nYour vault `{vault}` has been permanently deleted.\nAll TOTP data has been erased.\n\nIf you did not perform this action, please contact support immediately.",
+                parse_mode="MarkdownV2"
+            )
+        except Exception as e:
+            logger.error(f"Failed to notify owner {owner_id} of deletion: {e}")
     await update.message.reply_text(
         "🗑 *Account permanently deleted\\.* All data has been removed\\.",
         parse_mode="MarkdownV2", reply_markup=kb_auth())
