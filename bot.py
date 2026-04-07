@@ -31,12 +31,16 @@ logger = logging.getLogger(__name__)
     EXPORT_PW1_INPUT, EXPORT_PW2_INPUT,
     IMPORT_FILE_WAIT, IMPORT_PW_INPUT,
     TZ_INPUT,
-) = range(30)   # removed private key states
+) = range(30)
 
 DB_PATH     = os.environ.get("DB_PATH", "auth.db")
 SERVER_KEY  = os.environ.get("ENCRYPTION_KEY", "").encode()
 PBKDF2_ITER = 1_000_000
 OTP_TTL     = 60
+MAX_RESET_ATTEMPTS = 3
+FREEZE_HOURS = 18
+ALERT_VISIBLE_HOURS = 72
+BUTTON_VALID_HOURS = 12
 
 # ── DB ─────────────────────────────────────────────────────
 def get_db():
@@ -73,6 +77,17 @@ def init_db():
             otp        TEXT    NOT NULL,
             expires_at INTEGER NOT NULL,
             used       INTEGER DEFAULT 0)""")
+        c.execute("""CREATE TABLE IF NOT EXISTS reset_attempts (
+            vault_id   TEXT PRIMARY KEY,
+            attempts   INTEGER DEFAULT 0,
+            frozen_until INTEGER DEFAULT 0)""")
+        c.execute("""CREATE TABLE IF NOT EXISTS login_alerts (
+            alert_id   TEXT PRIMARY KEY,
+            owner_id   INTEGER NOT NULL,
+            vault_id   TEXT NOT NULL,
+            message_id INTEGER NOT NULL,
+            chat_id    INTEGER NOT NULL,
+            created_at INTEGER NOT NULL)""")
         for col, defval in [("tg_name","''"), ("timezone","'UTC'")]:
             try:
                 c.execute(f"ALTER TABLE users ADD COLUMN {col} TEXT DEFAULT {defval}")
@@ -187,6 +202,113 @@ def verify_otp(vault_id: str, otp: str) -> bool:
 def mark_otp_used(vault_id: str):
     with get_db() as c:
         c.execute("UPDATE reset_otps SET used=1 WHERE vault_id=?", (vault_id,)); c.commit()
+
+# ── Rate limiting for password reset ───────────────────────
+def record_reset_attempt(vault_id: str) -> bool:
+    """Returns True if account is now frozen."""
+    now = int(time.time())
+    with get_db() as c:
+        row = c.execute("SELECT attempts, frozen_until FROM reset_attempts WHERE vault_id=?", (vault_id,)).fetchone()
+        if row and row["frozen_until"] > now:
+            return True  # already frozen
+        attempts = (row["attempts"] if row else 0) + 1
+        frozen_until = 0
+        if attempts >= MAX_RESET_ATTEMPTS:
+            frozen_until = now + FREEZE_HOURS * 3600
+        c.execute("INSERT OR REPLACE INTO reset_attempts (vault_id, attempts, frozen_until) VALUES (?,?,?)",
+                  (vault_id, attempts, frozen_until))
+        c.commit()
+        return frozen_until > now
+
+def reset_attempts_clear(vault_id: str):
+    with get_db() as c:
+        c.execute("DELETE FROM reset_attempts WHERE vault_id=?", (vault_id,)); c.commit()
+
+def is_reset_frozen(vault_id: str) -> bool:
+    with get_db() as c:
+        row = c.execute("SELECT frozen_until FROM reset_attempts WHERE vault_id=?", (vault_id,)).fetchone()
+        if row and row["frozen_until"] > int(time.time()):
+            return True
+    return False
+
+def get_freeze_remaining(vault_id: str) -> int:
+    with get_db() as c:
+        row = c.execute("SELECT frozen_until FROM reset_attempts WHERE vault_id=?", (vault_id,)).fetchone()
+        if row and row["frozen_until"] > int(time.time()):
+            return row["frozen_until"] - int(time.time())
+    return 0
+
+# ── Login alert system ─────────────────────────────────────
+async def send_login_alert(bot, owner_id: int, vault_id: str, new_telegram_id: int, new_username: str):
+    """Send alert to vault owner about new login."""
+    now = int(time.time())
+    alert_id = f"{vault_id}_{now}"
+    # Prepare message
+    dt = datetime.datetime.fromtimestamp(now)
+    tz = "UTC"  # owner's timezone not known here, use UTC
+    time_str = dt.strftime("%I:%M %p, %d %b %Y") + " (GMT+0)"
+    text = (
+        f"⚠️ *New Login Detected*\n\n"
+        f"Your vault `{vault_id}` was accessed from a different Telegram account.\n"
+        f"*New login:* @{new_username} (ID: `{new_telegram_id}`)\n"
+        f"*Time:* {time_str}\n\n"
+        f"If this was you, click 'It\\'s me'. Otherwise, click 'Not me' to log out all sessions."
+    )
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ It's me", callback_data=f"alert_ack_{alert_id}"),
+         InlineKeyboardButton("🚨 Not me - Log out all", callback_data=f"alert_logout_{alert_id}")]
+    ])
+    try:
+        msg = await bot.send_message(chat_id=owner_id, text=text, parse_mode="MarkdownV2", reply_markup=kb)
+        with get_db() as c:
+            c.execute("INSERT INTO login_alerts (alert_id, owner_id, vault_id, message_id, chat_id, created_at) VALUES (?,?,?,?,?,?)",
+                      (alert_id, owner_id, vault_id, msg.message_id, owner_id, now))
+            c.commit()
+        # Schedule auto-delete after 72 hours
+        async def delete_alert():
+            await asyncio.sleep(ALERT_VISIBLE_HOURS * 3600)
+            try:
+                await msg.delete()
+                with get_db() as c:
+                    c.execute("DELETE FROM login_alerts WHERE alert_id=?", (alert_id,))
+                    c.commit()
+            except Exception:
+                pass
+        asyncio.create_task(delete_alert())
+    except Exception as e:
+        logger.error(f"Failed to send login alert to owner {owner_id}: {e}")
+
+async def handle_alert_ack(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """User clicked 'It's me' – just delete the alert message."""
+    q = update.callback_query
+    await q.answer("Acknowledged. No action taken.")
+    try:
+        await q.message.delete()
+    except:
+        pass
+    # Remove from DB
+    alert_id = q.data.split("_")[2]
+    with get_db() as c:
+        c.execute("DELETE FROM login_alerts WHERE alert_id=?", (alert_id,))
+        c.commit()
+
+async def handle_alert_logout(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """User clicked 'Not me' – log out all sessions for that vault."""
+    q = update.callback_query
+    await q.answer("Logging out all sessions...")
+    alert_id = q.data.split("_")[2]
+    with get_db() as c:
+        row = c.execute("SELECT vault_id FROM login_alerts WHERE alert_id=?", (alert_id,)).fetchone()
+        if not row:
+            await q.edit_message_text("Alert expired or already processed.")
+            return
+        vault_id = row["vault_id"]
+        # Delete all sessions for this vault
+        c.execute("DELETE FROM sessions WHERE vault_id=?", (vault_id,))
+        c.execute("DELETE FROM login_alerts WHERE alert_id=?", (alert_id,))
+        c.commit()
+    await q.edit_message_text("✅ All sessions have been logged out. You may now change your password if needed.")
+    # Optionally notify the intruder? Not needed.
 
 # ── Session ─────────────────────────────────────────────────
 def get_session(tid):
@@ -375,7 +497,7 @@ async def signup_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         parse_mode="MarkdownV2", reply_markup=kb_main())
     return TOTP_MENU
 
-# ── LOGIN ───────────────────────────────────────────────────
+# ── LOGIN (with new login alert) ────────────────────────────
 async def login_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
     await q.edit_message_text(
@@ -440,6 +562,11 @@ async def login_pw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Wrong password\\. Try again:",
             parse_mode="MarkdownV2", reply_markup=kb_cancel())
         return LOGIN_PASSWORD
+    # Check if this login is from a different Telegram account than the owner
+    if uid != u["telegram_id"]:
+        # Send alert to owner
+        new_username = update.effective_user.username or str(uid)
+        await send_login_alert(ctx.bot, u["telegram_id"], vid, uid, new_username)
     set_session(uid, vid)
     if uid == u["telegram_id"]:
         update_tg_name(vid, update.effective_user)
@@ -451,7 +578,7 @@ async def login_pw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         parse_mode="MarkdownV2", reply_markup=kb_main())
     return TOTP_MENU
 
-# ── PASSWORD RESET (from login screen) ──────────────────────
+# ── PASSWORD RESET (with rate limiting) ──────────────────────
 async def reset_pw_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
     await q.edit_message_text(
@@ -471,6 +598,16 @@ async def reset_id_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             parse_mode="MarkdownV2", reply_markup=kb_cancel())
         return RESET_ID_INPUT
     vid = u["vault_id"]
+    # Check if account is frozen for password reset
+    if is_reset_frozen(vid):
+        remaining = get_freeze_remaining(vid)
+        hours = remaining // 3600
+        minutes = (remaining % 3600) // 60
+        await update.message.reply_text(
+            f"⚠️ *This account is temporarily frozen* due to too many failed reset attempts.\n\n"
+            f"Please try again in *{hours}h {minutes}m*.",
+            parse_mode="MarkdownV2", reply_markup=kb_cancel())
+        return RESET_ID_INPUT
     otp = gen_otp()
     store_otp(vid, otp)
     ctx.user_data["reset_vid"] = vid
@@ -500,10 +637,30 @@ async def reset_otp_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     except: pass
     vid = ctx.user_data.get("reset_vid")
     if not verify_otp(vid, otp):
-        await update.message.reply_text(
-            "❌ *Invalid or expired OTP\\.* Request a new one\\.",
-            parse_mode="MarkdownV2", reply_markup=kb_cancel())
+        # Record failed attempt
+        frozen = record_reset_attempt(vid)
+        if frozen:
+            remaining = get_freeze_remaining(vid)
+            hours = remaining // 3600
+            minutes = (remaining % 3600) // 60
+            await update.message.reply_text(
+                f"⚠️ *Too many failed attempts*\\. This account is frozen for *{hours}h {minutes}m*\\.",
+                parse_mode="MarkdownV2", reply_markup=kb_cancel())
+            ctx.user_data.pop("reset_vid", None)
+            return AUTH_MENU
+        else:
+            attempts_left = MAX_RESET_ATTEMPTS - (record_reset_attempt(vid) is not True? We need to fetch attempts. Let's simplify.
+            # We'll fetch attempts count
+            with get_db() as c:
+                row = c.execute("SELECT attempts FROM reset_attempts WHERE vault_id=?", (vid,)).fetchone()
+                attempts = row["attempts"] if row else 0
+                left = max(0, MAX_RESET_ATTEMPTS - attempts)
+            await update.message.reply_text(
+                f"❌ *Invalid or expired OTP\\.* {left} attempt\\(s\\) remaining before freeze\\.",
+                parse_mode="MarkdownV2", reply_markup=kb_cancel())
         return RESET_OTP_INPUT
+    # Success: clear reset attempts
+    reset_attempts_clear(vid)
     mark_otp_used(vid)
     ctx.user_data["reset_otp_verified"] = True
     await update.message.reply_text("✅ OTP verified\\! Enter your *new password* \\(min 6 chars\\):",
@@ -586,9 +743,25 @@ async def settings_reset_otp(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     except: pass
     uid   = update.effective_user.id; vault = get_session(uid)
     if not verify_otp(vault, otp):
-        await update.message.reply_text("❌ Invalid or expired OTP\\.",
-            parse_mode="MarkdownV2", reply_markup=kb_cancel())
+        # Record failed attempt for settings reset as well
+        frozen = record_reset_attempt(vault)
+        if frozen:
+            remaining = get_freeze_remaining(vault)
+            hours = remaining // 3600
+            minutes = (remaining % 3600) // 60
+            await update.message.reply_text(
+                f"⚠️ *Too many failed attempts*\\. This account is frozen for *{hours}h {minutes}m*\\.",
+                parse_mode="MarkdownV2", reply_markup=kb_cancel())
+            return TOTP_MENU
+        else:
+            with get_db() as c:
+                row = c.execute("SELECT attempts FROM reset_attempts WHERE vault_id=?", (vault,)).fetchone()
+                attempts = row["attempts"] if row else 0
+                left = max(0, MAX_RESET_ATTEMPTS - attempts)
+            await update.message.reply_text(f"❌ Invalid OTP\\. {left} attempt\\(s\\) remaining\\.",
+                parse_mode="MarkdownV2", reply_markup=kb_cancel())
         return SETTINGS_RESET_OTP
+    reset_attempts_clear(vault)
     mark_otp_used(vault)
     await update.message.reply_text("✅ Verified\\! Enter *new password* \\(min 6 chars\\):",
         parse_mode="MarkdownV2", reply_markup=kb_cancel())
@@ -644,7 +817,7 @@ async def logout(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         parse_mode="MarkdownV2", reply_markup=kb_auth())
     return AUTH_MENU
 
-# ── SETTINGS ────────────────────────────────────────────────
+# ── SETTINGS MENU ───────────────────────────────────────────
 async def settings_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
     await q.edit_message_text("⚙️ *Settings*\n\nChoose an option:",
@@ -766,6 +939,7 @@ async def change_pw_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     return TOTP_MENU
 
 # ── ADD TOTP ────────────────────────────────────────────────
+# (unchanged, keep as is from previous working version)
 async def add_totp_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
     if not get_session(update.effective_user.id):
@@ -1195,6 +1369,7 @@ async def delete_account_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
         with get_db() as c:
             c.execute("DELETE FROM totp_accounts WHERE vault_id=?", (vault,))
             c.execute("DELETE FROM reset_otps WHERE vault_id=?", (vault,))
+            c.execute("DELETE FROM reset_attempts WHERE vault_id=?", (vault,))
             c.execute("DELETE FROM users WHERE vault_id=?", (vault,))
             c.execute("DELETE FROM sessions WHERE telegram_id=?", (uid,))
             c.commit()
@@ -1329,6 +1504,8 @@ def main():
     )
     app.add_handler(conv)
     app.add_handler(CallbackQueryHandler(global_add_cancel, pattern="^global_add_cancel$"))
+    app.add_handler(CallbackQueryHandler(handle_alert_ack, pattern="^alert_ack_"))
+    app.add_handler(CallbackQueryHandler(handle_alert_logout, pattern="^alert_logout_"))
     app.add_handler(MessageHandler(private & (filters.PHOTO | filters.Document.IMAGE), global_auto_detect))
     app.add_handler(MessageHandler(private & filters.TEXT & ~filters.COMMAND, global_auto_detect))
     logger.info("BlockVeil Auth Bot started.")
