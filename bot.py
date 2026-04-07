@@ -27,11 +27,11 @@ logger = logging.getLogger(__name__)
     EDIT_PICK, EDIT_ACTION, EDIT_RENAME_INPUT,
     CHANGE_PW_OLD, CHANGE_PW_NEW, CHANGE_PW_CONFIRM,
     SETTINGS_RESET_OTP, SETTINGS_RESET_PW, SETTINGS_RESET_PW_CONFIRM,
-    DELETE_ACCOUNT_CONFIRM,
+    DELETE_ACCOUNT_PASSWORD, DELETE_ACCOUNT_CONFIRM,
     EXPORT_PW1_INPUT, EXPORT_PW2_INPUT,
     IMPORT_FILE_WAIT, IMPORT_PW_INPUT,
     TZ_INPUT,
-) = range(29)   # fixed
+) = range(30)   # Added DELETE_ACCOUNT_PASSWORD so now 30 states
 
 DB_PATH     = os.environ.get("DB_PATH", "auth.db")
 SERVER_KEY  = os.environ.get("ENCRYPTION_KEY", "").encode()
@@ -212,13 +212,10 @@ def find_user_by_id_or_vault(raw: str):
             return c.execute("SELECT * FROM users WHERE telegram_id=?", (int(raw),)).fetchone()
     return None
 
-# FIX: Only update tg_name if the logged-in user is the actual owner
 def update_tg_name(vault_id: str, tg_user):
     u = get_user(vault_id)
     if not u: return
-    # Only update if the Telegram user ID matches the vault owner's ID
-    if tg_user.id != u["telegram_id"]:
-        return
+    if tg_user.id != u["telegram_id"]: return
     name = ((tg_user.first_name or "") + " " + (tg_user.last_name or "")).strip()
     if name:
         with get_db() as c:
@@ -291,8 +288,7 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if vault:
         u = get_user(vault)
         if u:
-            update_tg_name(vault, update.effective_user)  # will only update if owner
-            # Show name from stored owner name if available
+            update_tg_name(vault, update.effective_user)
             display_name = u["tg_name"] if u["tg_name"] else update.effective_user.first_name or "User"
             await update.message.reply_text(
                 f"👋 Welcome back, *{em(display_name)}*\\!\n\nChoose an option:",
@@ -436,12 +432,10 @@ async def login_pw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             parse_mode="MarkdownV2", reply_markup=kb_cancel())
         return LOGIN_PASSWORD
     set_session(uid, vid)
-    # Only update tg_name if this login is from the actual owner
     if uid == u["telegram_id"]:
         update_tg_name(vid, update.effective_user)
     ctx.user_data["password"] = pw
     ctx.user_data["vault_id"] = vid
-    # Show owner's name from stored data
     owner_name = u["tg_name"] if u["tg_name"] else "User"
     await update.message.reply_text(
         f"✅ *Logged in\\!* Welcome to vault of *{em(owner_name)}*\\.",
@@ -471,7 +465,6 @@ async def reset_id_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     otp = gen_otp()
     store_otp(vid, otp)
     ctx.user_data["reset_vid"] = vid
-    # Send OTP to vault owner's Telegram ID
     owner_tid = u["telegram_id"]
     bot = ctx.bot
     try:
@@ -557,7 +550,6 @@ async def settings_reset_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not u:
         await q.edit_message_text("User not found\\.", parse_mode="MarkdownV2", reply_markup=kb_main())
         return TOTP_MENU
-    # Always send OTP to the vault owner's Telegram ID (not necessarily the logged-in user)
     owner_tid = u["telegram_id"]
     otp = gen_otp()
     store_otp(vault, otp)
@@ -650,7 +642,7 @@ async def settings_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         parse_mode="MarkdownV2", reply_markup=kb_settings())
     return TOTP_MENU
 
-# ── PROFILE (FIX: always show owner's name and Telegram ID) ──
+# ── PROFILE (always show owner) ─────────────────────────────
 async def show_profile(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
     uid = update.effective_user.id
@@ -662,7 +654,6 @@ async def show_profile(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not u:
         await q.edit_message_text("⚠️ Profile not found\\.", parse_mode="MarkdownV2", reply_markup=kb_main())
         return TOTP_MENU
-    # Always show owner's data from database
     owner_name = u["tg_name"] if u["tg_name"] else "Unknown"
     owner_tid = u["telegram_id"]
     tz = u["timezone"] or "UTC"
@@ -1136,21 +1127,57 @@ async def import_pw_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         parse_mode="MarkdownV2", reply_markup=kb_main())
     return TOTP_MENU
 
-# ── DELETE ACCOUNT ──────────────────────────────────────────
+# ── DELETE ACCOUNT (with password verification) ──────────────
 async def delete_account_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
+    if not get_session(update.effective_user.id):
+        await q.edit_message_text("Session expired\\.", parse_mode="MarkdownV2", reply_markup=kb_auth())
+        return AUTH_MENU
     await q.edit_message_text(
         "🗑 *Delete Account*\n\n"
-        "⚠️ *Permanently deletes account and ALL TOTP data\\.*\n\n"
-        "Cannot be undone\\. Confirm?",
-        parse_mode="MarkdownV2",
-        reply_markup=kb_danger("delete_account_confirm", "settings"))
+        "⚠️ *This will permanently delete your account and ALL TOTP data\\.*\n\n"
+        "Enter your *current password* to confirm deletion:",
+        parse_mode="MarkdownV2", reply_markup=kb_cancel())
+    return DELETE_ACCOUNT_PASSWORD
+
+async def delete_account_password(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    pw = update.message.text.strip()
+    try: await update.message.delete()
+    except: pass
+    uid = update.effective_user.id
+    vault = get_session(uid)
+    if not vault:
+        await update.message.reply_text("Session expired\\. /start", parse_mode="MarkdownV2", reply_markup=kb_auth())
+        return AUTH_MENU
+    u = get_user(vault)
+    if not u:
+        await update.message.reply_text("User not found\\.", parse_mode="MarkdownV2", reply_markup=kb_main())
+        return TOTP_MENU
+    if not hmac.compare_digest(hash_pw(pw, bytes(u["pw_salt"])), bytes(u["password_hash"])):
+        await update.message.reply_text("❌ *Wrong password\\.* Account deletion cancelled\\.",
+            parse_mode="MarkdownV2", reply_markup=kb_main())
+        return TOTP_MENU
+    # Password correct, ask for final confirmation
+    ctx.user_data["delete_verified"] = True
+    await update.message.reply_text(
+        "⚠️ *FINAL WARNING*\n\n"
+        "Are you absolutely sure? This action *cannot be undone* and all TOTP data will be lost forever.\n\n"
+        "Type `YES DELETE` to confirm:",
+        parse_mode="MarkdownV2", reply_markup=kb_cancel())
     return DELETE_ACCOUNT_CONFIRM
 
 async def delete_account_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query; await q.answer()
-    uid = update.effective_user.id; vault = get_session(uid)
-    if vault:
+    text = update.message.text.strip()
+    try: await update.message.delete()
+    except: pass
+    if text != "YES DELETE":
+        await update.message.reply_text("❌ Confirmation failed\\. Account not deleted\\.",
+            parse_mode="MarkdownV2", reply_markup=kb_main())
+        ctx.user_data.pop("delete_verified", None)
+        return TOTP_MENU
+    uid = update.effective_user.id
+    vault = get_session(uid)
+    if vault and ctx.user_data.get("delete_verified"):
         with get_db() as c:
             c.execute("DELETE FROM totp_accounts WHERE vault_id=?", (vault,))
             c.execute("DELETE FROM reset_otps WHERE vault_id=?", (vault,))
@@ -1158,7 +1185,8 @@ async def delete_account_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
             c.execute("DELETE FROM sessions WHERE telegram_id=?", (uid,))
             c.commit()
     ctx.user_data.clear()
-    await q.edit_message_text("🗑 *Account deleted\\.* All data permanently removed\\.",
+    await update.message.reply_text(
+        "🗑 *Account permanently deleted\\.* All data has been removed\\.",
         parse_mode="MarkdownV2", reply_markup=kb_auth())
     return AUTH_MENU
 
@@ -1198,7 +1226,7 @@ async def global_add_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cancel_to_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
     for k in ["pending_name","signup_pw","new_pw","edit_id","edit_name","pending_secret","_global_add",
-              "reset_vid","sreset_pw","import_payload"]:
+              "reset_vid","sreset_pw","import_payload","delete_verified"]:
         ctx.user_data.pop(k, None)
     uid = update.effective_user.id; vault = get_session(uid)
     if vault:
@@ -1273,7 +1301,8 @@ def main():
             SETTINGS_RESET_OTP:        [MessageHandler(private & filters.TEXT & ~filters.COMMAND, settings_reset_otp),        CallbackQueryHandler(cancel_to_menu, pattern="^cancel_to_menu$")],
             SETTINGS_RESET_PW:         [MessageHandler(private & filters.TEXT & ~filters.COMMAND, settings_reset_pw_input),   CallbackQueryHandler(cancel_to_menu, pattern="^cancel_to_menu$")],
             SETTINGS_RESET_PW_CONFIRM: [MessageHandler(private & filters.TEXT & ~filters.COMMAND, settings_reset_pw_confirm), CallbackQueryHandler(cancel_to_menu, pattern="^cancel_to_menu$")],
-            DELETE_ACCOUNT_CONFIRM: [CallbackQueryHandler(delete_account_confirm, pattern="^delete_account_confirm$"), CallbackQueryHandler(settings_menu, pattern="^settings$")],
+            DELETE_ACCOUNT_PASSWORD:   [MessageHandler(private & filters.TEXT & ~filters.COMMAND, delete_account_password),   CallbackQueryHandler(cancel_to_menu, pattern="^cancel_to_menu$")],
+            DELETE_ACCOUNT_CONFIRM:    [MessageHandler(private & filters.TEXT & ~filters.COMMAND, delete_account_confirm),    CallbackQueryHandler(cancel_to_menu, pattern="^cancel_to_menu$")],
             EXPORT_PW1_INPUT: [MessageHandler(private & filters.TEXT & ~filters.COMMAND, export_pw1_input), CallbackQueryHandler(cancel_to_menu, pattern="^cancel_to_menu$")],
             EXPORT_PW2_INPUT: [MessageHandler(private & filters.TEXT & ~filters.COMMAND, export_pw2_input), CallbackQueryHandler(cancel_to_menu, pattern="^cancel_to_menu$")],
             IMPORT_FILE_WAIT: [MessageHandler(private & filters.Document.ALL, import_file_recv), CallbackQueryHandler(cancel_to_menu, pattern="^cancel_to_menu$")],
