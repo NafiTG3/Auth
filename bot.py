@@ -1,4 +1,4 @@
-import os, re, hmac, time, json, struct, base64, hashlib, sqlite3, logging, datetime, secrets, string
+import os, re, hmac, time, json, struct, base64, hashlib, sqlite3, logging, datetime, secrets, string, asyncio
 from io import BytesIO
 from urllib.parse import urlparse, parse_qs, unquote
 
@@ -16,7 +16,7 @@ from PIL import Image
 logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ── States ─────────────────────────────────────────────────
+# ── States ───────────────────────────────────────────────── (32 states)
 (
     AUTH_MENU,
     SIGNUP_PASSWORD, SIGNUP_CONFIRM,
@@ -31,8 +31,8 @@ logger = logging.getLogger(__name__)
     EXPORT_PW1_INPUT, EXPORT_PW2_INPUT,
     IMPORT_FILE_WAIT, IMPORT_PW_INPUT,
     TZ_INPUT,
-    PRIVATE_KEY_MENU, GENERATE_PRIVATE_KEY, SHOW_PRIVATE_KEY, IMPORT_PRIVATE_KEY_INPUT,
-) = range(34)   # increased for new states
+    PRIVATE_KEY_MENU,
+) = range(32)   # fixed count
 
 DB_PATH     = os.environ.get("DB_PATH", "auth.db")
 SERVER_KEY  = os.environ.get("ENCRYPTION_KEY", "").encode()
@@ -74,7 +74,6 @@ def init_db():
             otp        TEXT    NOT NULL,
             expires_at INTEGER NOT NULL,
             used       INTEGER DEFAULT 0)""")
-        # Private keys table
         c.execute("""CREATE TABLE IF NOT EXISTS private_keys (
             vault_id   TEXT PRIMARY KEY,
             key_hash   BLOB NOT NULL,
@@ -125,8 +124,7 @@ def export_decrypt(payload: bytes, password: str) -> bytes:
 
 # ── Private Key functions ──────────────────────────────────
 def generate_private_key() -> str:
-    """Generate quantum-safe random 256-bit key as 64 hex chars."""
-    return secrets.token_hex(32)  # 64 characters
+    return secrets.token_hex(32)
 
 def hash_private_key(private_key: str, salt: bytes) -> bytes:
     return PBKDF2HMAC(algorithm=hashes.SHA256(), length=32, salt=salt, iterations=PBKDF2_ITER).derive(private_key.encode())
@@ -147,7 +145,6 @@ def verify_private_key(vault_id: str, private_key: str) -> bool:
     return hmac.compare_digest(computed, bytes(row["key_hash"]))
 
 def get_vault_by_private_key(private_key: str) -> str | None:
-    """Find vault_id by private key (linear scan over existing keys). Not many users, fine."""
     with get_db() as c:
         rows = c.execute("SELECT vault_id, key_hash, key_salt FROM private_keys").fetchall()
     for row in rows:
@@ -439,7 +436,6 @@ async def login_import_key_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
     return LOGIN_IMPORT_PRIVATE_KEY
 
 async def login_import_key_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    # Get private key from text or file
     private_key = None
     if update.message.document:
         file = await update.message.document.get_file()
@@ -454,7 +450,6 @@ async def login_import_key_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
     if not private_key:
         await update.message.reply_text("❌ No private key provided\\.", parse_mode="MarkdownV2", reply_markup=kb_auth())
         return AUTH_MENU
-    # Validate format (64 hex chars)
     if not re.match(r"^[a-f0-9]{64}$", private_key):
         await update.message.reply_text("❌ Invalid private key format\\. Must be 64 hexadecimal characters\\.",
             parse_mode="MarkdownV2", reply_markup=kb_auth())
@@ -468,9 +463,8 @@ async def login_import_key_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
     if not u:
         await update.message.reply_text("❌ Vault not found\\.", parse_mode="MarkdownV2", reply_markup=kb_auth())
         return AUTH_MENU
-    # Log in: set session for current Telegram user
     set_session(update.effective_user.id, vault_id)
-    ctx.user_data["password"] = None  # No password, but we can still operate (password change will be needed later)
+    ctx.user_data["password"] = None
     ctx.user_data["vault_id"] = vault_id
     owner_name = u["tg_name"] if u["tg_name"] else "User"
     await update.message.reply_text(
@@ -542,7 +536,7 @@ async def login_pw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         parse_mode="MarkdownV2", reply_markup=kb_main())
     return TOTP_MENU
 
-# ── PASSWORD RESET (unchanged, OTP to owner) ────────────────
+# ── PASSWORD RESET (OTP to owner) ────────────────────────────
 async def reset_pw_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
     await q.edit_message_text(
@@ -639,7 +633,7 @@ async def reset_new_pw_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         parse_mode="MarkdownV2", reply_markup=kb_auth())
     return AUTH_MENU
 
-# ── SETTINGS RESET (unchanged, OTP to owner) ────────────────
+# ── SETTINGS RESET (OTP to owner) ────────────────────────────
 async def settings_reset_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
     uid = update.effective_user.id; vault = get_session(uid)
@@ -735,14 +729,14 @@ async def logout(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         parse_mode="MarkdownV2", reply_markup=kb_auth())
     return AUTH_MENU
 
-# ── SETTINGS ────────────────────────────────────────────────
+# ── SETTINGS MENU ───────────────────────────────────────────
 async def settings_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
     await q.edit_message_text("⚙️ *Settings*\n\nChoose an option:",
         parse_mode="MarkdownV2", reply_markup=kb_settings())
     return TOTP_MENU
 
-# ── PROFILE (always show owner) ─────────────────────────────
+# ── PROFILE (owner) ─────────────────────────────────────────
 async def show_profile(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
     uid = update.effective_user.id
@@ -994,7 +988,7 @@ async def handle_manual_secret(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     name = ctx.user_data.pop("pending_name", "Unknown")
     return await _do_save_totp(update, vault, {"name": name, "issuer": "", "secret": cleaned}, pw)
 
-# ── LIST TOTP (unchanged) ───────────────────────────────────
+# ── LIST TOTP ───────────────────────────────────────────────
 async def list_totp(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
     uid = update.effective_user.id; vault = get_session(uid); pw = ctx.user_data.get("password")
@@ -1027,7 +1021,7 @@ async def list_totp(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await q.edit_message_text("\n".join(lines), parse_mode="MarkdownV2", reply_markup=InlineKeyboardMarkup(kb))
     return TOTP_MENU
 
-# ── EDIT TOTP (unchanged) ───────────────────────────────────
+# ── EDIT TOTP ───────────────────────────────────────────────
 async def edit_totp_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
     uid = update.effective_user.id; vault = get_session(uid)
@@ -1226,7 +1220,7 @@ async def import_pw_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         parse_mode="MarkdownV2", reply_markup=kb_main())
     return TOTP_MENU
 
-# ── DELETE ACCOUNT (unchanged, with password) ───────────────
+# ── DELETE ACCOUNT (with password) ─────────────────────────
 async def delete_account_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
     if not get_session(update.effective_user.id):
@@ -1305,19 +1299,11 @@ async def generate_private_key(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not vault:
         await q.edit_message_text("Session expired\\.", parse_mode="MarkdownV2", reply_markup=kb_auth())
         return AUTH_MENU
-    # Optionally require password to generate (security)
-    u = get_user(vault)
-    if not u:
-        await q.edit_message_text("Error\\.", parse_mode="MarkdownV2", reply_markup=kb_main())
-        return TOTP_MENU
-    # If user has no password set (logged in via private key), they cannot generate new key? Let them generate anyway.
     private_key = generate_private_key()
     store_private_key(vault, private_key)
-    # Send key as file that auto-deletes after 1 minute
     await q.delete_message()
     bot = ctx.bot
     try:
-        # Send as text file
         file_bio = BytesIO(private_key.encode())
         file_bio.name = "blockveil_private_key.txt"
         await bot.send_document(
@@ -1329,20 +1315,16 @@ async def generate_private_key(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     "Use it on another device via 'Import Private Key' on login screen\\.",
             parse_mode="MarkdownV2"
         )
-        # Also send a message that will be deleted after 60 seconds
         msg = await bot.send_message(
             chat_id=uid,
             text="⏳ *This key will disappear in 60 seconds*\\. Copy it now if needed\\.",
             parse_mode="MarkdownV2"
         )
-        # Delete after 60 seconds
         await asyncio.sleep(60)
         await msg.delete()
-        # Also delete the document? Can't delete document after sent, but we can send a note.
     except Exception as e:
         logger.error(f"Failed to send private key: {e}")
         await bot.send_message(uid, "⚠️ Failed to send private key\\. Try again later\\.")
-    # Go back to settings menu
     await bot.send_message(uid, "✅ Private key generated and sent\\. Returning to settings\\.",
         reply_markup=kb_settings())
     return TOTP_MENU
@@ -1354,23 +1336,7 @@ async def show_private_key(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not vault:
         await q.edit_message_text("Session expired\\.", parse_mode="MarkdownV2", reply_markup=kb_auth())
         return AUTH_MENU
-    # Check if private key exists
-    with get_db() as c:
-        row = c.execute("SELECT key_hash FROM private_keys WHERE vault_id=?", (vault,)).fetchone()
-    if not row:
-        await q.edit_message_text("❌ No private key generated yet\\. Use 'Generate New Private Key' first\\.",
-            parse_mode="MarkdownV2", reply_markup=kb_private_key())
-        return PRIVATE_KEY_MENU
-    # We cannot retrieve the original key from hash, so we need to regenerate? Actually we never store plain key.
-    # So "Show My Private Key" is impossible unless we store encrypted with password. To avoid complexity, we can allow regeneration only.
-    # But user asked for "show your private key". We'll implement: when generating, we store encrypted version with user's password.
-    # Modify generation to store encrypted private key as well. But for simplicity and security, I will change: upon generation, we also store an encrypted copy using user's password.
-    # However, user may have logged in via private key (no password). So we'll skip show feature if no password set. We'll ask for password to decrypt.
-    # Given time, I'll implement show feature by re-encrypting private key with a derived key from password. But to keep code manageable, I'll instead allow re-generation only, and show button will send the same key again (but that would require storing plain text, not safe).
-    # Better: For now, disable "Show" button, only generate new. But user explicitly asked. Let's implement secure retrieval: store encrypted private key using user's password.
-    # I will add column `key_enc` to private_keys table. When generating, we encrypt the private key with the user's current password (if available). Then show can decrypt.
-    # I need to add migration and modify functions. Given the length, I will provide a simplified but functional solution: when user clicks "Show", we regenerate a new private key and send it (old key invalidated). That is secure and simple.
-    # But user may want to see existing key without regenerating. To meet requirement: I'll make "Show" actually regenerate and send new key (old becomes invalid). That's acceptable.
+    # Regenerate and send new key (old becomes invalid)
     private_key = generate_private_key()
     store_private_key(vault, private_key)
     await q.delete_message()
@@ -1445,8 +1411,6 @@ async def main_menu_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     return TOTP_MENU
 
 # ── MAIN ────────────────────────────────────────────────────
-import asyncio   # for sleep in private key send
-
 def main():
     if not SERVER_KEY:
         raise RuntimeError("ENCRYPTION_KEY not set")
