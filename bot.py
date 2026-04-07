@@ -2,6 +2,7 @@ import os
 import re
 import hmac
 import time
+import json
 import struct
 import base64
 import hashlib
@@ -11,7 +12,6 @@ import datetime
 from io import BytesIO
 from urllib.parse import urlparse, parse_qs, unquote
 
-from mnemonic import Mnemonic
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, CallbackQueryHandler,
@@ -33,17 +33,16 @@ logger = logging.getLogger(__name__)
     LOGIN_ID, LOGIN_PASSWORD,
     TOTP_MENU,
     ADD_WAITING, ADD_MANUAL_NAME, ADD_MANUAL_SECRET,
-    RENAME_PICK, RENAME_INPUT,
+    EDIT_PICK, EDIT_ACTION, EDIT_RENAME_INPUT,
     CHANGE_PW_OLD, CHANGE_PW_NEW, CHANGE_PW_CONFIRM,
     DELETE_ACCOUNT_CONFIRM,
-    EXPORT_CONFIRM, IMPORT_WAITING,
+    EXPORT_PW_INPUT, IMPORT_WAITING,
     TZ_INPUT,
-) = range(18)
+) = range(19)
 
-DB_PATH    = os.environ.get("DB_PATH", "auth.db")
-SERVER_KEY = os.environ.get("ENCRYPTION_KEY", "").encode()
-PBKDF2_ITER = 310_000
-_mnemo      = Mnemonic("english")
+DB_PATH     = os.environ.get("DB_PATH", "auth.db")
+SERVER_KEY  = os.environ.get("ENCRYPTION_KEY", "").encode()
+PBKDF2_ITER = 1_000_000   # 1 million iterations
 
 # ── DB ────────────────────────────────────────────────────
 def get_db():
@@ -78,10 +77,18 @@ def init_db():
 
 # ── Crypto ────────────────────────────────────────────────
 def generate_vault_id(telegram_id: int) -> str:
-    digest = hashlib.sha256(
-        f"blockveil_uid_{telegram_id}_v1".encode() + SERVER_KEY
+    """12-char cryptographic hash from telegram_id + SERVER_KEY."""
+    raw = hashlib.sha256(
+        f"bv_{telegram_id}_v2".encode() + SERVER_KEY
     ).digest()
-    return _mnemo.to_mnemonic(digest[:16])
+    # Base62 alphabet for clean readable hash
+    alphabet = "abcdefghijklmnopqrstuvwxyz0123456789"
+    num = int.from_bytes(raw, "big")
+    chars = []
+    for _ in range(12):
+        chars.append(alphabet[num % len(alphabet)])
+        num //= len(alphabet)
+    return "".join(chars)
 
 def hash_password(password: str, salt: bytes) -> bytes:
     kdf = PBKDF2HMAC(algorithm=hashes.SHA256(), length=32, salt=salt, iterations=PBKDF2_ITER)
@@ -101,18 +108,41 @@ def decrypt_secret(ct, salt, iv, password, vault_id) -> str:
     return AESGCM(derive_enc_key(password, vault_id, bytes(salt))).decrypt(bytes(iv), bytes(ct), None).decode()
 
 # ── TOTP ──────────────────────────────────────────────────
+def clean_secret(s: str) -> str:
+    """Normalize secret: strip spaces, dashes, dots; uppercase."""
+    return re.sub(r"[\s\-\.\,]", "", s).upper()
+
 def _b32(s: str) -> bytes:
-    s = s.upper().strip().replace(" ", "")
+    s = clean_secret(s)
     return base64.b32decode(s + "=" * ((8 - len(s) % 8) % 8))
 
+def validate_secret(s: str) -> tuple[bool, str]:
+    """Returns (is_valid, cleaned_secret). Tries to auto-fix common issues."""
+    cleaned = clean_secret(s)
+    # Check base32 charset
+    if not re.match(r"^[A-Z2-7]+=*$", cleaned):
+        # Try to fix common substitutions: 0->O, 1->I/L, 8->B
+        fixed = cleaned.replace("0","O").replace("1","I").replace("8","B")
+        fixed = re.sub(r"[^A-Z2-7]", "", fixed)
+        if not fixed:
+            return False, ""
+        cleaned = fixed
+    # Validate length (must be multiple of 8 after padding)
+    padded = cleaned + "=" * ((8 - len(cleaned) % 8) % 8)
+    try:
+        base64.b32decode(padded)
+        return True, cleaned
+    except Exception:
+        return False, ""
+
 def totp_now(secret: str):
-    key     = _b32(secret)
-    ts      = int(time.time())
-    remain  = 30 - (ts % 30)
-    msg     = struct.pack(">Q", ts // 30)
-    h       = hmac.new(key, msg, hashlib.sha1).digest()
-    offset  = h[-1] & 0x0F
-    code    = struct.unpack(">I", h[offset:offset+4])[0] & 0x7FFFFFFF
+    key    = _b32(secret)
+    ts     = int(time.time())
+    remain = 30 - (ts % 30)
+    msg    = struct.pack(">Q", ts // 30)
+    h      = hmac.new(key, msg, hashlib.sha1).digest()
+    offset = h[-1] & 0x0F
+    code   = struct.unpack(">I", h[offset:offset+4])[0] & 0x7FFFFFFF
     return str(code % 1_000_000).zfill(6), remain
 
 # ── Session ───────────────────────────────────────────────
@@ -124,7 +154,9 @@ def get_session(tid):
 def set_session(tid, vault_id):
     with get_db() as c:
         c.execute("DELETE FROM sessions WHERE vault_id=? AND telegram_id!=?", (vault_id, tid))
-        c.execute("INSERT INTO sessions (telegram_id,vault_id) VALUES (?,?) ON CONFLICT(telegram_id) DO UPDATE SET vault_id=excluded.vault_id,created_at=strftime('%s','now')", (tid, vault_id))
+        c.execute("INSERT INTO sessions (telegram_id,vault_id) VALUES (?,?) "
+                  "ON CONFLICT(telegram_id) DO UPDATE SET vault_id=excluded.vault_id,"
+                  "created_at=strftime('%s','now')", (tid, vault_id))
         c.commit()
 
 def clear_session(tid):
@@ -151,12 +183,30 @@ def bar(remain):
 def fmt_time(ts, tz_str="UTC"):
     try:
         import zoneinfo
-        tz  = zoneinfo.ZoneInfo(tz_str)
-        dt  = datetime.datetime.fromtimestamp(ts, tz=tz)
+        tz = zoneinfo.ZoneInfo(tz_str)
+        dt = datetime.datetime.fromtimestamp(ts, tz=tz)
     except Exception:
-        dt  = datetime.datetime.utcfromtimestamp(ts)
+        dt = datetime.datetime.utcfromtimestamp(ts)
         tz_str = "UTC"
     return dt.strftime(f"%d %b %Y, %I:%M %p ({tz_str})")
+
+def parse_tz_offset(raw: str) -> str | None:
+    """Parse +6:00 / -5:30 style into Etc/GMT offset or return None if invalid."""
+    raw = raw.strip()
+    m = re.match(r"^([+-])(\d{1,2}):(\d{2})$", raw)
+    if not m:
+        m = re.match(r"^([+-])(\d{1,2})$", raw)
+        if not m: return None
+        sign, h, mn = m.group(1), int(m.group(2)), 0
+    else:
+        sign, h, mn = m.group(1), int(m.group(2)), int(m.group(3))
+    if h > 14 or mn not in (0, 30, 45): return None
+    # Etc/GMT sign is inverted
+    etc_sign = "-" if sign == "+" else "+"
+    if mn == 0:
+        return f"Etc/GMT{etc_sign}{h}"
+    # For non-zero minutes use fixed offset string stored as-is
+    return f"UTC{sign}{h:02d}:{mn:02d}"
 
 def parse_otpauth(uri):
     try:
@@ -171,7 +221,9 @@ def parse_otpauth(uri):
         else:
             name = label.strip()
         if not secret: return None
-        return {"name": name, "issuer": issuer or "", "secret": secret.upper()}
+        ok, cleaned = validate_secret(secret)
+        if not ok: return None
+        return {"name": name, "issuer": issuer or "", "secret": cleaned}
     except Exception:
         return None
 
@@ -186,20 +238,23 @@ def kb_main():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("➕ Add New TOTP",  callback_data="add_totp"),
          InlineKeyboardButton("📋 List of TOTP", callback_data="list_totp")],
-        [InlineKeyboardButton("✏️ Rename TOTP",  callback_data="rename_totp"),
+        [InlineKeyboardButton("✏️ Edit TOTP",    callback_data="edit_totp"),
          InlineKeyboardButton("👤 Profile",       callback_data="profile")],
-        [InlineKeyboardButton("📤 Export Vault",  callback_data="export_vault"),
-         InlineKeyboardButton("📥 Import Vault",  callback_data="import_vault")],
+        [InlineKeyboardButton("⚙️ Settings",      callback_data="settings")],
+    ])
+
+def kb_settings():
+    return InlineKeyboardMarkup([
         [InlineKeyboardButton("🔑 Change Password", callback_data="change_pw")],
+        [InlineKeyboardButton("📥 Import Vault",    callback_data="import_vault")],
+        [InlineKeyboardButton("📤 Export Vault",    callback_data="export_vault")],
         [InlineKeyboardButton("🗑 Delete Account",  callback_data="delete_account")],
         [InlineKeyboardButton("🚪 Logout",           callback_data="logout")],
+        [InlineKeyboardButton("🏠 Main Menu",        callback_data="main_menu")],
     ])
 
 def kb_cancel():
     return InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="cancel_to_menu")]])
-
-def kb_back():
-    return InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")]])
 
 def kb_confirm_danger(yes_cb, no_cb="main_menu"):
     return InlineKeyboardMarkup([[
@@ -230,14 +285,15 @@ async def signup_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
     uid = update.effective_user.id
     if get_user_by_tid(uid):
-        await q.edit_message_text("⚠️ *This Telegram account already has a vault\\.* Use *Login*\\.",
+        await q.edit_message_text(
+            "⚠️ *This Telegram account already has a vault\\.* Use *Login*\\.",
             parse_mode="MarkdownV2", reply_markup=kb_auth())
         return AUTH_MENU
     vault_id = generate_vault_id(uid)
     ctx.user_data["signup_vault_id"] = vault_id
     await q.edit_message_text(
         "🆕 *Create Your Account*\n\n"
-        "Your unique Vault ID \\(auto\\-generated\\):\n\n"
+        "Your unique *BV Vault ID* \\(auto\\-generated\\):\n\n"
         f"`{em(vault_id)}`\n\n"
         "📌 *Save this ID\\!* You need it to login from other devices\\.\n\n"
         "Set a *password* \\(minimum 6 characters\\):",
@@ -283,32 +339,56 @@ async def signup_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data["vault_id"] = vault_id
     await update.message.reply_text(
         "✅ *Account created\\!*\n\n"
-        f"🔑 *Your Vault ID:*\n`{em(vault_id)}`\n\n"
-        "⚠️ _Save your Vault ID safely\\._\n\nYou are now logged in\\.",
+        f"🔑 *Your BV Vault ID:*\n`{em(vault_id)}`\n\n"
+        "⚠️ _Save your BV Vault ID safely\\._\n\nYou are now logged in\\.",
         parse_mode="MarkdownV2", reply_markup=kb_main())
     return TOTP_MENU
 
 # ── LOGIN ─────────────────────────────────────────────────
 async def login_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
-    uid      = update.effective_user.id
-    vault_id = generate_vault_id(uid)
+    uid = update.effective_user.id
     await q.edit_message_text(
         "🔑 *Login*\n\n"
-        "Send your *Vault ID* or type `auto` to use your Telegram account's ID\\.\n\n"
-        f"_Your auto\\-generated ID:_\n`{em(vault_id)}`",
+        "Choose how to login:",
+        parse_mode="MarkdownV2",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("📱 Login with My Telegram", callback_data="login_auto")],
+            [InlineKeyboardButton("🔑 Login with BV Vault ID", callback_data="login_manual")],
+            [InlineKeyboardButton("❌ Cancel", callback_data="cancel_to_menu")],
+        ]))
+    return LOGIN_ID
+
+async def login_auto(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query; await q.answer()
+    uid      = update.effective_user.id
+    vault_id = generate_vault_id(uid)
+    if not get_user(vault_id):
+        await q.edit_message_text(
+            "❌ No account found for this Telegram account\\.\n\nPlease *Sign Up* first\\.",
+            parse_mode="MarkdownV2", reply_markup=kb_auth())
+        return AUTH_MENU
+    ctx.user_data["login_vault_id"] = vault_id
+    await q.edit_message_text("🔒 *Enter your password:*",
+        parse_mode="MarkdownV2", reply_markup=kb_cancel())
+    return LOGIN_PASSWORD
+
+async def login_manual(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query; await q.answer()
+    await q.edit_message_text(
+        "🔑 *Enter your BV Vault ID:*\n\n_12\\-character ID from your account_",
         parse_mode="MarkdownV2", reply_markup=kb_cancel())
     return LOGIN_ID
 
 async def login_id(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    uid  = update.effective_user.id
-    vid  = generate_vault_id(uid) if text.lower() == "auto" else text.lower().strip()
-    if not get_user(vid):
-        await update.message.reply_text("❌ Vault ID not found\\. Try again or Sign Up\\.",
+    text = update.message.text.strip().lower().replace(" ", "")
+    try: await update.message.delete()
+    except: pass
+    if not get_user(text):
+        await update.message.reply_text("❌ BV Vault ID not found\\. Check and try again\\.",
             parse_mode="MarkdownV2", reply_markup=kb_cancel())
         return LOGIN_ID
-    ctx.user_data["login_vault_id"] = vid
+    ctx.user_data["login_vault_id"] = text
     await update.message.reply_text("🔒 *Enter your password:*",
         parse_mode="MarkdownV2", reply_markup=kb_cancel())
     return LOGIN_PASSWORD
@@ -336,7 +416,13 @@ async def login_password(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         parse_mode="MarkdownV2", reply_markup=kb_main())
     return TOTP_MENU
 
-# ── LOGOUT ────────────────────────────────────────────────
+# ── SETTINGS ──────────────────────────────────────────────
+async def settings_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query; await q.answer()
+    await q.edit_message_text("⚙️ *Settings*\n\nChoose an option:",
+        parse_mode="MarkdownV2", reply_markup=kb_settings())
+    return TOTP_MENU
+
 async def logout(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
     clear_session(update.effective_user.id)
@@ -355,7 +441,8 @@ async def add_totp_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "➕ *Add New TOTP*\n\n"
         "📷 Send a *QR code image*\n"
         "🔗 Paste an `otpauth://` URI\n"
-        "⌨️ Type `manual` to enter manually",
+        "⌨️ Type `manual` to enter manually\n\n"
+        "_Your message will be auto\\-deleted after processing_",
         parse_mode="MarkdownV2", reply_markup=kb_cancel())
     return ADD_WAITING
 
@@ -365,38 +452,49 @@ async def handle_add_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not vault or not pw:
         await update.message.reply_text("🔒 Session expired\\. /start", parse_mode="MarkdownV2")
         return AUTH_MENU
+    # QR image
     file_obj = None
     if update.message.photo:
         file_obj = await update.message.photo[-1].get_file()
     elif update.message.document and update.message.document.mime_type.startswith("image"):
         file_obj = await update.message.document.get_file()
     if file_obj:
+        try: await update.message.delete()
+        except: pass
         bio = BytesIO(); await file_obj.download_to_memory(bio); bio.seek(0)
         try:
             decoded = qr_decode(Image.open(bio))
             if not decoded:
-                await update.message.reply_text("⚠️ No QR code found\\.", parse_mode="MarkdownV2", reply_markup=kb_cancel())
+                await update.message.reply_text("⚠️ No QR code found\\. Try a clearer image\\.",
+                    parse_mode="MarkdownV2", reply_markup=kb_cancel())
                 return ADD_WAITING
             data = parse_otpauth(decoded[0].data.decode("utf-8"))
             if not data:
-                await update.message.reply_text("⚠️ Not a valid TOTP QR\\.", parse_mode="MarkdownV2", reply_markup=kb_cancel())
+                await update.message.reply_text("⚠️ Not a valid TOTP QR\\.",
+                    parse_mode="MarkdownV2", reply_markup=kb_cancel())
                 return ADD_WAITING
             return await _save_totp(update, vault, data, pw)
         except Exception as e:
             logger.error(f"QR error: {e}")
-            await update.message.reply_text("⚠️ Could not read image\\.", parse_mode="MarkdownV2", reply_markup=kb_cancel())
+            await update.message.reply_text("⚠️ Could not read image\\.",
+                parse_mode="MarkdownV2", reply_markup=kb_cancel())
             return ADD_WAITING
     text = update.message.text.strip()
     if text.lower() == "manual":
-        await update.message.reply_text("⌨️ Enter *account name*:", parse_mode="MarkdownV2", reply_markup=kb_cancel())
+        await update.message.reply_text("⌨️ Enter *account name*:",
+            parse_mode="MarkdownV2", reply_markup=kb_cancel())
         return ADD_MANUAL_NAME
     if text.startswith("otpauth://"):
+        try: await update.message.delete()
+        except: pass
         data = parse_otpauth(text)
         if not data:
-            await update.message.reply_text("⚠️ Invalid URI\\.", parse_mode="MarkdownV2", reply_markup=kb_cancel())
+            await update.message.reply_text("⚠️ Invalid URI\\.",
+                parse_mode="MarkdownV2", reply_markup=kb_cancel())
             return ADD_WAITING
         return await _save_totp(update, vault, data, pw)
-    await update.message.reply_text("⚠️ Send QR image, `otpauth://` URI, or type `manual`\\.",
+    await update.message.reply_text(
+        "⚠️ Send QR image, `otpauth://` URI, or type `manual`\\.",
         parse_mode="MarkdownV2", reply_markup=kb_cancel())
     return ADD_WAITING
 
@@ -407,19 +505,36 @@ async def handle_manual_name(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return ADD_MANUAL_NAME
     ctx.user_data["pending_name"] = name
     await update.message.reply_text(
-        f"✅ Name: *{em(name)}*\n\nEnter *Base32 secret key*:\n_Example: JBSWY3DPEHPK3PXP_",
+        f"✅ Name: *{em(name)}*\n\n"
+        "Enter *Base32 secret key*:\n"
+        "_Spaces and dashes are auto\\-removed_\n\n"
+        "Example: `JBSWY3DPEHPK3PXP`\n"
+        "Also works: `JBSW Y3DP EHPK 3PXP`",
         parse_mode="MarkdownV2", reply_markup=kb_cancel())
     return ADD_MANUAL_SECRET
 
 async def handle_manual_secret(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    secret = update.message.text.strip().upper().replace(" ", "")
-    uid = update.effective_user.id; vault = get_session(uid); pw = ctx.user_data.get("password")
-    if not re.match(r"^[A-Z2-7]+=*$", secret):
-        await update.message.reply_text("⚠️ Invalid Base32 secret\\.", parse_mode="MarkdownV2", reply_markup=kb_cancel())
+    raw    = update.message.text.strip()
+    uid    = update.effective_user.id
+    vault  = get_session(uid)
+    pw     = ctx.user_data.get("password")
+    try: await update.message.delete()
+    except: pass
+    ok, secret = validate_secret(raw)
+    if not ok:
+        await update.message.reply_text(
+            "⚠️ *Invalid secret key\\.*\n\n"
+            "Secret must be Base32 \\(letters A\\-Z and digits 2\\-7\\)\\.\n"
+            "Common issues:\n"
+            "• Letter O vs digit 0\n"
+            "• Letter I/L vs digit 1\n\n"
+            "Please check and try again:",
+            parse_mode="MarkdownV2", reply_markup=kb_cancel())
         return ADD_MANUAL_SECRET
     try: totp_now(secret)
     except Exception:
-        await update.message.reply_text("⚠️ Invalid secret key\\.", parse_mode="MarkdownV2", reply_markup=kb_cancel())
+        await update.message.reply_text("⚠️ Secret key is invalid\\. Cannot generate OTP\\.",
+            parse_mode="MarkdownV2", reply_markup=kb_cancel())
         return ADD_MANUAL_SECRET
     name = ctx.user_data.pop("pending_name", "Unknown")
     return await _save_totp(update, vault, {"name": name, "issuer": "", "secret": secret}, pw)
@@ -428,7 +543,8 @@ async def _save_totp(update, vault_id, data, pw):
     ct, salt, iv = encrypt_secret(data["secret"], pw, vault_id)
     with get_db() as c:
         c.execute("INSERT INTO totp_accounts (vault_id,name,issuer,secret_enc,salt,iv) VALUES (?,?,?,?,?,?)",
-            (vault_id, data["name"], data.get("issuer",""), ct, salt, iv)); c.commit()
+            (vault_id, data["name"], data.get("issuer",""), ct, salt, iv))
+        c.commit()
     code, remain = totp_now(data["secret"])
     await update.message.reply_text(
         f"✅ *{em(data['name'])}* added\\!\n\n"
@@ -438,7 +554,7 @@ async def _save_totp(update, vault_id, data, pw):
         parse_mode="MarkdownV2", reply_markup=kb_main())
     return TOTP_MENU
 
-# ── TOTP: LIST ────────────────────────────────────────────
+# ── TOTP: LIST (live update via Refresh) ──────────────────
 async def list_totp(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
     uid = update.effective_user.id; vault = get_session(uid); pw = ctx.user_data.get("password")
@@ -450,70 +566,104 @@ async def list_totp(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             parse_mode="MarkdownV2", reply_markup=kb_auth())
         return AUTH_MENU
     with get_db() as c:
-        rows = c.execute("SELECT id,name,issuer,secret_enc,salt,iv FROM totp_accounts WHERE vault_id=? ORDER BY name",
+        rows = c.execute(
+            "SELECT id,name,issuer,secret_enc,salt,iv FROM totp_accounts WHERE vault_id=? ORDER BY name",
             (vault,)).fetchall()
     if not rows:
         await q.edit_message_text("📋 *Your TOTP Accounts*\n\nNo accounts yet\\.",
             parse_mode="MarkdownV2", reply_markup=kb_main())
         return TOTP_MENU
-    lines = ["📋 *Your TOTP Accounts*\n"]; kb = []
+    ts     = int(time.time())
+    remain = 30 - (ts % 30)
+    lines  = [f"📋 *Your TOTP Accounts*\n_⏱ Codes refresh every 30s — tap 🔄 to update_\n_Next refresh in: {remain}s_\n"]
+    kb     = []
     for row in rows:
         try:
             secret = decrypt_secret(row["secret_enc"], row["salt"], row["iv"], pw, vault)
-            code, remain = totp_now(secret)
-            issuer_part  = f" \\| {em(row['issuer'])}" if row["issuer"] else ""
-            lines.append(f"🔑 *{em(row['name'])}*{issuer_part}\n   `{code[:3]} {code[3:]}` ⏱ {bar(remain)} {remain}s\n")
-            kb.append([InlineKeyboardButton(f"🗑 Delete: {row['name']}", callback_data=f"del_{row['id']}")])
+            code, rem = totp_now(secret)
+            issuer_part = f" \\| {em(row['issuer'])}" if row["issuer"] else ""
+            lines.append(f"🔑 *{em(row['name'])}*{issuer_part}\n   `{code[:3]} {code[3:]}` {bar(rem)} {rem}s\n")
         except Exception as e:
             logger.error(f"Decrypt error: {e}")
             lines.append(f"⚠️ *{em(row['name'])}* — error\n")
-    kb.append([InlineKeyboardButton("🔄 Refresh", callback_data="list_totp")])
-    kb.append([InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")])
-    await q.edit_message_text("\n".join(lines), parse_mode="MarkdownV2", reply_markup=InlineKeyboardMarkup(kb))
+    kb.append([InlineKeyboardButton("🔄 Refresh codes", callback_data="list_totp")])
+    kb.append([InlineKeyboardButton("🏠 Main Menu",     callback_data="main_menu")])
+    await q.edit_message_text("\n".join(lines), parse_mode="MarkdownV2",
+        reply_markup=InlineKeyboardMarkup(kb))
     return TOTP_MENU
 
-async def delete_totp_entry(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query; await q.answer()
-    uid = update.effective_user.id; vault = get_session(uid)
-    acc_id = int(q.data.split("_")[1])
-    with get_db() as c:
-        row = c.execute("SELECT name FROM totp_accounts WHERE id=? AND vault_id=?", (acc_id, vault)).fetchone()
-        if row:
-            c.execute("DELETE FROM totp_accounts WHERE id=? AND vault_id=?", (acc_id, vault)); c.commit()
-    await q.answer(f"✅ {row['name']} deleted" if row else "⚠️ Not found", show_alert=True)
-    update.callback_query.data = "list_totp"
-    return await list_totp(update, ctx)
-
-# ── TOTP: RENAME ──────────────────────────────────────────
-async def rename_totp_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+# ── TOTP: EDIT (rename + delete combined) ─────────────────
+async def edit_totp_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
     uid = update.effective_user.id; vault = get_session(uid)
     if not vault:
         await q.edit_message_text("Session expired\\. /start", parse_mode="MarkdownV2", reply_markup=kb_auth())
         return AUTH_MENU
     with get_db() as c:
-        rows = c.execute("SELECT id, name FROM totp_accounts WHERE vault_id=? ORDER BY name", (vault,)).fetchall()
+        rows = c.execute("SELECT id,name FROM totp_accounts WHERE vault_id=? ORDER BY name", (vault,)).fetchall()
     if not rows:
         await q.edit_message_text("No TOTP accounts found\\.", parse_mode="MarkdownV2", reply_markup=kb_main())
         return TOTP_MENU
-    kb = [[InlineKeyboardButton(row["name"], callback_data=f"renamepick_{row['id']}")] for row in rows]
+    kb = [[InlineKeyboardButton(row["name"], callback_data=f"editpick_{row['id']}")] for row in rows]
     kb.append([InlineKeyboardButton("❌ Cancel", callback_data="main_menu")])
-    await q.edit_message_text("✏️ *Rename TOTP*\n\nSelect an account to rename:",
+    await q.edit_message_text("✏️ *Edit TOTP*\n\nSelect an account:",
         parse_mode="MarkdownV2", reply_markup=InlineKeyboardMarkup(kb))
-    return RENAME_PICK
+    return EDIT_PICK
 
-async def rename_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+async def edit_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
     acc_id = int(q.data.split("_")[1])
-    ctx.user_data["rename_id"] = acc_id
-    await q.edit_message_text("✏️ Enter the *new name* for this account:",
-        parse_mode="MarkdownV2", reply_markup=kb_cancel())
-    return RENAME_INPUT
+    uid = update.effective_user.id; vault = get_session(uid)
+    with get_db() as c:
+        row = c.execute("SELECT name FROM totp_accounts WHERE id=? AND vault_id=?", (acc_id, vault)).fetchone()
+    if not row:
+        await q.edit_message_text("⚠️ Account not found\\.", parse_mode="MarkdownV2", reply_markup=kb_main())
+        return TOTP_MENU
+    ctx.user_data["edit_id"] = acc_id
+    ctx.user_data["edit_name"] = row["name"]
+    await q.edit_message_text(
+        f"✏️ *{em(row['name'])}*\n\nWhat do you want to do?",
+        parse_mode="MarkdownV2",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("✏️ Rename", callback_data="edit_action_rename")],
+            [InlineKeyboardButton("🗑 Delete",  callback_data="edit_action_delete")],
+            [InlineKeyboardButton("❌ Cancel",  callback_data="edit_totp")],
+        ]))
+    return EDIT_ACTION
 
-async def rename_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+async def edit_action(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query; await q.answer()
+    action = q.data.split("_")[2]
+    if action == "rename":
+        await q.edit_message_text("✏️ Enter the *new name*:",
+            parse_mode="MarkdownV2", reply_markup=kb_cancel())
+        return EDIT_RENAME_INPUT
+    elif action == "delete":
+        name = ctx.user_data.get("edit_name", "")
+        await q.edit_message_text(
+            f"🗑 Delete *{em(name)}*?\n\n_This cannot be undone\\._",
+            parse_mode="MarkdownV2",
+            reply_markup=kb_confirm_danger("edit_action_delete_confirm", "edit_totp"))
+        return EDIT_ACTION
+
+async def edit_delete_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query; await q.answer()
+    uid = update.effective_user.id; vault = get_session(uid)
+    acc_id = ctx.user_data.pop("edit_id", None)
+    name   = ctx.user_data.pop("edit_name", "")
+    if acc_id:
+        with get_db() as c:
+            c.execute("DELETE FROM totp_accounts WHERE id=? AND vault_id=?", (acc_id, vault))
+            c.commit()
+    await q.edit_message_text(f"✅ *{em(name)}* deleted\\.",
+        parse_mode="MarkdownV2", reply_markup=kb_main())
+    return TOTP_MENU
+
+async def edit_rename_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     new_name = update.message.text.strip()
     uid = update.effective_user.id; vault = get_session(uid)
-    acc_id = ctx.user_data.pop("rename_id", None)
+    acc_id = ctx.user_data.pop("edit_id", None)
+    ctx.user_data.pop("edit_name", None)
     if not new_name or not acc_id:
         await update.message.reply_text("⚠️ Invalid name\\.", parse_mode="MarkdownV2", reply_markup=kb_main())
         return TOTP_MENU
@@ -544,17 +694,17 @@ async def show_profile(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text = (
         f"👤 *Profile*\n\n"
         f"*Name:* {em(name)}\n\n"
-        f"*Telegram ID:*\n`{uid}`\n_Tap to copy_\n\n"
-        f"*Vault ID:*\n`{em(vault)}`\n_Tap to copy_\n\n"
+        f"*Telegram ID:*\n`{uid}`\n\n"
+        f"*BV Vault ID:*\n`{em(vault)}`\n\n"
         f"*TOTP Accounts:* {totp_count}\n\n"
         f"*Timezone:* {em(tz)}\n\n"
         f"*Account Created:*\n{em(created_str)}"
     )
-    profile_kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🌐 Change Timezone", callback_data="change_tz")],
-        [InlineKeyboardButton("🏠 Main Menu",        callback_data="main_menu")],
-    ])
-    await q.edit_message_text(text, parse_mode="MarkdownV2", reply_markup=profile_kb)
+    await q.edit_message_text(text, parse_mode="MarkdownV2",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🌐 Change Timezone", callback_data="change_tz")],
+            [InlineKeyboardButton("🏠 Main Menu",        callback_data="main_menu")],
+        ]))
     return TOTP_MENU
 
 # ── CHANGE TIMEZONE ───────────────────────────────────────
@@ -562,30 +712,38 @@ async def change_tz_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
     await q.edit_message_text(
         "🌐 *Change Timezone*\n\n"
-        "Send your timezone name\\. Examples:\n\n"
-        "`Asia/Dhaka` \\— Bangladesh\n"
-        "`Asia/Kolkata` \\— India\n"
-        "`America/New_York` \\— US East\n"
-        "`Europe/London` \\— UK\n"
-        "`UTC` \\— Universal\n\n"
-        "Full list: _en\\.wikipedia\\.org/wiki/List\\_of\\_tz\\_database\\_time\\_zones_",
+        "Enter UTC offset format:\n\n"
+        "`\\+6:00` \\— Bangladesh \\(UTC\\+6\\)\n"
+        "`\\+5:30` \\— India\n"
+        "`\\+0:00` \\— UK / UTC\n"
+        "`\\-5:00` \\— US East\n"
+        "`\\-8:00` \\— US Pacific\n"
+        "`\\+8:00` \\— China / Singapore\n"
+        "`\\+9:00` \\— Japan / Korea\n\n"
+        "_Supported minutes: :00, :30, :45_",
         parse_mode="MarkdownV2", reply_markup=kb_cancel())
     return TZ_INPUT
 
 async def change_tz_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    tz_str = update.message.text.strip()
-    uid    = update.effective_user.id
+    raw = update.message.text.strip()
+    uid = update.effective_user.id
+    tz_str = parse_tz_offset(raw)
+    if not tz_str:
+        await update.message.reply_text(
+            f"⚠️ Invalid format\\. Use `\\+6:00` or `\\-5:30` style\\.",
+            parse_mode="MarkdownV2", reply_markup=kb_cancel())
+        return TZ_INPUT
+    # Verify it works
     try:
         import zoneinfo
         zoneinfo.ZoneInfo(tz_str)
     except Exception:
-        await update.message.reply_text(
-            f"⚠️ `{em(tz_str)}` is not a valid timezone\\. Try again:",
-            parse_mode="MarkdownV2", reply_markup=kb_cancel())
-        return TZ_INPUT
+        # Store as raw offset string for fmt_time fallback
+        pass
     with get_db() as c:
         c.execute("UPDATE users SET timezone=? WHERE telegram_id=?", (tz_str, uid)); c.commit()
-    await update.message.reply_text(f"✅ Timezone set to *{em(tz_str)}*\\.",
+    await update.message.reply_text(
+        f"✅ Timezone set to *{em(raw)}*\\.",
         parse_mode="MarkdownV2", reply_markup=kb_main())
     return TOTP_MENU
 
@@ -604,7 +762,7 @@ async def change_pw_old(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     try: await update.message.delete()
     except: pass
     uid = update.effective_user.id; vault = get_session(uid); u = get_user(vault)
-    if not hmac.compare_digest(hash_password(pw, bytes(u["pw_salt"])), bytes(u["password_hash"])):
+    if not u or not hmac.compare_digest(hash_password(pw, bytes(u["pw_salt"])), bytes(u["password_hash"])):
         await update.message.reply_text("❌ Wrong current password\\. Try again:",
             parse_mode="MarkdownV2", reply_markup=kb_cancel())
         return CHANGE_PW_OLD
@@ -632,9 +790,8 @@ async def change_pw_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if confirm != new_pw:
         await update.message.reply_text("❌ Passwords do not match\\.", parse_mode="MarkdownV2", reply_markup=kb_cancel())
         return CHANGE_PW_NEW
-    uid   = update.effective_user.id; vault = get_session(uid)
+    uid    = update.effective_user.id; vault = get_session(uid)
     old_pw = ctx.user_data.get("password", "")
-    # Re-encrypt all TOTP secrets with new password
     with get_db() as c:
         rows = c.execute("SELECT id,secret_enc,salt,iv FROM totp_accounts WHERE vault_id=?", (vault,)).fetchall()
         for row in rows:
@@ -644,14 +801,14 @@ async def change_pw_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 c.execute("UPDATE totp_accounts SET secret_enc=?,salt=?,iv=? WHERE id=?", (ct, s, iv, row["id"]))
             except Exception as e:
                 logger.error(f"Re-encrypt error: {e}")
-        # Update password hash
         new_salt = os.urandom(16)
         c.execute("UPDATE users SET password_hash=?,pw_salt=? WHERE vault_id=?",
             (hash_password(new_pw, new_salt), new_salt, vault))
         c.commit()
     ctx.user_data["password"] = new_pw
     ctx.user_data.pop("new_pw", None); ctx.user_data.pop("old_pw_verified", None)
-    await update.message.reply_text("✅ *Password changed successfully\\!*\nAll TOTP secrets re\\-encrypted\\.",
+    await update.message.reply_text(
+        "✅ *Password changed\\!* All TOTP secrets re\\-encrypted\\.",
         parse_mode="MarkdownV2", reply_markup=kb_main())
     return TOTP_MENU
 
@@ -663,27 +820,26 @@ async def export_vault_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return AUTH_MENU
     await q.edit_message_text(
         "📤 *Export Vault*\n\n"
-        "This will send you an encrypted backup file\\.\n"
-        "The file is protected with your current password\\.\n\n"
-        "⚠️ _Keep this file and your password safe\\._\n\n"
-        "Confirm export?",
-        parse_mode="MarkdownV2",
-        reply_markup=kb_confirm_danger("export_confirm"))
-    return EXPORT_CONFIRM
+        "Enter your *current password* to confirm export\\.\n\n"
+        "_Your backup will be AES\\-256\\-GCM encrypted\\._",
+        parse_mode="MarkdownV2", reply_markup=kb_cancel())
+    return EXPORT_PW_INPUT
 
-async def export_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query; await q.answer()
-    uid   = update.effective_user.id; vault = get_session(uid); pw = ctx.user_data.get("password")
-    if not vault or not pw:
-        await q.edit_message_text("Session expired\\. /start", parse_mode="MarkdownV2", reply_markup=kb_auth())
-        return AUTH_MENU
+async def export_pw_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    pw = update.message.text.strip()
+    try: await update.message.delete()
+    except: pass
+    uid = update.effective_user.id; vault = get_session(uid)
+    u   = get_user(vault)
+    if not u or not hmac.compare_digest(hash_password(pw, bytes(u["pw_salt"])), bytes(u["password_hash"])):
+        await update.message.reply_text("❌ Wrong password\\. Export cancelled\\.",
+            parse_mode="MarkdownV2", reply_markup=kb_settings())
+        return TOTP_MENU
     with get_db() as c:
         rows = c.execute("SELECT name,issuer,secret_enc,salt,iv FROM totp_accounts WHERE vault_id=?", (vault,)).fetchall()
     if not rows:
-        await q.edit_message_text("No TOTP accounts to export\\.", parse_mode="MarkdownV2", reply_markup=kb_main())
+        await update.message.reply_text("No TOTP accounts to export\\.", parse_mode="MarkdownV2", reply_markup=kb_main())
         return TOTP_MENU
-    # Build plaintext export, then encrypt with AES-256-GCM
-    import json
     entries = []
     for row in rows:
         try:
@@ -691,21 +847,17 @@ async def export_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             entries.append({"name": row["name"], "issuer": row["issuer"] or "", "secret": secret})
         except Exception as e:
             logger.error(f"Export decrypt error: {e}")
-    plain = json.dumps({"vault_id": vault, "accounts": entries}, ensure_ascii=False).encode()
-    # Encrypt with password-derived key
+    plain       = json.dumps({"vault_id": vault, "accounts": entries}, ensure_ascii=False).encode()
     export_salt = os.urandom(16); export_iv = os.urandom(12)
     export_key  = derive_enc_key(pw, vault, export_salt)
     ct          = AESGCM(export_key).encrypt(export_iv, plain, None)
-    # File: salt(16) + iv(12) + ciphertext
-    payload = export_salt + export_iv + ct
-    bio = BytesIO(payload)
-    bio.name = "blockveil_backup.bvault"
-    await update.effective_message.reply_document(
-        document=bio,
-        filename="blockveil_backup.bvault",
-        caption="🔒 *BlockVeil Encrypted Vault Backup*\n\nTo restore: use 📥 Import Vault\\.\nKeep this file and your password safe\\.",
+    payload     = export_salt + export_iv + ct
+    bio         = BytesIO(payload); bio.name = "blockveil_backup.bvault"
+    await update.message.reply_document(
+        document=bio, filename="blockveil_backup.bvault",
+        caption="🔒 *BlockVeil Encrypted Vault Backup*\n\nUse 📥 Import Vault to restore\\.\nKeep this file and your password safe\\.",
         parse_mode="MarkdownV2")
-    await q.edit_message_text("✅ *Vault exported successfully\\!*",
+    await update.message.reply_text("✅ *Vault exported successfully\\!*",
         parse_mode="MarkdownV2", reply_markup=kb_main())
     return TOTP_MENU
 
@@ -739,35 +891,35 @@ async def import_vault_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ Invalid backup file\\.", parse_mode="MarkdownV2", reply_markup=kb_cancel())
         return IMPORT_WAITING
     try:
-        import json
         export_salt = payload[:16]; export_iv = payload[16:28]; ct = payload[28:]
         export_key  = derive_enc_key(pw, vault, export_salt)
         plain       = AESGCM(export_key).decrypt(export_iv, ct, None)
         data        = json.loads(plain.decode())
         accounts    = data.get("accounts", [])
     except Exception:
-        await update.message.reply_text("❌ *Decryption failed\\.* Wrong password or corrupted file\\.",
+        await update.message.reply_text(
+            "❌ *Decryption failed\\.* Wrong password or corrupted file\\.",
             parse_mode="MarkdownV2", reply_markup=kb_cancel())
         return IMPORT_WAITING
     imported = 0; skipped = 0
     with get_db() as c:
-        existing_names = {r["name"] for r in c.execute("SELECT name FROM totp_accounts WHERE vault_id=?", (vault,)).fetchall()}
+        existing = {r["name"] for r in c.execute("SELECT name FROM totp_accounts WHERE vault_id=?", (vault,)).fetchall()}
         for acc in accounts:
-            if acc["name"] in existing_names:
-                skipped += 1; continue
+            if acc["name"] in existing: skipped += 1; continue
             try:
-                totp_now(acc["secret"])  # validate
-                ct2, s2, iv2 = encrypt_secret(acc["secret"], pw, vault)
+                ok, secret = validate_secret(acc["secret"])
+                if not ok: skipped += 1; continue
+                totp_now(secret)
+                ct2, s2, iv2 = encrypt_secret(secret, pw, vault)
                 c.execute("INSERT INTO totp_accounts (vault_id,name,issuer,secret_enc,salt,iv) VALUES (?,?,?,?,?,?)",
                     (vault, acc["name"], acc.get("issuer",""), ct2, s2, iv2))
                 imported += 1
             except Exception as e:
-                logger.error(f"Import error for {acc.get('name')}: {e}"); skipped += 1
+                logger.error(f"Import error: {e}"); skipped += 1
         c.commit()
     await update.message.reply_text(
         f"✅ *Import complete\\!*\n\n"
-        f"Imported: *{imported}* accounts\n"
-        f"Skipped: *{skipped}* \\(duplicates or errors\\)",
+        f"Imported: *{imported}*\nSkipped: *{skipped}* \\(duplicates or errors\\)",
         parse_mode="MarkdownV2", reply_markup=kb_main())
     return TOTP_MENU
 
@@ -776,10 +928,10 @@ async def delete_account_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
     await q.edit_message_text(
         "🗑 *Delete Account*\n\n"
-        "⚠️ *This will permanently delete your account and ALL TOTP data\\.*\n\n"
+        "⚠️ *Permanently deletes your account and ALL TOTP data\\.*\n\n"
         "This action *cannot be undone*\\. Are you sure?",
         parse_mode="MarkdownV2",
-        reply_markup=kb_confirm_danger("delete_account_confirm"))
+        reply_markup=kb_confirm_danger("delete_account_confirm", "settings"))
     return DELETE_ACCOUNT_CONFIRM
 
 async def delete_account_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -792,16 +944,15 @@ async def delete_account_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
             c.execute("DELETE FROM sessions WHERE telegram_id=?", (uid,))
             c.commit()
     ctx.user_data.clear()
-    await q.edit_message_text(
-        "🗑 *Account deleted\\.* All data has been permanently removed\\.",
+    await q.edit_message_text("🗑 *Account deleted\\.* All data permanently removed\\.",
         parse_mode="MarkdownV2", reply_markup=kb_auth())
     return AUTH_MENU
 
 # ── CANCEL / MENU ─────────────────────────────────────────
 async def cancel_to_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
-    ctx.user_data.pop("pending_name", None); ctx.user_data.pop("signup_pw", None)
-    ctx.user_data.pop("new_pw", None); ctx.user_data.pop("rename_id", None)
+    for k in ["pending_name","signup_pw","new_pw","edit_id","edit_name"]:
+        ctx.user_data.pop(k, None)
     uid = update.effective_user.id; vault = get_session(uid)
     if vault:
         await q.edit_message_text("Choose an option:", reply_markup=kb_main())
@@ -818,7 +969,7 @@ async def main_menu_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ── MAIN ──────────────────────────────────────────────────
 def main():
     if not SERVER_KEY:
-        raise RuntimeError("ENCRYPTION_KEY not set")
+        raise RuntimeError("ENCRYPTION_KEY environment variable not set")
     init_db()
     token = os.environ["BOT_TOKEN"]
     app   = ApplicationBuilder().token(token).build()
@@ -827,40 +978,56 @@ def main():
         entry_points=[CommandHandler("start", start)],
         states={
             AUTH_MENU: [
-                CallbackQueryHandler(signup_start, pattern="^auth_signup$"),
-                CallbackQueryHandler(login_start,  pattern="^auth_login$"),
+                CallbackQueryHandler(signup_start,  pattern="^auth_signup$"),
+                CallbackQueryHandler(login_start,   pattern="^auth_login$"),
             ],
             SIGNUP_PASSWORD:  [MessageHandler(filters.TEXT & ~filters.COMMAND, signup_password),  CallbackQueryHandler(cancel_to_menu, pattern="^cancel_to_menu$")],
             SIGNUP_CONFIRM:   [MessageHandler(filters.TEXT & ~filters.COMMAND, signup_confirm),   CallbackQueryHandler(cancel_to_menu, pattern="^cancel_to_menu$")],
-            LOGIN_ID:         [MessageHandler(filters.TEXT & ~filters.COMMAND, login_id),          CallbackQueryHandler(cancel_to_menu, pattern="^cancel_to_menu$")],
-            LOGIN_PASSWORD:   [MessageHandler(filters.TEXT & ~filters.COMMAND, login_password),    CallbackQueryHandler(cancel_to_menu, pattern="^cancel_to_menu$")],
-            TOTP_MENU: [
-                CallbackQueryHandler(add_totp_start,       pattern="^add_totp$"),
-                CallbackQueryHandler(list_totp,            pattern="^list_totp$"),
-                CallbackQueryHandler(rename_totp_start,    pattern="^rename_totp$"),
-                CallbackQueryHandler(show_profile,         pattern="^profile$"),
-                CallbackQueryHandler(export_vault_start,   pattern="^export_vault$"),
-                CallbackQueryHandler(import_vault_start,   pattern="^import_vault$"),
-                CallbackQueryHandler(change_pw_start,      pattern="^change_pw$"),
-                CallbackQueryHandler(delete_account_start, pattern="^delete_account$"),
-                CallbackQueryHandler(logout,               pattern="^logout$"),
-                CallbackQueryHandler(main_menu_cb,         pattern="^main_menu$"),
-                CallbackQueryHandler(delete_totp_entry,    pattern="^del_\\d+$"),
-                CallbackQueryHandler(change_tz_start,      pattern="^change_tz$"),
-                CallbackQueryHandler(export_confirm,       pattern="^export_confirm$"),
-                CallbackQueryHandler(delete_account_confirm, pattern="^delete_account_confirm$"),
-                CallbackQueryHandler(rename_pick,          pattern="^renamepick_\\d+$"),
+            LOGIN_ID: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, login_id),
+                CallbackQueryHandler(login_auto,   pattern="^login_auto$"),
+                CallbackQueryHandler(login_manual, pattern="^login_manual$"),
+                CallbackQueryHandler(cancel_to_menu, pattern="^cancel_to_menu$"),
             ],
-            ADD_WAITING:    [MessageHandler(filters.PHOTO | filters.Document.IMAGE, handle_add_input), MessageHandler(filters.TEXT & ~filters.COMMAND, handle_add_input), CallbackQueryHandler(cancel_to_menu, pattern="^cancel_to_menu$")],
+            LOGIN_PASSWORD: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, login_password),
+                CallbackQueryHandler(cancel_to_menu, pattern="^cancel_to_menu$"),
+            ],
+            TOTP_MENU: [
+                CallbackQueryHandler(add_totp_start,        pattern="^add_totp$"),
+                CallbackQueryHandler(list_totp,             pattern="^list_totp$"),
+                CallbackQueryHandler(edit_totp_start,       pattern="^edit_totp$"),
+                CallbackQueryHandler(show_profile,          pattern="^profile$"),
+                CallbackQueryHandler(settings_menu,         pattern="^settings$"),
+                CallbackQueryHandler(export_vault_start,    pattern="^export_vault$"),
+                CallbackQueryHandler(import_vault_start,    pattern="^import_vault$"),
+                CallbackQueryHandler(change_pw_start,       pattern="^change_pw$"),
+                CallbackQueryHandler(delete_account_start,  pattern="^delete_account$"),
+                CallbackQueryHandler(logout,                pattern="^logout$"),
+                CallbackQueryHandler(main_menu_cb,          pattern="^main_menu$"),
+                CallbackQueryHandler(change_tz_start,       pattern="^change_tz$"),
+                CallbackQueryHandler(edit_pick,             pattern="^editpick_\\d+$"),
+                CallbackQueryHandler(edit_action,           pattern="^edit_action_(rename|delete)$"),
+                CallbackQueryHandler(edit_delete_confirm,   pattern="^edit_action_delete_confirm$"),
+            ],
+            ADD_WAITING:       [MessageHandler(filters.PHOTO | filters.Document.IMAGE, handle_add_input), MessageHandler(filters.TEXT & ~filters.COMMAND, handle_add_input), CallbackQueryHandler(cancel_to_menu, pattern="^cancel_to_menu$")],
             ADD_MANUAL_NAME:   [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_manual_name),   CallbackQueryHandler(cancel_to_menu, pattern="^cancel_to_menu$")],
             ADD_MANUAL_SECRET: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_manual_secret), CallbackQueryHandler(cancel_to_menu, pattern="^cancel_to_menu$")],
-            RENAME_PICK:    [CallbackQueryHandler(rename_pick, pattern="^renamepick_\\d+$"), CallbackQueryHandler(main_menu_cb, pattern="^main_menu$")],
-            RENAME_INPUT:   [MessageHandler(filters.TEXT & ~filters.COMMAND, rename_input), CallbackQueryHandler(cancel_to_menu, pattern="^cancel_to_menu$")],
+            EDIT_PICK:   [CallbackQueryHandler(edit_pick,   pattern="^editpick_\\d+$"), CallbackQueryHandler(main_menu_cb, pattern="^main_menu$")],
+            EDIT_ACTION: [
+                CallbackQueryHandler(edit_action,         pattern="^edit_action_(rename|delete)$"),
+                CallbackQueryHandler(edit_delete_confirm, pattern="^edit_action_delete_confirm$"),
+                CallbackQueryHandler(edit_totp_start,     pattern="^edit_totp$"),
+            ],
+            EDIT_RENAME_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_rename_input), CallbackQueryHandler(cancel_to_menu, pattern="^cancel_to_menu$")],
             CHANGE_PW_OLD:     [MessageHandler(filters.TEXT & ~filters.COMMAND, change_pw_old),     CallbackQueryHandler(cancel_to_menu, pattern="^cancel_to_menu$")],
             CHANGE_PW_NEW:     [MessageHandler(filters.TEXT & ~filters.COMMAND, change_pw_new),     CallbackQueryHandler(cancel_to_menu, pattern="^cancel_to_menu$")],
             CHANGE_PW_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, change_pw_confirm), CallbackQueryHandler(cancel_to_menu, pattern="^cancel_to_menu$")],
-            DELETE_ACCOUNT_CONFIRM: [CallbackQueryHandler(delete_account_confirm, pattern="^delete_account_confirm$"), CallbackQueryHandler(main_menu_cb, pattern="^main_menu$")],
-            EXPORT_CONFIRM:  [CallbackQueryHandler(export_confirm, pattern="^export_confirm$"), CallbackQueryHandler(main_menu_cb, pattern="^main_menu$")],
+            DELETE_ACCOUNT_CONFIRM: [
+                CallbackQueryHandler(delete_account_confirm, pattern="^delete_account_confirm$"),
+                CallbackQueryHandler(settings_menu,          pattern="^settings$"),
+            ],
+            EXPORT_PW_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, export_pw_input), CallbackQueryHandler(cancel_to_menu, pattern="^cancel_to_menu$")],
             IMPORT_WAITING:  [MessageHandler(filters.Document.ALL, import_vault_file), CallbackQueryHandler(cancel_to_menu, pattern="^cancel_to_menu$")],
             TZ_INPUT:        [MessageHandler(filters.TEXT & ~filters.COMMAND, change_tz_input), CallbackQueryHandler(cancel_to_menu, pattern="^cancel_to_menu$")],
         },
