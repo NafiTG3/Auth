@@ -34,7 +34,8 @@ logger = logging.getLogger(__name__)
     TZ_INPUT,
     SHOW_SECRET_PW,
     SECURE_KEY_VIEW_PW,
-) = range(33)   # fixed count
+    SHARE_PICK,
+) = range(34)
 
 DB_PATH            = os.environ.get("DB_PATH", "auth.db")
 SERVER_KEY         = os.environ.get("ENCRYPTION_KEY", "").encode()
@@ -113,6 +114,19 @@ def init_db():
             except Exception:
                 pass
 
+        c.execute("""CREATE TABLE IF NOT EXISTS shared_codes (
+            token       TEXT    PRIMARY KEY,
+            vault_id    TEXT    NOT NULL,
+            totp_id     INTEGER NOT NULL,
+            secret_plain TEXT   NOT NULL,
+            expires_at  INTEGER NOT NULL,
+            created_at  INTEGER DEFAULT (strftime('%s','now')))"""
+        )
+        # Migration: add secret_plain if missing
+        try:
+            c.execute("ALTER TABLE shared_codes ADD COLUMN secret_plain TEXT NOT NULL DEFAULT ''")
+        except Exception:
+            pass
         c.commit()
 
 # ── Crypto ─────────────────────────────────────────────────
@@ -364,6 +378,40 @@ def parse_tz(raw: str):
     es = "-" if sign == "+" else "+"
     return f"Etc/GMT{es}{h}" if mn == 0 else f"UTC{sign}{h:02d}:{mn:02d}"
 
+
+# ── TOTP Share helpers ───────────────────────────────────────
+SHARE_TTL = 600  # 10 minutes
+
+def gen_share_token() -> str:
+    raw = secrets.token_bytes(32)
+    return base64.urlsafe_b64encode(raw).rstrip(b'=').decode()
+
+def create_share(vault_id: str, totp_id: int, secret_plain: str) -> str:
+    token      = gen_share_token()
+    expires_at = int(time.time()) + SHARE_TTL
+    with get_db() as c:
+        c.execute(
+            'INSERT INTO shared_codes (token,vault_id,totp_id,secret_plain,expires_at) VALUES (?,?,?,?,?)',
+            (token, vault_id, totp_id, secret_plain, expires_at)
+        )
+        c.commit()
+    return token
+
+def get_share(token: str):
+    with get_db() as c:
+        row = c.execute(
+            'SELECT vault_id,totp_id,secret_plain,expires_at FROM shared_codes WHERE token=?',
+            (token,)
+        ).fetchone()
+    if not row: return None
+    if int(time.time()) > row['expires_at']: return None
+    return row
+
+def cleanup_expired_shares():
+    with get_db() as c:
+        c.execute('DELETE FROM shared_codes WHERE expires_at<?', (int(time.time()),))
+        c.commit()
+
 # ── Keyboards ───────────────────────────────────────────────
 def kb_auth():
     return InlineKeyboardMarkup([[
@@ -536,6 +584,12 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not update.message:
         return
     uid   = update.effective_user.id
+    # Handle deep link: /start share_TOKEN
+    args = ctx.args
+    if args and args[0].startswith('share_'):
+        token = args[0][6:]  # strip 'share_'
+        await handle_share_view(update, ctx, token)
+        return ConversationHandler.END
     vault = get_session(uid)
     if vault:
         u = get_user(vault)
@@ -1754,7 +1808,12 @@ async def list_totp(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             logger.error(f"List TOTP decrypt error: {e}")
             lines.append(f"*{em(row['name'])}*\n_\\[Decrypt error\\]_")
     text = "📋 *Your TOTP Codes*\n\n" + "\n\n".join(lines)
-    await q.edit_message_text(text, parse_mode="MarkdownV2", reply_markup=kb_main())
+    list_kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔄 Refresh",     callback_data="list_totp")],
+        [InlineKeyboardButton("🔗 Share Codes", callback_data="share_codes_start")],
+        [InlineKeyboardButton("🏠 Main Menu",   callback_data="main_menu")],
+    ])
+    await q.edit_message_text(text, parse_mode="MarkdownV2", reply_markup=list_kb)
     return TOTP_MENU
 
 # ── EDIT TOTP (FIXED) ───────────────────────────────────────
@@ -2437,7 +2496,9 @@ def main():
                 CallbackQueryHandler(edit_pick,            pattern=r"^editpick_\d+$"),
                 CallbackQueryHandler(edit_action,          pattern=r"^edit_action_(rename|delete|showsecret)$"),
                 CallbackQueryHandler(edit_delete_confirm,  pattern="^edit_action_delete_confirm$"),
-                CallbackQueryHandler(global_add_cancel,    pattern="^global_add_cancel$"),
+                CallbackQueryHandler(global_add_cancel,     pattern="^global_add_cancel$"),
+                CallbackQueryHandler(share_codes_start,     pattern="^share_codes_start$"),
+                CallbackQueryHandler(share_pick,            pattern=r"^sharepick_\d+$"),
             ],
             ADD_WAITING: [
                 MessageHandler(private & (filters.PHOTO | filters.Document.IMAGE), handle_add_input),
@@ -2524,6 +2585,11 @@ def main():
             SECURE_KEY_VIEW_PW: [
                 MessageHandler(private & filters.TEXT & ~filters.COMMAND, view_secure_key_pw),
                 CallbackQueryHandler(cancel_to_menu, pattern="^cancel_to_menu$"),
+            ],
+            SHARE_PICK: [
+                CallbackQueryHandler(share_pick,        pattern=r"^sharepick_\d+$"),
+                CallbackQueryHandler(share_codes_start, pattern="^share_codes_start$"),
+                CallbackQueryHandler(list_totp,         pattern="^list_totp$"),
             ],
         },
         fallbacks=[CommandHandler("start", start, filters=private)],
