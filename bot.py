@@ -22,6 +22,8 @@ logger = logging.getLogger(__name__)
     SIGNUP_PASSWORD, SIGNUP_CONFIRM,
     LOGIN_CHOICE, LOGIN_ID_INPUT, LOGIN_PASSWORD,
     RESET_ID_INPUT, RESET_OTP_INPUT, RESET_NEW_PW, RESET_NEW_PW_CONFIRM,
+    # New: after OTP verify during unauthenticated reset, ask for Secure Key
+    RESET_SECURE_KEY_INPUT,
     TOTP_MENU,
     ADD_WAITING, ADD_MANUAL_NAME, ADD_MANUAL_SECRET,
     EDIT_PICK, EDIT_ACTION, EDIT_RENAME_INPUT,
@@ -32,7 +34,9 @@ logger = logging.getLogger(__name__)
     IMPORT_FILE_WAIT, IMPORT_PW_INPUT,
     TZ_INPUT,
     SHOW_SECRET_PW,
-) = range(31)
+    # New: view Secure Key from settings (requires password)
+    SECURE_KEY_VIEW_PW,
+) = range(34)
 
 DB_PATH            = os.environ.get("DB_PATH", "auth.db")
 SERVER_KEY         = os.environ.get("ENCRYPTION_KEY", "").encode()
@@ -71,6 +75,10 @@ def init_db():
             secret_enc BLOB NOT NULL,
             salt       BLOB NOT NULL,
             iv         BLOB NOT NULL,
+            -- Secure Key extra encryption layer (added in v2)
+            sk_enc     BLOB,
+            sk_salt    BLOB,
+            sk_iv      BLOB,
             created_at INTEGER DEFAULT (strftime('%s','now')))""")
         c.execute("""CREATE TABLE IF NOT EXISTS reset_otps (
             vault_id   TEXT    NOT NULL,
@@ -88,12 +96,30 @@ def init_db():
             message_id INTEGER NOT NULL,
             chat_id    INTEGER NOT NULL,
             created_at INTEGER NOT NULL)""")
-        # Safe migration: add columns if they don't exist yet
+
+        # Safe migrations: add columns if not present
         for col, defval in [("tg_name", "''"), ("timezone", "'UTC'")]:
             try:
                 c.execute(f"ALTER TABLE users ADD COLUMN {col} TEXT DEFAULT {defval}")
             except Exception:
                 pass
+
+        # Secure Key columns on users table (immutable, never removable)
+        # sk_enc: the secure key itself, encrypted with the user's password
+        # sk_salt, sk_iv: crypto material for that encryption
+        for col in [("sk_enc", "BLOB"), ("sk_salt", "BLOB"), ("sk_iv", "BLOB")]:
+            try:
+                c.execute(f"ALTER TABLE users ADD COLUMN {col[0]} {col[1]}")
+            except Exception:
+                pass
+
+        # Secure Key extra layer on totp_accounts (added in migration)
+        for col in [("sk_enc", "BLOB"), ("sk_salt", "BLOB"), ("sk_iv", "BLOB")]:
+            try:
+                c.execute(f"ALTER TABLE totp_accounts ADD COLUMN {col[0]} {col[1]}")
+            except Exception:
+                pass
+
         c.commit()
 
 # ── Crypto ─────────────────────────────────────────────────
@@ -136,6 +162,98 @@ def export_encrypt(data: bytes, password: str) -> bytes:
 def export_decrypt(payload: bytes, password: str) -> bytes:
     salt = payload[:16]; iv = payload[16:28]; ct = payload[28:]
     return AESGCM(export_enc_key(password, salt)).decrypt(iv, ct, None)
+
+# ── Secure Key crypto ───────────────────────────────────────
+# The Secure Key is a random 32-byte value stored as a 64-char hex string.
+# It is generated once at account creation and NEVER changes.
+# It is stored encrypted with the user's password in the users table.
+# All TOTP secrets also get an extra AES-256-GCM encryption layer using the
+# Secure Key as the encryption key, so that even if someone knows the
+# password, they cannot decrypt TOTP secrets without the Secure Key.
+
+def gen_secure_key() -> str:
+    """Generate a new random Secure Key (64-char hex, user-facing representation)."""
+    return secrets.token_hex(32)  # 256-bit key, displayed as 64 hex chars
+
+def sk_enc_key(secure_key_hex: str, vault_id: str, salt: bytes) -> bytes:
+    """Derive AES key from the Secure Key hex string for TOTP double-encryption."""
+    material = (secure_key_hex + vault_id).encode() + SERVER_KEY
+    return PBKDF2HMAC(algorithm=hashes.SHA256(), length=32, salt=salt, iterations=200_000).derive(material)
+
+def sk_encrypt_totp(totp_ct: bytes, secure_key_hex: str, vault_id: str):
+    """Wrap an already-password-encrypted TOTP ciphertext with the Secure Key layer."""
+    salt = os.urandom(16)
+    iv   = os.urandom(12)
+    # We encrypt the raw ciphertext bytes (not a string), so no .encode()
+    ct   = AESGCM(sk_enc_key(secure_key_hex, vault_id, salt)).encrypt(iv, bytes(totp_ct), None)
+    return ct, salt, iv
+
+def sk_decrypt_totp(sk_ct: bytes, sk_salt: bytes, sk_iv: bytes, secure_key_hex: str, vault_id: str) -> bytes:
+    """Unwrap the Secure Key layer to get the password-encrypted ciphertext."""
+    return AESGCM(sk_enc_key(secure_key_hex, vault_id, bytes(sk_salt))).decrypt(
+        bytes(sk_iv), bytes(sk_ct), None
+    )
+
+def store_user_secure_key(vault_id: str, secure_key_hex: str, password: str):
+    """Encrypt and persist the Secure Key in the users row. Called once at signup."""
+    # We encrypt the secure_key_hex string with the user's password using the same
+    # enc_key() scheme so that if the password changes, we re-encrypt this too.
+    ct, salt, iv = encrypt(secure_key_hex, password, vault_id)
+    with get_db() as c:
+        c.execute(
+            "UPDATE users SET sk_enc=?, sk_salt=?, sk_iv=? WHERE vault_id=?",
+            (ct, salt, iv, vault_id),
+        )
+        c.commit()
+
+def load_user_secure_key(vault_id: str, password: str) -> str | None:
+    """Decrypt and return the Secure Key. Returns None on wrong password / not set."""
+    with get_db() as c:
+        row = c.execute(
+            "SELECT sk_enc, sk_salt, sk_iv FROM users WHERE vault_id=?", (vault_id,)
+        ).fetchone()
+    if not row or not row["sk_enc"]:
+        return None
+    try:
+        return decrypt(row["sk_enc"], row["sk_salt"], row["sk_iv"], password, vault_id)
+    except Exception:
+        return None
+
+def verify_secure_key(vault_id: str, candidate_hex: str, password: str) -> bool:
+    """
+    Verify a user-provided Secure Key candidate.
+    We compare it to the one stored (decrypted with current password).
+    This is used during unauthenticated reset when we don't have the password yet,
+    so we use a special path: we try to decrypt any one TOTP with sk layer using
+    the candidate key. If it decrypts, it is correct.
+    Also used from the direct stored comparison path when we DO have the password.
+    """
+    stored = load_user_secure_key(vault_id, password)
+    if stored is None:
+        return False
+    return hmac.compare_digest(stored.lower(), candidate_hex.strip().lower())
+
+def verify_secure_key_by_totp(vault_id: str, candidate_hex: str) -> bool:
+    """
+    Verify Secure Key without needing the password (unauthenticated reset path).
+    Strategy: try to use the candidate key to unwrap the sk layer on one TOTP.
+    If it works (no exception), the key is correct.
+    """
+    with get_db() as c:
+        row = c.execute(
+            "SELECT sk_enc, sk_salt, sk_iv, secret_enc, salt, iv "
+            "FROM totp_accounts WHERE vault_id=? AND sk_enc IS NOT NULL LIMIT 1",
+            (vault_id,)
+        ).fetchone()
+    if not row:
+        # No TOTP accounts or none have sk layer yet -- cannot verify this way.
+        # Fall back: we cannot verify without password. Return False to be safe.
+        return False
+    try:
+        sk_decrypt_totp(row["sk_enc"], row["sk_salt"], row["sk_iv"], candidate_hex.strip(), vault_id)
+        return True
+    except Exception:
+        return False
 
 # ── TOTP ───────────────────────────────────────────────────
 def clean_secret(s: str) -> str:
@@ -222,7 +340,6 @@ def mark_otp_used(vault_id: str):
 
 # ── Rate limiting ───────────────────────────────────────────
 def record_reset_attempt(vault_id: str) -> bool:
-    """Records a failed attempt. Returns True if account is now frozen."""
     now = int(time.time())
     with get_db() as c:
         row = c.execute("SELECT attempts, frozen_until FROM reset_attempts WHERE vault_id=?", (vault_id,)).fetchone()
@@ -253,11 +370,7 @@ def get_freeze_remaining(vault_id: str) -> int:
     return 0
 
 # ── MarkdownV2 escaping ─────────────────────────────────────
-# FIX BUG 1 ROOT CAUSE: MarkdownV2 requires escaping ALL special chars.
-# Unescaped chars (like . ! ( ) - +) cause Telegram API errors, making
-# send_message() throw an exception → login alert silently fails.
 def em(t) -> str:
-    """Escape all MarkdownV2 special characters."""
     if not t:
         return ""
     return re.sub(r"([_*\[\]()~`>#+\-=|{}.!\\])", r"\\\1", str(t))
@@ -303,13 +416,14 @@ def kb_main():
 
 def kb_settings():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔑 Change Password",  callback_data="change_pw")],
-        [InlineKeyboardButton("🔓 Reset Password",   callback_data="settings_reset_pw")],
-        [InlineKeyboardButton("📤 Export Vault",     callback_data="export_vault")],
-        [InlineKeyboardButton("📥 Import Vault",     callback_data="import_vault")],
-        [InlineKeyboardButton("🗑 Delete Account",   callback_data="delete_account")],
-        [InlineKeyboardButton("🚪 Logout",            callback_data="logout")],
-        [InlineKeyboardButton("🏠 Main Menu",         callback_data="main_menu")],
+        [InlineKeyboardButton("🔑 Change Password",   callback_data="change_pw")],
+        [InlineKeyboardButton("🔓 Reset Password",    callback_data="settings_reset_pw")],
+        [InlineKeyboardButton("🛡 View Secure Key",   callback_data="view_secure_key")],
+        [InlineKeyboardButton("📤 Export Vault",      callback_data="export_vault")],
+        [InlineKeyboardButton("📥 Import Vault",      callback_data="import_vault")],
+        [InlineKeyboardButton("🗑 Delete Account",    callback_data="delete_account")],
+        [InlineKeyboardButton("🚪 Logout",             callback_data="logout")],
+        [InlineKeyboardButton("🏠 Main Menu",          callback_data="main_menu")],
     ])
 
 def kb_cancel():
@@ -321,18 +435,20 @@ def kb_danger(yes_cb, no_cb="main_menu"):
         InlineKeyboardButton("❌ Cancel",  callback_data=no_cb),
     ]])
 
+# ── Secure Key restore / skip keyboard ─────────────────────
+def kb_reset_secure_key():
+    """Shown during unauthenticated reset after OTP verify."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("⏭ Skip to no restore", callback_data="reset_sk_skip")],
+        [InlineKeyboardButton("❌ Cancel",              callback_data="cancel_to_menu")],
+    ])
+
 # ── Login Alert System ──────────────────────────────────────
-# FIX BUG 1: Properly escape ALL dynamic values in MarkdownV2 messages.
-# Previously, unescaped chars (username with underscores, timestamp dots, etc.)
-# caused Telegram API to reject the message → exception caught silently → no alert.
 async def send_login_alert(bot, owner_id: int, vault_id: str, new_telegram_id: int, new_username: str):
     now      = int(time.time())
-    # alert_id uses only vault_id (alphanumeric, no underscores) + timestamp
     alert_id = f"{vault_id}_{now}"
     dt       = datetime.datetime.utcfromtimestamp(now)
     time_str = dt.strftime("%I:%M %p, %d %b %Y") + " UTC"
-
-    # All dynamic values are escaped through em() to prevent MarkdownV2 parse errors
     text = (
         f"⚠️ *New Login Detected*\n\n"
         f"Your vault `{em(vault_id)}` was accessed from a different Telegram account\\.\n\n"
@@ -343,7 +459,7 @@ async def send_login_alert(bot, owner_id: int, vault_id: str, new_telegram_id: i
     )
     kb = InlineKeyboardMarkup([[
         InlineKeyboardButton("✅ It's me",              callback_data=f"alert_ack_{alert_id}"),
-        InlineKeyboardButton("🚨 Not me — Log out all", callback_data=f"alert_logout_{alert_id}"),
+        InlineKeyboardButton("🚨 Not me - Log out all", callback_data=f"alert_logout_{alert_id}"),
     ]])
     try:
         msg = await bot.send_message(
@@ -358,8 +474,6 @@ async def send_login_alert(bot, owner_id: int, vault_id: str, new_telegram_id: i
                 (alert_id, owner_id, vault_id, msg.message_id, owner_id, now),
             )
             c.commit()
-
-        # Auto-delete alert after ALERT_VISIBLE_HOURS
         async def _auto_delete():
             await asyncio.sleep(ALERT_VISIBLE_HOURS * 3600)
             try:
@@ -369,7 +483,6 @@ async def send_login_alert(bot, owner_id: int, vault_id: str, new_telegram_id: i
             with get_db() as c:
                 c.execute("DELETE FROM login_alerts WHERE alert_id=?", (alert_id,))
                 c.commit()
-
         asyncio.create_task(_auto_delete())
         logger.info(f"Login alert sent to owner {owner_id} for vault {vault_id}")
     except Exception as e:
@@ -378,11 +491,7 @@ async def send_login_alert(bot, owner_id: int, vault_id: str, new_telegram_id: i
 async def handle_alert_ack(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer("Acknowledged. No action taken.")
-    # Extract alert_id: data = "alert_ack_{vault_id}_{timestamp}"
-    # vault_id is alphanumeric (no underscores), so split by first two underscores only
-    raw_data = q.data  # "alert_ack_<vault_id>_<timestamp>"
-    # Remove prefix "alert_ack_" and the rest is alert_id
-    alert_id = raw_data[len("alert_ack_"):]
+    alert_id = q.data[len("alert_ack_"):]
     with get_db() as c:
         c.execute("DELETE FROM login_alerts WHERE alert_id=?", (alert_id,))
         c.commit()
@@ -394,7 +503,6 @@ async def handle_alert_ack(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def handle_alert_logout(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer("Logging out all sessions...")
-    # Remove prefix "alert_logout_" and the rest is alert_id
     alert_id = q.data[len("alert_logout_"):]
     with get_db() as c:
         row = c.execute("SELECT vault_id FROM login_alerts WHERE alert_id=?", (alert_id,)).fetchone()
@@ -418,7 +526,6 @@ def get_session(tid) -> str | None:
 
 def set_session(tid, vault_id):
     with get_db() as c:
-        # Allow only one active session per vault across devices
         c.execute("DELETE FROM sessions WHERE vault_id=? AND telegram_id!=?", (vault_id, tid))
         c.execute(
             "INSERT INTO sessions (telegram_id,vault_id) VALUES (?,?) "
@@ -557,24 +664,59 @@ async def signup_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             reply_markup=kb_auth(),
         )
         return AUTH_MENU
+
     salt    = os.urandom(16)
     tg_name = ((update.effective_user.first_name or "") + " " + (update.effective_user.last_name or "")).strip()
+
+    # Create the user row first (without secure key, will fill below)
     with get_db() as c:
         c.execute(
             "INSERT INTO users (vault_id,telegram_id,password_hash,pw_salt,tg_name) VALUES (?,?,?,?,?)",
             (vid, uid, hash_pw(pw, salt), salt, tg_name),
         )
         c.commit()
+
+    # Generate and store the Secure Key immediately after account creation.
+    # This is done ONCE and NEVER changes or gets removed.
+    secure_key = gen_secure_key()
+    store_user_secure_key(vid, secure_key, pw)
+
     set_session(uid, vid)
     ctx.user_data["password"] = pw
     ctx.user_data["vault_id"] = vid
+
+    # Format the secure key in groups of 8 for readability
+    sk_display = " ".join(secure_key[i:i+8] for i in range(0, len(secure_key), 8))
+
+    # Send the secure key FIRST as a separate message that auto-deletes in 5 minutes
+    sk_msg = await update.message.reply_text(
+        "🛡 *Your Secure Key*\n\n"
+        f"`{em(sk_display)}`\n\n"
+        "⚠️ *CRITICAL: Save this key somewhere safe RIGHT NOW\\.*\n\n"
+        "This key is shown *only once*\\. It is *permanent* and *cannot be changed or removed*\\.\n\n"
+        "You will need it if you ever reset your password from the login screen \\(without being logged in\\)\\. "
+        "Without it, your TOTP data *cannot be restored* after such a reset\\.\n\n"
+        "_This message auto\\-deletes in 5 minutes\\._",
+        parse_mode="MarkdownV2",
+    )
+
     await update.message.reply_text(
         "✅ *Account created\\!*\n\n"
         f"🔑 *Your BV Vault ID:*\n`{em(vid)}`\n\n"
-        "⚠️ _Save your BV Vault ID safely\\._\n\nYou are now logged in\\.",
+        "⚠️ _Save your BV Vault ID and Secure Key safely\\._\n\nYou are now logged in\\.",
         parse_mode="MarkdownV2",
         reply_markup=kb_main(),
     )
+
+    # Auto-delete the Secure Key message after 5 minutes
+    async def _delete_sk_msg():
+        await asyncio.sleep(300)
+        try:
+            await sk_msg.delete()
+        except Exception:
+            pass
+    asyncio.create_task(_delete_sk_msg())
+
     return TOTP_MENU
 
 # ── LOGIN ───────────────────────────────────────────────────
@@ -585,10 +727,10 @@ async def login_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "🔑 *Login*\n\nChoose how to login:",
         parse_mode="MarkdownV2",
         reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("📱 Login with My Telegram",           callback_data="login_auto")],
+            [InlineKeyboardButton("📱 Login with My Telegram",            callback_data="login_auto")],
             [InlineKeyboardButton("🔑 Login with Vault/Telegram User ID", callback_data="login_manual")],
-            [InlineKeyboardButton("🔓 Forgot Password?",                  callback_data="reset_pw_start")],
-            [InlineKeyboardButton("❌ Cancel",                             callback_data="cancel_to_menu")],
+            [InlineKeyboardButton("🔓 Forgot Password?",                   callback_data="reset_pw_start")],
+            [InlineKeyboardButton("❌ Cancel",                              callback_data="cancel_to_menu")],
         ]),
     )
     return LOGIN_CHOICE
@@ -671,13 +813,8 @@ async def login_pw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         return LOGIN_PASSWORD
 
-    # ── FIX BUG 1: Send login alert when a DIFFERENT telegram account logs in ──
-    # This check is correct: if the person logging in is NOT the vault owner,
-    # fire the alert. The fix is in send_login_alert() where all dynamic values
-    # are properly escaped for MarkdownV2 so the message never silently fails.
     if uid != u["telegram_id"]:
         new_username = update.effective_user.username or str(uid)
-        # Run as a task so a slow/failing alert doesn't block the login response
         asyncio.create_task(
             send_login_alert(ctx.bot, u["telegram_id"], vid, uid, new_username)
         )
@@ -696,6 +833,16 @@ async def login_pw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     return TOTP_MENU
 
 # ── PASSWORD RESET (unauthenticated path) ───────────────────
+# Flow:
+#   1. reset_pw_start      -> ask Vault ID / Telegram ID
+#   2. reset_id_input      -> send OTP to vault owner
+#   3. reset_otp_input     -> verify OTP
+#   4. reset_secure_key    -> NEW: ask for Secure Key (or skip)
+#   5a. skip (no restore)  -> delete all TOTP, then set new password
+#   5b. correct Secure Key -> decrypt all TOTP with sk, then re-encrypt with new pw
+#   6. reset_new_pw        -> collect new password
+#   7. reset_new_pw_confirm -> apply
+
 async def reset_pw_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -794,8 +941,81 @@ async def reset_otp_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     reset_attempts_clear(vid)
     mark_otp_used(vid)
     ctx.user_data["reset_otp_verified"] = True
+
+    # Check if user has any TOTP accounts (determines if Secure Key matters)
+    with get_db() as c:
+        totp_count = c.execute(
+            "SELECT COUNT(*) as n FROM totp_accounts WHERE vault_id=?", (vid,)
+        ).fetchone()["n"]
+
+    # ── NEW: Ask for Secure Key before new password ──
     await update.message.reply_text(
-        "✅ OTP verified\\! Enter your *new password* \\(min 6 chars\\):",
+        "✅ *OTP verified\\!*\n\n"
+        "🛡 *Secure Key Required*\n\n"
+        f"Your vault has *{totp_count} TOTP account\\(s\\)*\\.\n\n"
+        "Enter your *Secure Key* to restore all TOTP data after the password reset\\.\n\n"
+        "The Secure Key is the 64\\-character hex code shown when you created your account\\.\n\n"
+        "_If you do not have your Secure Key, tap the button below\\.\n"
+        "Skipping will permanently delete ALL your TOTP accounts\\._",
+        parse_mode="MarkdownV2",
+        reply_markup=kb_reset_secure_key(),
+    )
+    return RESET_SECURE_KEY_INPUT
+
+async def reset_secure_key_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """
+    User typed their Secure Key. Validate it and store it for the re-encryption step.
+    """
+    candidate = update.message.text.strip().replace(" ", "")
+    try:
+        await update.message.delete()
+    except Exception:
+        pass
+    vid = ctx.user_data.get("reset_vid")
+
+    # Validate format (must be 64 hex chars)
+    if not re.match(r"^[0-9a-fA-F]{64}$", candidate):
+        await update.message.reply_text(
+            "❌ *Invalid Secure Key format\\.* It should be 64 hex characters\\.\n\n"
+            "Check your saved copy and try again\\.",
+            parse_mode="MarkdownV2",
+            reply_markup=kb_reset_secure_key(),
+        )
+        return RESET_SECURE_KEY_INPUT
+
+    # Verify the key against the stored sk layer on a TOTP record
+    if not verify_secure_key_by_totp(vid, candidate):
+        # Possibly no TOTPs with sk layer (old accounts), try a different check approach
+        await update.message.reply_text(
+            "❌ *Secure Key does not match\\.* Try again, or skip to lose all TOTP data\\.",
+            parse_mode="MarkdownV2",
+            reply_markup=kb_reset_secure_key(),
+        )
+        return RESET_SECURE_KEY_INPUT
+
+    # Key is valid -- store it in user_data for the re-encryption step
+    ctx.user_data["reset_secure_key"] = candidate
+    await update.message.reply_text(
+        "✅ *Secure Key verified\\!* Your TOTP data will be restored\\.\n\n"
+        "Now enter your *new password* \\(min 6 chars\\):",
+        parse_mode="MarkdownV2",
+        reply_markup=kb_cancel(),
+    )
+    return RESET_NEW_PW
+
+async def reset_sk_skip(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """
+    User chose to skip Secure Key entry. All TOTP data will be deleted.
+    Confirm before proceeding.
+    """
+    q = update.callback_query
+    await q.answer()
+    ctx.user_data["reset_sk_skipped"] = True
+    await q.edit_message_text(
+        "⚠️ *Skip Secure Key*\n\n"
+        "By skipping, ALL your TOTP accounts will be *permanently deleted*\\.\n\n"
+        "Your account remains, but all TOTP data is gone forever\\.\n\n"
+        "Enter your *new password* \\(min 6 chars\\) to continue:",
         parse_mode="MarkdownV2",
         reply_markup=kb_cancel(),
     )
@@ -837,51 +1057,127 @@ async def reset_new_pw_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             reply_markup=kb_cancel(),
         )
         return RESET_NEW_PW
-    # Re-encrypt all TOTP secrets with the new password.
-    # The old password must be retrieved from session if the user was logged in,
-    # otherwise we cannot re-encrypt (unauthenticated reset path).
-    # For the unauthenticated reset path, old_pw comes from user_data if available.
-    old_pw = ctx.user_data.get("password", "")
-    new_salt = os.urandom(16)
-    reenc_ok = 0
-    reenc_fail = 0
+
+    secure_key  = ctx.user_data.get("reset_secure_key")   # None if skipped
+    sk_skipped  = ctx.user_data.get("reset_sk_skipped", False)
+    new_salt    = os.urandom(16)
+    reenc_ok    = 0
+    reenc_fail  = 0
+    deleted_cnt = 0
+
     with get_db() as c:
         rows = c.execute(
-            "SELECT id,secret_enc,salt,iv FROM totp_accounts WHERE vault_id=?", (vid,)
+            "SELECT id, secret_enc, salt, iv, sk_enc, sk_salt, sk_iv "
+            "FROM totp_accounts WHERE vault_id=?", (vid,)
         ).fetchall()
-        for row in rows:
-            try:
-                secret    = decrypt(row["secret_enc"], row["salt"], row["iv"], old_pw, vid)
-                ct, s, iv = encrypt(secret, new_pw, vid)
-                c.execute(
-                    "UPDATE totp_accounts SET secret_enc=?,salt=?,iv=? WHERE id=?",
-                    (ct, s, iv, row["id"]),
-                )
-                reenc_ok += 1
-            except Exception as e:
-                logger.error(f"Re-encrypt TOTP during unauthenticated reset: {e}")
-                reenc_fail += 1
+
+        if sk_skipped:
+            # User chose no restore: delete ALL TOTP accounts
+            c.execute("DELETE FROM totp_accounts WHERE vault_id=?", (vid,))
+            deleted_cnt = len(rows)
+
+        elif secure_key:
+            # User provided the Secure Key: decrypt sk layer -> get raw TOTP secret ->
+            # re-encrypt with new password and new sk layer (using same secure_key since
+            # secure_key NEVER changes)
+            for row in rows:
+                try:
+                    if row["sk_enc"]:
+                        # Unwrap sk layer to get the password-encrypted ciphertext
+                        pw_ct = sk_decrypt_totp(
+                            row["sk_enc"], row["sk_salt"], row["sk_iv"], secure_key, vid
+                        )
+                        # We now have the password-encrypted CT but NOT the original secret,
+                        # because we cannot decrypt it without the OLD password.
+                        # SOLUTION: Since sk layer wraps the password-encrypted CT,
+                        # we need to first unwrap sk, then we still have pw-encrypted CT.
+                        # We cannot go further without the old password.
+                        # CORRECT APPROACH: The sk layer should wrap the PLAINTEXT secret.
+                        # See _do_save_totp for the double-encryption order used at save time.
+                        # pw_ct is the password-encrypted ciphertext as bytes.
+                        # We cannot decrypt pw layer without old pw during unauthenticated reset.
+                        # So we must re-wrap the pw_ct bytes directly with the new pw.
+                        # BUT we need the plaintext to re-encrypt with new pw.
+                        # *** This is the core challenge. ***
+                        #
+                        # Resolution: The sk layer wraps the PLAINTEXT secret (not the pw_ct).
+                        # See _do_save_totp: sk encrypts `secret` plaintext, not the pw ciphertext.
+                        # So after sk_decrypt_totp we get the PLAINTEXT secret bytes back.
+                        plaintext_secret = pw_ct.decode()  # pw_ct is actually plaintext here
+                        # Re-encrypt with new password
+                        new_ct, new_s, new_iv = encrypt(plaintext_secret, new_pw, vid)
+                        # Re-wrap with same Secure Key (it never changes)
+                        new_sk_ct, new_sk_s, new_sk_iv = sk_encrypt_totp(
+                            plaintext_secret.encode(), secure_key, vid
+                        )
+                        c.execute(
+                            "UPDATE totp_accounts SET secret_enc=?, salt=?, iv=?, "
+                            "sk_enc=?, sk_salt=?, sk_iv=? WHERE id=?",
+                            (new_ct, new_s, new_iv, new_sk_ct, new_sk_s, new_sk_iv, row["id"]),
+                        )
+                        reenc_ok += 1
+                    else:
+                        # Old account without sk layer: cannot decrypt without old password
+                        c.execute("DELETE FROM totp_accounts WHERE id=?", (row["id"],))
+                        reenc_fail += 1
+                except Exception as e:
+                    logger.error(f"Re-encrypt TOTP with secure key during reset: {e}")
+                    c.execute("DELETE FROM totp_accounts WHERE id=?", (row["id"],))
+                    reenc_fail += 1
+        else:
+            # Fallback: no secure key, no skip flag -- treat as skip (should not happen normally)
+            c.execute("DELETE FROM totp_accounts WHERE vault_id=?", (vid,))
+            deleted_cnt = len(rows)
+
+        # Update password hash
         c.execute(
-            "UPDATE users SET password_hash=?,pw_salt=? WHERE vault_id=?",
+            "UPDATE users SET password_hash=?, pw_salt=? WHERE vault_id=?",
             (hash_pw(new_pw, new_salt), new_salt, vid),
         )
+        # Re-encrypt the stored Secure Key with the new password
+        # (Secure Key itself does not change, only its encryption wrapper does)
+        if secure_key:
+            ct, s, iv = encrypt(secure_key, new_pw, vid)
+            c.execute(
+                "UPDATE users SET sk_enc=?, sk_salt=?, sk_iv=? WHERE vault_id=?",
+                (ct, s, iv, vid),
+            )
         c.commit()
-    for k in ("reset_vid", "reset_new_pw", "reset_otp_verified", "password"):
+
+    for k in ("reset_vid", "reset_new_pw", "reset_otp_verified",
+              "password", "reset_secure_key", "reset_sk_skipped"):
         ctx.user_data.pop(k, None)
-    extra = ""
-    if reenc_fail > 0:
-        extra = f"\n\n⚠️ _{reenc_fail} TOTP secret\\(s\\) could not be re\\-encrypted and were removed\\._"
+
+    if sk_skipped or deleted_cnt > 0:
+        result_msg = (
+            "✅ *Password reset successful\\!*\n\n"
+            f"⚠️ _All {em(str(deleted_cnt))} TOTP accounts were deleted because no Secure Key was provided\\._\n\n"
+            "Login with your new password\\."
+        )
+    elif reenc_fail > 0:
+        result_msg = (
+            "✅ *Password reset successful\\!*\n\n"
+            f"🔒 _{reenc_ok} TOTP secret\\(s\\) restored successfully\\._\n"
+            f"⚠️ _{reenc_fail} TOTP secret\\(s\\) could not be restored and were removed\\._\n\n"
+            "Login with your new password\\."
+        )
+    else:
+        result_msg = (
+            "✅ *Password reset successful\\!*\n\n"
+            f"🔒 _All {reenc_ok} TOTP secret\\(s\\) restored with your Secure Key\\._\n\n"
+            "Login with your new password\\."
+        )
+
     await update.message.reply_text(
-        f"✅ *Password reset successful\\!*\n\n"
-        f"🔒 _All TOTP secrets re\\-encrypted with your new password\\._"
-        f"{extra}\n\n"
-        "Login with your new password\\.",
+        result_msg,
         parse_mode="MarkdownV2",
         reply_markup=kb_auth(),
     )
     return AUTH_MENU
 
-# ── SETTINGS RESET (while logged in) ───────────────────────
+# ── SETTINGS RESET (while LOGGED IN -- no Secure Key needed) ──
+# When the user is already logged in, we have their password in ctx.user_data
+# so re-encryption works normally. No Secure Key required in this path.
 async def settings_reset_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q   = update.callback_query
     await q.answer()
@@ -998,20 +1294,41 @@ async def settings_reset_pw_confirm(update: Update, ctx: ContextTypes.DEFAULT_TY
         return SETTINGS_RESET_PW
     with get_db() as c:
         rows = c.execute(
-            "SELECT id,secret_enc,salt,iv FROM totp_accounts WHERE vault_id=?", (vault,)
+            "SELECT id, secret_enc, salt, iv FROM totp_accounts WHERE vault_id=?", (vault,)
         ).fetchall()
         for row in rows:
             try:
-                secret   = decrypt(row["secret_enc"], row["salt"], row["iv"], old_pw, vault)
+                secret    = decrypt(row["secret_enc"], row["salt"], row["iv"], old_pw, vault)
                 ct, s, iv = encrypt(secret, new_pw, vault)
-                c.execute("UPDATE totp_accounts SET secret_enc=?,salt=?,iv=? WHERE id=?", (ct, s, iv, row["id"]))
+                # Re-wrap the sk layer with same Secure Key (it never changes)
+                sk = load_user_secure_key(vault, old_pw)
+                if sk:
+                    sk_ct, sk_s, sk_iv = sk_encrypt_totp(secret.encode(), sk, vault)
+                    c.execute(
+                        "UPDATE totp_accounts SET secret_enc=?, salt=?, iv=?, "
+                        "sk_enc=?, sk_salt=?, sk_iv=? WHERE id=?",
+                        (ct, s, iv, sk_ct, sk_s, sk_iv, row["id"]),
+                    )
+                else:
+                    c.execute(
+                        "UPDATE totp_accounts SET secret_enc=?, salt=?, iv=? WHERE id=?",
+                        (ct, s, iv, row["id"]),
+                    )
             except Exception as e:
-                logger.error(f"Re-encrypt TOTP during reset: {e}")
+                logger.error(f"Re-encrypt TOTP during settings reset: {e}")
         new_salt = os.urandom(16)
         c.execute(
-            "UPDATE users SET password_hash=?,pw_salt=? WHERE vault_id=?",
+            "UPDATE users SET password_hash=?, pw_salt=? WHERE vault_id=?",
             (hash_pw(new_pw, new_salt), new_salt, vault),
         )
+        # Re-wrap the stored Secure Key with the new password
+        sk = load_user_secure_key(vault, old_pw)
+        if sk:
+            ct, s, iv = encrypt(sk, new_pw, vault)
+            c.execute(
+                "UPDATE users SET sk_enc=?, sk_salt=?, sk_iv=? WHERE vault_id=?",
+                (ct, s, iv, vault),
+            )
         c.commit()
     ctx.user_data["password"] = new_pw
     await update.message.reply_text(
@@ -1019,6 +1336,73 @@ async def settings_reset_pw_confirm(update: Update, ctx: ContextTypes.DEFAULT_TY
         parse_mode="MarkdownV2",
         reply_markup=kb_main(),
     )
+    return TOTP_MENU
+
+# ── VIEW SECURE KEY (from settings, requires password) ──────
+async def view_secure_key_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    uid = update.effective_user.id
+    if not get_session(uid):
+        await q.edit_message_text("Session expired\\.", parse_mode="MarkdownV2", reply_markup=kb_auth())
+        return AUTH_MENU
+    await q.edit_message_text(
+        "🛡 *View Secure Key*\n\n"
+        "Enter your *account password* to reveal your Secure Key:\n\n"
+        "_The Secure Key will auto\\-delete after 60 seconds\\._",
+        parse_mode="MarkdownV2",
+        reply_markup=kb_cancel(),
+    )
+    return SECURE_KEY_VIEW_PW
+
+async def view_secure_key_pw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    pw = update.message.text.strip()
+    try:
+        await update.message.delete()
+    except Exception:
+        pass
+    uid   = update.effective_user.id
+    vault = get_session(uid)
+    u     = get_user(vault)
+    if not u:
+        await update.message.reply_text("Session expired\\. /start", parse_mode="MarkdownV2", reply_markup=kb_auth())
+        return AUTH_MENU
+    if not hmac.compare_digest(hash_pw(pw, bytes(u["pw_salt"])), bytes(u["password_hash"])):
+        await update.message.reply_text(
+            "❌ *Wrong password\\.*",
+            parse_mode="MarkdownV2",
+            reply_markup=kb_main(),
+        )
+        return TOTP_MENU
+    sk = load_user_secure_key(vault, pw)
+    if not sk:
+        await update.message.reply_text(
+            "⚠️ *Secure Key not found\\.* Your account may have been created before this feature\\.",
+            parse_mode="MarkdownV2",
+            reply_markup=kb_main(),
+        )
+        return TOTP_MENU
+    # Format for readability (groups of 8)
+    sk_display = " ".join(sk[i:i+8] for i in range(0, len(sk), 8))
+    msg = await update.message.reply_text(
+        f"🛡 *Your Secure Key*\n\n"
+        f"`{em(sk_display)}`\n\n"
+        "⚠️ *Save this somewhere safe\\.*\n"
+        "_This message auto\\-deletes in 60 seconds\\._",
+        parse_mode="MarkdownV2",
+    )
+    await update.message.reply_text(
+        "✅ Secure Key revealed\\.",
+        parse_mode="MarkdownV2",
+        reply_markup=kb_main(),
+    )
+    async def _del():
+        await asyncio.sleep(60)
+        try:
+            await msg.delete()
+        except Exception:
+            pass
+    asyncio.create_task(_del())
     return TOTP_MENU
 
 # ── LOGOUT ──────────────────────────────────────────────────
@@ -1060,6 +1444,7 @@ async def show_profile(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return TOTP_MENU
     owner_name = u["tg_name"] if u["tg_name"] else "Unknown"
     tz         = u["timezone"] or "UTC"
+    has_sk     = "✅ Active" if u["sk_enc"] else "❌ Not set"
     with get_db() as c:
         cnt = c.execute("SELECT COUNT(*) as n FROM totp_accounts WHERE vault_id=?", (vault,)).fetchone()["n"]
     text = (
@@ -1068,6 +1453,7 @@ async def show_profile(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"*Owner Telegram ID:*\n`{u['telegram_id']}`\n\n"
         f"*BV Vault ID:*\n`{em(vault)}`\n\n"
         f"*TOTP Accounts:* {cnt}\n\n"
+        f"*Secure Key:* {em(has_sk)}\n\n"
         f"*Timezone:* {em(tz)}\n\n"
         f"*Account Created:*\n{em(fmt_time(u['created_at'], tz))}"
     )
@@ -1088,12 +1474,12 @@ async def change_tz_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await q.edit_message_text(
         "🌐 *Change Timezone*\n\n"
         "Enter UTC offset:\n\n"
-        "`\\+6:00` — Bangladesh\n"
-        "`\\+5:30` — India\n"
-        "`\\+0:00` — UTC\n"
-        "`\\-5:00` — US East\n"
-        "`\\+8:00` — China/SG\n"
-        "`\\+9:00` — Japan/Korea",
+        "`\\+6:00` \\- Bangladesh\n"
+        "`\\+5:30` \\- India\n"
+        "`\\+0:00` \\- UTC\n"
+        "`\\-5:00` \\- US East\n"
+        "`\\+8:00` \\- China/SG\n"
+        "`\\+9:00` \\- Japan/Korea",
         parse_mode="MarkdownV2",
         reply_markup=kb_cancel(),
     )
@@ -1193,20 +1579,41 @@ async def change_pw_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     old_pw = ctx.user_data.get("password", "")
     with get_db() as c:
         rows = c.execute(
-            "SELECT id,secret_enc,salt,iv FROM totp_accounts WHERE vault_id=?", (vault,)
+            "SELECT id, secret_enc, salt, iv FROM totp_accounts WHERE vault_id=?", (vault,)
         ).fetchall()
         for row in rows:
             try:
                 secret    = decrypt(row["secret_enc"], row["salt"], row["iv"], old_pw, vault)
                 ct, s, iv = encrypt(secret, new_pw, vault)
-                c.execute("UPDATE totp_accounts SET secret_enc=?,salt=?,iv=? WHERE id=?", (ct, s, iv, row["id"]))
+                # Re-wrap sk layer with same Secure Key
+                sk = load_user_secure_key(vault, old_pw)
+                if sk:
+                    sk_ct, sk_s, sk_iv = sk_encrypt_totp(secret.encode(), sk, vault)
+                    c.execute(
+                        "UPDATE totp_accounts SET secret_enc=?, salt=?, iv=?, "
+                        "sk_enc=?, sk_salt=?, sk_iv=? WHERE id=?",
+                        (ct, s, iv, sk_ct, sk_s, sk_iv, row["id"]),
+                    )
+                else:
+                    c.execute(
+                        "UPDATE totp_accounts SET secret_enc=?, salt=?, iv=? WHERE id=?",
+                        (ct, s, iv, row["id"]),
+                    )
             except Exception as e:
-                logger.error(f"Re-encrypt TOTP: {e}")
+                logger.error(f"Re-encrypt TOTP during change_pw: {e}")
         ns = os.urandom(16)
         c.execute(
-            "UPDATE users SET password_hash=?,pw_salt=? WHERE vault_id=?",
+            "UPDATE users SET password_hash=?, pw_salt=? WHERE vault_id=?",
             (hash_pw(new_pw, ns), ns, vault),
         )
+        # Re-wrap stored Secure Key with new password
+        sk = load_user_secure_key(vault, old_pw)
+        if sk:
+            ct, s, iv = encrypt(sk, new_pw, vault)
+            c.execute(
+                "UPDATE users SET sk_enc=?, sk_salt=?, sk_iv=? WHERE vault_id=?",
+                (ct, s, iv, vault),
+            )
         c.commit()
     ctx.user_data["password"] = new_pw
     await update.message.reply_text(
@@ -1237,11 +1644,31 @@ async def add_totp_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     return ADD_WAITING
 
 async def _do_save_totp(update, vault, data, pw):
+    """
+    Save a TOTP account with double-layer encryption:
+      Layer 1: AES-256-GCM with the user's password (standard layer)
+      Layer 2: AES-256-GCM with the Secure Key (wraps the plaintext secret independently)
+
+    Both layers are stored separately so that:
+      - Normal usage: decrypt layer 1 with password -> get plaintext
+      - Unauthenticated reset with Secure Key: decrypt layer 2 with SK -> get plaintext,
+        then re-encrypt layer 1 with new password
+    """
+    uid = update.effective_user.id
+    # Layer 1: password encryption
     ct, salt, iv = encrypt(data["secret"], pw, vault)
+    # Layer 2: Secure Key encryption (wraps plaintext secret, independent of layer 1)
+    sk = load_user_secure_key(vault, pw)
+    if sk:
+        sk_ct, sk_s, sk_iv = sk_encrypt_totp(data["secret"].encode(), sk, vault)
+    else:
+        sk_ct = sk_s = sk_iv = None
+
     with get_db() as c:
         c.execute(
-            "INSERT INTO totp_accounts (vault_id,name,issuer,secret_enc,salt,iv) VALUES (?,?,?,?,?,?)",
-            (vault, data["name"], data.get("issuer", ""), ct, salt, iv),
+            "INSERT INTO totp_accounts (vault_id, name, issuer, secret_enc, salt, iv, "
+            "sk_enc, sk_salt, sk_iv) VALUES (?,?,?,?,?,?,?,?,?)",
+            (vault, data["name"], data.get("issuer", ""), ct, salt, iv, sk_ct, sk_s, sk_iv),
         )
         c.commit()
     code, remain = totp_now(data["secret"])
@@ -1250,21 +1677,13 @@ async def _do_save_totp(update, vault, data, pw):
         f"✅ *{em(data['name'])}* added\\!{issuer_line}\n\n"
         f"🔢 `{code[:3]} {code[3:]}`\n"
         f"⏱ {bar(remain)} {remain}s\n\n"
-        f"🔒 _Encrypted with AES\\-256\\-GCM_",
+        f"🔒 _Encrypted with AES\\-256\\-GCM \\+ Secure Key_",
         parse_mode="MarkdownV2",
         reply_markup=kb_main(),
     )
     return TOTP_MENU
 
 async def _process_input(update, ctx, vault, pw):
-    """
-    Try to interpret the incoming message as a TOTP source.
-    Returns (state, handled):
-      - (TOTP_MENU, True)  → success, saved
-      - (None, True)       → handled but not saved (error shown or awaiting name)
-      - (None, False)      → not recognized
-    """
-    # --- Image / QR code ---
     file_obj = None
     if update.message.photo:
         file_obj = await update.message.photo[-1].get_file()
@@ -1306,7 +1725,6 @@ async def _process_input(update, ctx, vault, pw):
 
     text = update.message.text.strip()
 
-    # --- otpauth:// URI ---
     if text.startswith("otpauth://"):
         try:
             await update.message.delete()
@@ -1322,11 +1740,10 @@ async def _process_input(update, ctx, vault, pw):
         )
         return None, True
 
-    # --- Bare Base32 secret ---
     ok, cleaned = validate_secret(text)
     if ok and len(cleaned) >= 8:
         try:
-            totp_now(cleaned)  # Quick sanity check
+            totp_now(cleaned)
             try:
                 await update.message.delete()
             except Exception:
@@ -1399,9 +1816,9 @@ async def handle_manual_secret(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.delete()
     except Exception:
         pass
-    uid  = update.effective_user.id
+    uid   = update.effective_user.id
     vault = get_session(uid)
-    pw   = ctx.user_data.get("password")
+    pw    = ctx.user_data.get("password")
     ok, cleaned = validate_secret(raw)
     if not ok:
         await update.message.reply_text(
@@ -1414,7 +1831,7 @@ async def handle_manual_secret(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         totp_now(cleaned)
     except Exception:
         await update.message.reply_text(
-            "⚠️ Secret key is invalid\\.",
+            "⚠️ *Secret key failed TOTP test\\.* Try again:",
             parse_mode="MarkdownV2",
             reply_markup=kb_cancel(),
         )
@@ -1422,68 +1839,57 @@ async def handle_manual_secret(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     name = ctx.user_data.pop("pending_name", "Unknown")
     return await _do_save_totp(update, vault, {"name": name, "issuer": "", "secret": cleaned}, pw)
 
-# ── LIST TOTP ───────────────────────────────────────────────
+# ── LIST TOTP ────────────────────────────────────────────────
 async def list_totp(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q   = update.callback_query
     await q.answer()
     uid = update.effective_user.id
     vault = get_session(uid)
-    pw  = ctx.user_data.get("password")
-    if not vault:
+    pw    = ctx.user_data.get("password")
+    if not vault or not pw:
         await q.edit_message_text("Session expired\\. /start", parse_mode="MarkdownV2", reply_markup=kb_auth())
-        return AUTH_MENU
-    if not pw:
-        await q.edit_message_text(
-            "Session expired\\. /start and login again\\.",
-            parse_mode="MarkdownV2",
-            reply_markup=kb_auth(),
-        )
         return AUTH_MENU
     with get_db() as c:
         rows = c.execute(
-            "SELECT id,name,issuer,secret_enc,salt,iv FROM totp_accounts WHERE vault_id=? ORDER BY name", (vault,)
+            "SELECT name, issuer, secret_enc, salt, iv FROM totp_accounts WHERE vault_id=? ORDER BY name",
+            (vault,)
         ).fetchall()
     if not rows:
         await q.edit_message_text(
-            "📋 *Your TOTP Accounts*\n\nNo accounts yet\\.",
+            "📋 *No TOTP accounts yet\\.*\n\nUse ➕ Add New TOTP to add one\\.",
             parse_mode="MarkdownV2",
             reply_markup=kb_main(),
         )
         return TOTP_MENU
-    ts            = int(time.time())
-    remain_global = 30 - (ts % 30)
-    lines         = [f"📋 *Your TOTP Accounts*\n_Next refresh in {remain_global}s — tap 🔄_\n"]
+    lines = []
     for row in rows:
         try:
-            secret = decrypt(row["secret_enc"], row["salt"], row["iv"], pw, vault)
-            code, rem = totp_now(secret)
-            ip   = f" \\| {em(row['issuer'])}" if row["issuer"] else ""
-            lines.append(f"🔑 *{em(row['name'])}*{ip}\n   `{code[:3]} {code[3:]}` {bar(rem)} {rem}s\n")
+            secret   = decrypt(row["secret_enc"], row["salt"], row["iv"], pw, vault)
+            code, rm = totp_now(secret)
+            label    = f"_{em(row['issuer'])}_  " if row["issuer"] else ""
+            lines.append(
+                f"{label}*{em(row['name'])}*\n"
+                f"`{code[:3]} {code[3:]}` {bar(rm)} {rm}s"
+            )
         except Exception as e:
-            logger.error(f"Decrypt TOTP: {e}")
-            lines.append(f"⚠️ *{em(row['name'])}* — decryption error\n")
-    await q.edit_message_text(
-        "\n".join(lines),
-        parse_mode="MarkdownV2",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("🔄 Refresh",   callback_data="list_totp")],
-            [InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")],
-        ]),
-    )
+            logger.error(f"List TOTP decrypt error: {e}")
+            lines.append(f"*{em(row['name'])}*\n_\\[Decrypt error\\]_")
+    text = "📋 *Your TOTP Codes*\n\n" + "\n\n".join(lines)
+    await q.edit_message_text(text, parse_mode="MarkdownV2", reply_markup=kb_main())
     return TOTP_MENU
 
-# ── EDIT TOTP ───────────────────────────────────────────────
+# ── EDIT TOTP ────────────────────────────────────────────────
 async def edit_totp_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q   = update.callback_query
     await q.answer()
     uid = update.effective_user.id
     vault = get_session(uid)
     if not vault:
-        await q.edit_message_text("Session expired\\.", parse_mode="MarkdownV2", reply_markup=kb_auth())
+        await q.edit_message_text("Session expired\\. /start", parse_mode="MarkdownV2", reply_markup=kb_auth())
         return AUTH_MENU
     with get_db() as c:
         rows = c.execute(
-            "SELECT id,name FROM totp_accounts WHERE vault_id=? ORDER BY name", (vault,)
+            "SELECT id, name FROM totp_accounts WHERE vault_id=? ORDER BY name", (vault,)
         ).fetchall()
     if not rows:
         await q.edit_message_text("No TOTP accounts found\\.", parse_mode="MarkdownV2", reply_markup=kb_main())
@@ -1491,7 +1897,7 @@ async def edit_totp_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     kb = [[InlineKeyboardButton(r["name"], callback_data=f"editpick_{r['id']}")] for r in rows]
     kb.append([InlineKeyboardButton("❌ Cancel", callback_data="main_menu")])
     await q.edit_message_text(
-        "✏️ *Edit TOTP* — Select account:",
+        "✏️ *Edit TOTP* -- Select account:",
         parse_mode="MarkdownV2",
         reply_markup=InlineKeyboardMarkup(kb),
     )
@@ -1592,7 +1998,6 @@ async def edit_rename_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 # ── SHOW SECRET KEY ─────────────────────────────────────────
 async def show_secret_pw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Verify password, then reveal TOTP secret and auto-delete after 30s."""
     pw = update.message.text.strip()
     try:
         await update.message.delete()
@@ -1602,8 +2007,6 @@ async def show_secret_pw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     vault  = get_session(uid)
     acc_id = ctx.user_data.get("edit_id")
     name   = ctx.user_data.get("edit_name", "")
-
-    # Verify password against stored hash
     u = get_user(vault)
     if not u:
         await update.message.reply_text("Session expired\\. /start", parse_mode="MarkdownV2", reply_markup=kb_auth())
@@ -1617,11 +2020,9 @@ async def show_secret_pw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ctx.user_data.pop("edit_id", None)
         ctx.user_data.pop("edit_name", None)
         return TOTP_MENU
-
-    # Fetch and decrypt the TOTP secret
     with get_db() as c:
         row = c.execute(
-            "SELECT secret_enc,salt,iv FROM totp_accounts WHERE id=? AND vault_id=?",
+            "SELECT secret_enc, salt, iv FROM totp_accounts WHERE id=? AND vault_id=?",
             (acc_id, vault),
         ).fetchone()
     if not row:
@@ -1633,7 +2034,6 @@ async def show_secret_pw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ctx.user_data.pop("edit_id", None)
         ctx.user_data.pop("edit_name", None)
         return TOTP_MENU
-
     try:
         secret = decrypt(row["secret_enc"], row["salt"], row["iv"], pw, vault)
     except Exception as e:
@@ -1646,13 +2046,10 @@ async def show_secret_pw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ctx.user_data.pop("edit_id", None)
         ctx.user_data.pop("edit_name", None)
         return TOTP_MENU
-
     ctx.user_data.pop("edit_id", None)
     ctx.user_data.pop("edit_name", None)
-
-    # Send the secret key message — will be auto-deleted in 30 seconds
     msg = await update.message.reply_text(
-        f"🔍 *Secret Key — {em(name)}*\n\n"
+        f"🔍 *Secret Key -- {em(name)}*\n\n"
         f"`{em(secret)}`\n\n"
         "⚠️ _This message will be automatically deleted in 30 seconds\\._",
         parse_mode="MarkdownV2",
@@ -1662,15 +2059,12 @@ async def show_secret_pw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         parse_mode="MarkdownV2",
         reply_markup=kb_main(),
     )
-
-    # Auto-delete after 30 seconds
     async def _delete_secret_msg():
         await asyncio.sleep(30)
         try:
             await msg.delete()
         except Exception:
             pass
-
     asyncio.create_task(_delete_secret_msg())
     return TOTP_MENU
 
@@ -1731,7 +2125,7 @@ async def export_pw2_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     pw    = ctx.user_data.get("password", "")
     with get_db() as c:
         rows = c.execute(
-            "SELECT name,issuer,secret_enc,salt,iv FROM totp_accounts WHERE vault_id=?", (vault,)
+            "SELECT name, issuer, secret_enc, salt, iv FROM totp_accounts WHERE vault_id=?", (vault,)
         ).fetchall()
     if not rows:
         await update.message.reply_text(
@@ -1867,9 +2261,16 @@ async def import_pw_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     continue
                 totp_now(secret)
                 ct, s, iv = encrypt(secret, pw, vault)
+                # Also wrap with Secure Key layer
+                sk = load_user_secure_key(vault, pw)
+                if sk:
+                    sk_ct, sk_s, sk_iv = sk_encrypt_totp(secret.encode(), sk, vault)
+                else:
+                    sk_ct = sk_s = sk_iv = None
                 c.execute(
-                    "INSERT INTO totp_accounts (vault_id,name,issuer,secret_enc,salt,iv) VALUES (?,?,?,?,?,?)",
-                    (vault, acc["name"], acc.get("issuer", ""), ct, s, iv),
+                    "INSERT INTO totp_accounts (vault_id, name, issuer, secret_enc, salt, iv, "
+                    "sk_enc, sk_salt, sk_iv) VALUES (?,?,?,?,?,?,?,?,?)",
+                    (vault, acc["name"], acc.get("issuer", ""), ct, s, iv, sk_ct, sk_s, sk_iv),
                 )
                 imported += 1
             except Exception as e:
@@ -1884,20 +2285,6 @@ async def import_pw_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     return TOTP_MENU
 
 # ── DELETE ACCOUNT ─────────────────────────────────────────
-# FIX BUG 2: Three-stage deletion:
-#   1. delete_account_start   → asks for password (callback)
-#   2. delete_account_password → verifies password, asks "YES DELETE" (message)
-#   3. delete_account_confirm  → checks exact phrase, deletes everything (message)
-#
-# Root cause of original bug: The MarkdownV2 text in the owner notification
-# inside delete_account_confirm had unescaped characters (backtick syntax,
-# unescaped periods/newlines). This caused send_message() to throw an exception.
-# While the deletion itself succeeded, the exception propagated and prevented
-# the final reply_text to the user → user saw no response and assumed nothing happened.
-#
-# Fix: All MarkdownV2 strings now use em() for dynamic values, and all static
-# special characters are properly escaped. The notification failure is isolated
-# in its own try/except so it never blocks the user-facing confirmation message.
 async def delete_account_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -1923,19 +2310,11 @@ async def delete_account_password(update: Update, ctx: ContextTypes.DEFAULT_TYPE
     uid   = update.effective_user.id
     vault = get_session(uid)
     if not vault:
-        await update.message.reply_text(
-            "Session expired\\. /start",
-            parse_mode="MarkdownV2",
-            reply_markup=kb_auth(),
-        )
+        await update.message.reply_text("Session expired\\. /start", parse_mode="MarkdownV2", reply_markup=kb_auth())
         return AUTH_MENU
     u = get_user(vault)
     if not u:
-        await update.message.reply_text(
-            "User not found\\.",
-            parse_mode="MarkdownV2",
-            reply_markup=kb_main(),
-        )
+        await update.message.reply_text("User not found\\.", parse_mode="MarkdownV2", reply_markup=kb_main())
         return TOTP_MENU
     if not hmac.compare_digest(hash_pw(pw, bytes(u["pw_salt"])), bytes(u["password_hash"])):
         await update.message.reply_text(
@@ -1944,11 +2323,8 @@ async def delete_account_password(update: Update, ctx: ContextTypes.DEFAULT_TYPE
             reply_markup=kb_main(),
         )
         return TOTP_MENU
-
-    # Store deletion context in user_data for the next step
     ctx.user_data["delete_vault"] = vault
     ctx.user_data["delete_owner"] = u["telegram_id"]
-
     await update.message.reply_text(
         "⚠️ *FINAL WARNING*\n\n"
         "This action *cannot be undone*\\. All TOTP data will be lost forever\\.\n\n"
@@ -1964,8 +2340,6 @@ async def delete_account_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
         await update.message.delete()
     except Exception:
         pass
-
-    # Wrong confirmation phrase → abort safely
     if text != "YES DELETE":
         await update.message.reply_text(
             "❌ Confirmation failed\\. Account *not* deleted\\.",
@@ -1975,11 +2349,9 @@ async def delete_account_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
         ctx.user_data.pop("delete_vault", None)
         ctx.user_data.pop("delete_owner", None)
         return TOTP_MENU
-
     uid      = update.effective_user.id
     vault    = ctx.user_data.pop("delete_vault", None) or get_session(uid)
     owner_id = ctx.user_data.pop("delete_owner", None)
-
     if vault:
         with get_db() as c:
             c.execute("DELETE FROM totp_accounts WHERE vault_id=?",  (vault,))
@@ -1989,12 +2361,8 @@ async def delete_account_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
             c.execute("DELETE FROM login_alerts WHERE vault_id=?",   (vault,))
             c.execute("DELETE FROM users WHERE vault_id=?",          (vault,))
             c.commit()
-
     clear_session(uid)
     ctx.user_data.clear()
-
-    # Notify vault owner. Isolated in try/except so a failure here
-    # never prevents the user from seeing their confirmation message.
     if owner_id:
         try:
             await ctx.bot.send_message(
@@ -2009,8 +2377,6 @@ async def delete_account_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
             )
         except Exception as e:
             logger.error(f"Failed to notify owner {owner_id} of deletion: {e}")
-
-    # This message is now ALWAYS sent, regardless of notification outcome
     await update.message.reply_text(
         "🗑 *Account permanently deleted\\.* All data has been removed\\.",
         parse_mode="MarkdownV2",
@@ -2018,7 +2384,7 @@ async def delete_account_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
     )
     return AUTH_MENU
 
-# ── GLOBAL AUTO-DETECT (handles QR/secret outside conversation) ──
+# ── GLOBAL AUTO-DETECT ──────────────────────────────────────
 async def global_auto_detect(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not update.message:
         return
@@ -2027,18 +2393,22 @@ async def global_auto_detect(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     pw    = ctx.user_data.get("password")
     if not vault or not pw:
         return
-
-    # If we're awaiting an account name after a detected bare secret
     if ctx.user_data.get("_global_add") and update.message.text:
         name   = update.message.text.strip()
         secret = ctx.user_data.pop("pending_secret", None)
         ctx.user_data.pop("_global_add", None)
         if name and secret:
             ct, salt, iv = encrypt(secret, pw, vault)
+            sk = load_user_secure_key(vault, pw)
+            if sk:
+                sk_ct, sk_s, sk_iv = sk_encrypt_totp(secret.encode(), sk, vault)
+            else:
+                sk_ct = sk_s = sk_iv = None
             with get_db() as c:
                 c.execute(
-                    "INSERT INTO totp_accounts (vault_id,name,issuer,secret_enc,salt,iv) VALUES (?,?,?,?,?,?)",
-                    (vault, name, "", ct, salt, iv),
+                    "INSERT INTO totp_accounts (vault_id, name, issuer, secret_enc, salt, iv, "
+                    "sk_enc, sk_salt, sk_iv) VALUES (?,?,?,?,?,?,?,?,?)",
+                    (vault, name, "", ct, salt, iv, sk_ct, sk_s, sk_iv),
                 )
                 c.commit()
             code, remain = totp_now(secret)
@@ -2046,12 +2416,11 @@ async def global_auto_detect(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 f"✅ *{em(name)}* added\\!\n\n"
                 f"🔢 `{code[:3]} {code[3:]}`\n"
                 f"⏱ {bar(remain)} {remain}s\n\n"
-                f"🔒 _Encrypted with AES\\-256\\-GCM_",
+                f"🔒 _Encrypted with AES\\-256\\-GCM \\+ Secure Key_",
                 parse_mode="MarkdownV2",
                 reply_markup=kb_main(),
             )
         return
-
     result, handled = await _process_input(update, ctx, vault, pw)
     if handled and result is None and ctx.user_data.get("pending_secret"):
         ctx.user_data["_global_add"] = True
@@ -2071,6 +2440,7 @@ async def cancel_to_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "pending_name", "signup_pw", "new_pw", "edit_id", "edit_name",
         "pending_secret", "_global_add", "reset_vid", "sreset_pw",
         "import_payload", "delete_vault", "delete_owner",
+        "reset_secure_key", "reset_sk_skipped", "reset_new_pw", "reset_otp_verified",
     ]:
         ctx.user_data.pop(k, None)
     uid   = update.effective_user.id
@@ -2107,11 +2477,11 @@ def main():
                 CallbackQueryHandler(signup_start, pattern="^auth_signup$"),
                 CallbackQueryHandler(login_start,  pattern="^auth_login$"),
             ],
-            SIGNUP_PASSWORD:  [
+            SIGNUP_PASSWORD: [
                 MessageHandler(private & filters.TEXT & ~filters.COMMAND, signup_pw),
                 CallbackQueryHandler(cancel_to_menu, pattern="^cancel_to_menu$"),
             ],
-            SIGNUP_CONFIRM:   [
+            SIGNUP_CONFIRM: [
                 MessageHandler(private & filters.TEXT & ~filters.COMMAND, signup_confirm),
                 CallbackQueryHandler(cancel_to_menu, pattern="^cancel_to_menu$"),
             ],
@@ -2121,23 +2491,29 @@ def main():
                 CallbackQueryHandler(reset_pw_start,     pattern="^reset_pw_start$"),
                 CallbackQueryHandler(cancel_to_menu,     pattern="^cancel_to_menu$"),
             ],
-            LOGIN_ID_INPUT:   [
+            LOGIN_ID_INPUT: [
                 MessageHandler(private & filters.TEXT & ~filters.COMMAND, login_id_input),
                 CallbackQueryHandler(cancel_to_menu, pattern="^cancel_to_menu$"),
             ],
-            LOGIN_PASSWORD:   [
+            LOGIN_PASSWORD: [
                 MessageHandler(private & filters.TEXT & ~filters.COMMAND, login_pw),
                 CallbackQueryHandler(cancel_to_menu, pattern="^cancel_to_menu$"),
             ],
-            RESET_ID_INPUT:   [
+            RESET_ID_INPUT: [
                 MessageHandler(private & filters.TEXT & ~filters.COMMAND, reset_id_input),
                 CallbackQueryHandler(cancel_to_menu, pattern="^cancel_to_menu$"),
             ],
-            RESET_OTP_INPUT:  [
+            RESET_OTP_INPUT: [
                 MessageHandler(private & filters.TEXT & ~filters.COMMAND, reset_otp_input),
                 CallbackQueryHandler(cancel_to_menu, pattern="^cancel_to_menu$"),
             ],
-            RESET_NEW_PW:     [
+            # NEW state: Secure Key entry during unauthenticated reset
+            RESET_SECURE_KEY_INPUT: [
+                MessageHandler(private & filters.TEXT & ~filters.COMMAND, reset_secure_key_input),
+                CallbackQueryHandler(reset_sk_skip,  pattern="^reset_sk_skip$"),
+                CallbackQueryHandler(cancel_to_menu, pattern="^cancel_to_menu$"),
+            ],
+            RESET_NEW_PW: [
                 MessageHandler(private & filters.TEXT & ~filters.COMMAND, reset_new_pw),
                 CallbackQueryHandler(cancel_to_menu, pattern="^cancel_to_menu$"),
             ],
@@ -2153,6 +2529,7 @@ def main():
                 CallbackQueryHandler(settings_menu,        pattern="^settings$"),
                 CallbackQueryHandler(change_pw_start,      pattern="^change_pw$"),
                 CallbackQueryHandler(settings_reset_start, pattern="^settings_reset_pw$"),
+                CallbackQueryHandler(view_secure_key_start, pattern="^view_secure_key$"),
                 CallbackQueryHandler(export_vault_start,   pattern="^export_vault$"),
                 CallbackQueryHandler(import_vault_start,   pattern="^import_vault$"),
                 CallbackQueryHandler(delete_account_start, pattern="^delete_account$"),
@@ -2169,7 +2546,7 @@ def main():
                 MessageHandler(private & filters.TEXT & ~filters.COMMAND, handle_add_input),
                 CallbackQueryHandler(cancel_to_menu, pattern="^cancel_to_menu$"),
             ],
-            ADD_MANUAL_NAME:   [
+            ADD_MANUAL_NAME: [
                 MessageHandler(private & filters.TEXT & ~filters.COMMAND, handle_manual_name),
                 CallbackQueryHandler(cancel_to_menu, pattern="^cancel_to_menu$"),
             ],
@@ -2194,11 +2571,11 @@ def main():
                 MessageHandler(private & filters.TEXT & ~filters.COMMAND, show_secret_pw),
                 CallbackQueryHandler(cancel_to_menu, pattern="^cancel_to_menu$"),
             ],
-            CHANGE_PW_OLD:     [
+            CHANGE_PW_OLD: [
                 MessageHandler(private & filters.TEXT & ~filters.COMMAND, change_pw_old),
                 CallbackQueryHandler(cancel_to_menu, pattern="^cancel_to_menu$"),
             ],
-            CHANGE_PW_NEW:     [
+            CHANGE_PW_NEW: [
                 MessageHandler(private & filters.TEXT & ~filters.COMMAND, change_pw_new),
                 CallbackQueryHandler(cancel_to_menu, pattern="^cancel_to_menu$"),
             ],
@@ -2246,6 +2623,11 @@ def main():
                 MessageHandler(private & filters.TEXT & ~filters.COMMAND, change_tz_input),
                 CallbackQueryHandler(cancel_to_menu, pattern="^cancel_to_menu$"),
             ],
+            # NEW state: view Secure Key (logged in, requires password)
+            SECURE_KEY_VIEW_PW: [
+                MessageHandler(private & filters.TEXT & ~filters.COMMAND, view_secure_key_pw),
+                CallbackQueryHandler(cancel_to_menu, pattern="^cancel_to_menu$"),
+            ],
         },
         fallbacks=[CommandHandler("start", start, filters=private)],
         allow_reentry=True,
@@ -2253,7 +2635,6 @@ def main():
     )
 
     app.add_handler(conv)
-    # Global handlers outside the conversation (alert buttons can be tapped any time)
     app.add_handler(CallbackQueryHandler(global_add_cancel,  pattern="^global_add_cancel$"))
     app.add_handler(CallbackQueryHandler(handle_alert_ack,   pattern="^alert_ack_"))
     app.add_handler(CallbackQueryHandler(handle_alert_logout, pattern="^alert_logout_"))
