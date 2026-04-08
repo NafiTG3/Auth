@@ -1780,7 +1780,7 @@ async def edit_totp_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             kb.append([InlineKeyboardButton(r["name"], callback_data=f"editpick_{r['id']}")])
         kb.append([InlineKeyboardButton("❌ Cancel", callback_data="main_menu")])
         await q.edit_message_text(
-            "✏️ *Edit TOTP* -- Select account:",
+            "✏️ *Edit TOTP* \\-\\- Select account:",
             parse_mode="MarkdownV2",
             reply_markup=InlineKeyboardMarkup(kb),
         )
@@ -1949,7 +1949,7 @@ async def show_secret_pw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data.pop("edit_id", None)
     ctx.user_data.pop("edit_name", None)
     msg = await update.message.reply_text(
-        f"🔍 *Secret Key -- {em(name)}*\n\n"
+        f"🔍 *Secret Key \\-\\- {em(name)}*\n\n"
         f"`{em(secret)}`\n\n"
         "⚠️ _This message will be automatically deleted in 30 seconds\\._",
         parse_mode="MarkdownV2",
