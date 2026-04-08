@@ -31,7 +31,8 @@ logger = logging.getLogger(__name__)
     EXPORT_PW1_INPUT, EXPORT_PW2_INPUT,
     IMPORT_FILE_WAIT, IMPORT_PW_INPUT,
     TZ_INPUT,
-) = range(30)
+    SHOW_SECRET_PW,
+) = range(31)
 
 DB_PATH            = os.environ.get("DB_PATH", "auth.db")
 SERVER_KEY         = os.environ.get("ENCRYPTION_KEY", "").encode()
@@ -836,20 +837,44 @@ async def reset_new_pw_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             reply_markup=kb_cancel(),
         )
         return RESET_NEW_PW
+    # Re-encrypt all TOTP secrets with the new password.
+    # The old password must be retrieved from session if the user was logged in,
+    # otherwise we cannot re-encrypt (unauthenticated reset path).
+    # For the unauthenticated reset path, old_pw comes from user_data if available.
+    old_pw = ctx.user_data.get("password", "")
     new_salt = os.urandom(16)
+    reenc_ok = 0
+    reenc_fail = 0
     with get_db() as c:
+        rows = c.execute(
+            "SELECT id,secret_enc,salt,iv FROM totp_accounts WHERE vault_id=?", (vid,)
+        ).fetchall()
+        for row in rows:
+            try:
+                secret    = decrypt(row["secret_enc"], row["salt"], row["iv"], old_pw, vid)
+                ct, s, iv = encrypt(secret, new_pw, vid)
+                c.execute(
+                    "UPDATE totp_accounts SET secret_enc=?,salt=?,iv=? WHERE id=?",
+                    (ct, s, iv, row["id"]),
+                )
+                reenc_ok += 1
+            except Exception as e:
+                logger.error(f"Re-encrypt TOTP during unauthenticated reset: {e}")
+                reenc_fail += 1
         c.execute(
             "UPDATE users SET password_hash=?,pw_salt=? WHERE vault_id=?",
             (hash_pw(new_pw, new_salt), new_salt, vid),
         )
-        # Clear TOTP secrets because old encryption key is now invalid
-        c.execute("DELETE FROM totp_accounts WHERE vault_id=?", (vid,))
         c.commit()
-    for k in ("reset_vid", "reset_new_pw", "reset_otp_verified"):
+    for k in ("reset_vid", "reset_new_pw", "reset_otp_verified", "password"):
         ctx.user_data.pop(k, None)
+    extra = ""
+    if reenc_fail > 0:
+        extra = f"\n\n⚠️ _{reenc_fail} TOTP secret\\(s\\) could not be re\\-encrypted and were removed\\._"
     await update.message.reply_text(
-        "✅ *Password reset successful\\!*\n\n"
-        "⚠️ _TOTP secrets were cleared for security\\. Please re\\-add your accounts\\._\n\n"
+        f"✅ *Password reset successful\\!*\n\n"
+        f"🔒 _All TOTP secrets re\\-encrypted with your new password\\._"
+        f"{extra}\n\n"
         "Login with your new password\\.",
         parse_mode="MarkdownV2",
         reply_markup=kb_auth(),
@@ -1491,9 +1516,10 @@ async def edit_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"✏️ *{em(row['name'])}*\n\nWhat would you like to do?",
         parse_mode="MarkdownV2",
         reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("✏️ Rename", callback_data="edit_action_rename")],
-            [InlineKeyboardButton("🗑 Delete",  callback_data="edit_action_delete")],
-            [InlineKeyboardButton("❌ Cancel",  callback_data="edit_totp")],
+            [InlineKeyboardButton("✏️ Rename",         callback_data="edit_action_rename")],
+            [InlineKeyboardButton("🗑 Delete",           callback_data="edit_action_delete")],
+            [InlineKeyboardButton("🔍 Show Secret Key", callback_data="edit_action_showsecret")],
+            [InlineKeyboardButton("❌ Cancel",           callback_data="edit_totp")],
         ]),
     )
     return EDIT_ACTION
@@ -1509,6 +1535,16 @@ async def edit_action(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             reply_markup=kb_cancel(),
         )
         return EDIT_RENAME_INPUT
+    if action == "showsecret":
+        name = ctx.user_data.get("edit_name", "")
+        await q.edit_message_text(
+            f"🔍 *Show Secret Key*\n\n"
+            f"Account: *{em(name)}*\n\n"
+            "🔒 Enter your *account password* to reveal the secret key:",
+            parse_mode="MarkdownV2",
+            reply_markup=kb_cancel(),
+        )
+        return SHOW_SECRET_PW
     name = ctx.user_data.get("edit_name", "")
     await q.edit_message_text(
         f"🗑 Delete *{em(name)}*?\n\n_This cannot be undone\\._",
@@ -1552,6 +1588,90 @@ async def edit_rename_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         parse_mode="MarkdownV2",
         reply_markup=kb_main(),
     )
+    return TOTP_MENU
+
+# ── SHOW SECRET KEY ─────────────────────────────────────────
+async def show_secret_pw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Verify password, then reveal TOTP secret and auto-delete after 30s."""
+    pw = update.message.text.strip()
+    try:
+        await update.message.delete()
+    except Exception:
+        pass
+    uid    = update.effective_user.id
+    vault  = get_session(uid)
+    acc_id = ctx.user_data.get("edit_id")
+    name   = ctx.user_data.get("edit_name", "")
+
+    # Verify password against stored hash
+    u = get_user(vault)
+    if not u:
+        await update.message.reply_text("Session expired\\. /start", parse_mode="MarkdownV2", reply_markup=kb_auth())
+        return AUTH_MENU
+    if not hmac.compare_digest(hash_pw(pw, bytes(u["pw_salt"])), bytes(u["password_hash"])):
+        await update.message.reply_text(
+            "❌ *Wrong password\\.* Secret key not revealed\\.",
+            parse_mode="MarkdownV2",
+            reply_markup=kb_main(),
+        )
+        ctx.user_data.pop("edit_id", None)
+        ctx.user_data.pop("edit_name", None)
+        return TOTP_MENU
+
+    # Fetch and decrypt the TOTP secret
+    with get_db() as c:
+        row = c.execute(
+            "SELECT secret_enc,salt,iv FROM totp_accounts WHERE id=? AND vault_id=?",
+            (acc_id, vault),
+        ).fetchone()
+    if not row:
+        await update.message.reply_text(
+            "⚠️ Account not found\\.",
+            parse_mode="MarkdownV2",
+            reply_markup=kb_main(),
+        )
+        ctx.user_data.pop("edit_id", None)
+        ctx.user_data.pop("edit_name", None)
+        return TOTP_MENU
+
+    try:
+        secret = decrypt(row["secret_enc"], row["salt"], row["iv"], pw, vault)
+    except Exception as e:
+        logger.error(f"Decrypt for show_secret failed: {e}")
+        await update.message.reply_text(
+            "❌ *Failed to decrypt secret key\\.*",
+            parse_mode="MarkdownV2",
+            reply_markup=kb_main(),
+        )
+        ctx.user_data.pop("edit_id", None)
+        ctx.user_data.pop("edit_name", None)
+        return TOTP_MENU
+
+    ctx.user_data.pop("edit_id", None)
+    ctx.user_data.pop("edit_name", None)
+
+    # Send the secret key message — will be auto-deleted in 30 seconds
+    msg = await update.message.reply_text(
+        f"🔍 *Secret Key — {em(name)}*\n\n"
+        f"`{em(secret)}`\n\n"
+        "⚠️ _This message will be automatically deleted in 30 seconds\\._",
+        parse_mode="MarkdownV2",
+    )
+    await update.message.reply_text(
+        "✅ Secret key revealed\\. Keep it safe\\!",
+        parse_mode="MarkdownV2",
+        reply_markup=kb_main(),
+    )
+
+    # Auto-delete after 30 seconds
+    async def _delete_secret_msg():
+        await asyncio.sleep(30)
+        try:
+            await msg.delete()
+        except Exception:
+            pass
+
+    asyncio.create_task(_delete_secret_msg())
     return TOTP_MENU
 
 # ── EXPORT VAULT ────────────────────────────────────────────
@@ -2040,7 +2160,7 @@ def main():
                 CallbackQueryHandler(main_menu_cb,         pattern="^main_menu$"),
                 CallbackQueryHandler(change_tz_start,      pattern="^change_tz$"),
                 CallbackQueryHandler(edit_pick,            pattern=r"^editpick_\d+$"),
-                CallbackQueryHandler(edit_action,          pattern=r"^edit_action_(rename|delete)$"),
+                CallbackQueryHandler(edit_action,          pattern=r"^edit_action_(rename|delete|showsecret)$"),
                 CallbackQueryHandler(edit_delete_confirm,  pattern="^edit_action_delete_confirm$"),
                 CallbackQueryHandler(global_add_cancel,    pattern="^global_add_cancel$"),
             ],
@@ -2062,12 +2182,16 @@ def main():
                 CallbackQueryHandler(main_menu_cb, pattern="^main_menu$"),
             ],
             EDIT_ACTION: [
-                CallbackQueryHandler(edit_action,         pattern=r"^edit_action_(rename|delete)$"),
+                CallbackQueryHandler(edit_action,         pattern=r"^edit_action_(rename|delete|showsecret)$"),
                 CallbackQueryHandler(edit_delete_confirm, pattern="^edit_action_delete_confirm$"),
                 CallbackQueryHandler(edit_totp_start,     pattern="^edit_totp$"),
             ],
             EDIT_RENAME_INPUT: [
                 MessageHandler(private & filters.TEXT & ~filters.COMMAND, edit_rename_input),
+                CallbackQueryHandler(cancel_to_menu, pattern="^cancel_to_menu$"),
+            ],
+            SHOW_SECRET_PW: [
+                MessageHandler(private & filters.TEXT & ~filters.COMMAND, show_secret_pw),
                 CallbackQueryHandler(cancel_to_menu, pattern="^cancel_to_menu$"),
             ],
             CHANGE_PW_OLD:     [
