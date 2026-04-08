@@ -22,7 +22,6 @@ logger = logging.getLogger(__name__)
     SIGNUP_PASSWORD, SIGNUP_CONFIRM,
     LOGIN_CHOICE, LOGIN_ID_INPUT, LOGIN_PASSWORD,
     RESET_ID_INPUT, RESET_OTP_INPUT, RESET_NEW_PW, RESET_NEW_PW_CONFIRM,
-    # New: after OTP verify during unauthenticated reset, ask for Secure Key
     RESET_SECURE_KEY_INPUT,
     TOTP_MENU,
     ADD_WAITING, ADD_MANUAL_NAME, ADD_MANUAL_SECRET,
@@ -34,9 +33,8 @@ logger = logging.getLogger(__name__)
     IMPORT_FILE_WAIT, IMPORT_PW_INPUT,
     TZ_INPUT,
     SHOW_SECRET_PW,
-    # New: view Secure Key from settings (requires password)
     SECURE_KEY_VIEW_PW,
-) = range(34)
+) = range(33)   # fixed: was 34, now 33
 
 DB_PATH            = os.environ.get("DB_PATH", "auth.db")
 SERVER_KEY         = os.environ.get("ENCRYPTION_KEY", "").encode()
@@ -75,7 +73,6 @@ def init_db():
             secret_enc BLOB NOT NULL,
             salt       BLOB NOT NULL,
             iv         BLOB NOT NULL,
-            -- Secure Key extra encryption layer (added in v2)
             sk_enc     BLOB,
             sk_salt    BLOB,
             sk_iv      BLOB,
@@ -97,23 +94,19 @@ def init_db():
             chat_id    INTEGER NOT NULL,
             created_at INTEGER NOT NULL)""")
 
-        # Safe migrations: add columns if not present
+        # Migrations
         for col, defval in [("tg_name", "''"), ("timezone", "'UTC'")]:
             try:
                 c.execute(f"ALTER TABLE users ADD COLUMN {col} TEXT DEFAULT {defval}")
             except Exception:
                 pass
 
-        # Secure Key columns on users table (immutable, never removable)
-        # sk_enc: the secure key itself, encrypted with the user's password
-        # sk_salt, sk_iv: crypto material for that encryption
         for col in [("sk_enc", "BLOB"), ("sk_salt", "BLOB"), ("sk_iv", "BLOB")]:
             try:
                 c.execute(f"ALTER TABLE users ADD COLUMN {col[0]} {col[1]}")
             except Exception:
                 pass
 
-        # Secure Key extra layer on totp_accounts (added in migration)
         for col in [("sk_enc", "BLOB"), ("sk_salt", "BLOB"), ("sk_iv", "BLOB")]:
             try:
                 c.execute(f"ALTER TABLE totp_accounts ADD COLUMN {col[0]} {col[1]}")
@@ -164,40 +157,25 @@ def export_decrypt(payload: bytes, password: str) -> bytes:
     return AESGCM(export_enc_key(password, salt)).decrypt(iv, ct, None)
 
 # ── Secure Key crypto ───────────────────────────────────────
-# The Secure Key is a random 32-byte value stored as a 64-char hex string.
-# It is generated once at account creation and NEVER changes.
-# It is stored encrypted with the user's password in the users table.
-# All TOTP secrets also get an extra AES-256-GCM encryption layer using the
-# Secure Key as the encryption key, so that even if someone knows the
-# password, they cannot decrypt TOTP secrets without the Secure Key.
-
 def gen_secure_key() -> str:
-    """Generate a new random Secure Key (64-char hex, user-facing representation)."""
-    return secrets.token_hex(32)  # 256-bit key, displayed as 64 hex chars
+    return secrets.token_hex(32)
 
 def sk_enc_key(secure_key_hex: str, vault_id: str, salt: bytes) -> bytes:
-    """Derive AES key from the Secure Key hex string for TOTP double-encryption."""
     material = (secure_key_hex + vault_id).encode() + SERVER_KEY
     return PBKDF2HMAC(algorithm=hashes.SHA256(), length=32, salt=salt, iterations=200_000).derive(material)
 
-def sk_encrypt_totp(totp_ct: bytes, secure_key_hex: str, vault_id: str):
-    """Wrap an already-password-encrypted TOTP ciphertext with the Secure Key layer."""
+def sk_encrypt_totp(totp_plain_bytes: bytes, secure_key_hex: str, vault_id: str):
     salt = os.urandom(16)
     iv   = os.urandom(12)
-    # We encrypt the raw ciphertext bytes (not a string), so no .encode()
-    ct   = AESGCM(sk_enc_key(secure_key_hex, vault_id, salt)).encrypt(iv, bytes(totp_ct), None)
+    ct   = AESGCM(sk_enc_key(secure_key_hex, vault_id, salt)).encrypt(iv, totp_plain_bytes, None)
     return ct, salt, iv
 
 def sk_decrypt_totp(sk_ct: bytes, sk_salt: bytes, sk_iv: bytes, secure_key_hex: str, vault_id: str) -> bytes:
-    """Unwrap the Secure Key layer to get the password-encrypted ciphertext."""
     return AESGCM(sk_enc_key(secure_key_hex, vault_id, bytes(sk_salt))).decrypt(
         bytes(sk_iv), bytes(sk_ct), None
     )
 
 def store_user_secure_key(vault_id: str, secure_key_hex: str, password: str):
-    """Encrypt and persist the Secure Key in the users row. Called once at signup."""
-    # We encrypt the secure_key_hex string with the user's password using the same
-    # enc_key() scheme so that if the password changes, we re-encrypt this too.
     ct, salt, iv = encrypt(secure_key_hex, password, vault_id)
     with get_db() as c:
         c.execute(
@@ -207,7 +185,6 @@ def store_user_secure_key(vault_id: str, secure_key_hex: str, password: str):
         c.commit()
 
 def load_user_secure_key(vault_id: str, password: str) -> str | None:
-    """Decrypt and return the Secure Key. Returns None on wrong password / not set."""
     with get_db() as c:
         row = c.execute(
             "SELECT sk_enc, sk_salt, sk_iv FROM users WHERE vault_id=?", (vault_id,)
@@ -219,35 +196,13 @@ def load_user_secure_key(vault_id: str, password: str) -> str | None:
     except Exception:
         return None
 
-def verify_secure_key(vault_id: str, candidate_hex: str, password: str) -> bool:
-    """
-    Verify a user-provided Secure Key candidate.
-    We compare it to the one stored (decrypted with current password).
-    This is used during unauthenticated reset when we don't have the password yet,
-    so we use a special path: we try to decrypt any one TOTP with sk layer using
-    the candidate key. If it decrypts, it is correct.
-    Also used from the direct stored comparison path when we DO have the password.
-    """
-    stored = load_user_secure_key(vault_id, password)
-    if stored is None:
-        return False
-    return hmac.compare_digest(stored.lower(), candidate_hex.strip().lower())
-
 def verify_secure_key_by_totp(vault_id: str, candidate_hex: str) -> bool:
-    """
-    Verify Secure Key without needing the password (unauthenticated reset path).
-    Strategy: try to use the candidate key to unwrap the sk layer on one TOTP.
-    If it works (no exception), the key is correct.
-    """
     with get_db() as c:
         row = c.execute(
-            "SELECT sk_enc, sk_salt, sk_iv, secret_enc, salt, iv "
-            "FROM totp_accounts WHERE vault_id=? AND sk_enc IS NOT NULL LIMIT 1",
+            "SELECT sk_enc, sk_salt, sk_iv FROM totp_accounts WHERE vault_id=? AND sk_enc IS NOT NULL LIMIT 1",
             (vault_id,)
         ).fetchone()
     if not row:
-        # No TOTP accounts or none have sk layer yet -- cannot verify this way.
-        # Fall back: we cannot verify without password. Return False to be safe.
         return False
     try:
         sk_decrypt_totp(row["sk_enc"], row["sk_salt"], row["sk_iv"], candidate_hex.strip(), vault_id)
@@ -435,9 +390,7 @@ def kb_danger(yes_cb, no_cb="main_menu"):
         InlineKeyboardButton("❌ Cancel",  callback_data=no_cb),
     ]])
 
-# ── Secure Key restore / skip keyboard ─────────────────────
 def kb_reset_secure_key():
-    """Shown during unauthenticated reset after OTP verify."""
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("⏭ Skip to no restore", callback_data="reset_sk_skip")],
         [InlineKeyboardButton("❌ Cancel",              callback_data="cancel_to_menu")],
@@ -668,7 +621,6 @@ async def signup_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     salt    = os.urandom(16)
     tg_name = ((update.effective_user.first_name or "") + " " + (update.effective_user.last_name or "")).strip()
 
-    # Create the user row first (without secure key, will fill below)
     with get_db() as c:
         c.execute(
             "INSERT INTO users (vault_id,telegram_id,password_hash,pw_salt,tg_name) VALUES (?,?,?,?,?)",
@@ -676,8 +628,6 @@ async def signup_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         c.commit()
 
-    # Generate and store the Secure Key immediately after account creation.
-    # This is done ONCE and NEVER changes or gets removed.
     secure_key = gen_secure_key()
     store_user_secure_key(vid, secure_key, pw)
 
@@ -685,10 +635,8 @@ async def signup_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data["password"] = pw
     ctx.user_data["vault_id"] = vid
 
-    # Format the secure key in groups of 8 for readability
     sk_display = " ".join(secure_key[i:i+8] for i in range(0, len(secure_key), 8))
 
-    # Send the secure key FIRST as a separate message that auto-deletes in 5 minutes
     sk_msg = await update.message.reply_text(
         "🛡 *Your Secure Key*\n\n"
         f"`{em(sk_display)}`\n\n"
@@ -708,7 +656,6 @@ async def signup_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         reply_markup=kb_main(),
     )
 
-    # Auto-delete the Secure Key message after 5 minutes
     async def _delete_sk_msg():
         await asyncio.sleep(300)
         try:
@@ -833,16 +780,6 @@ async def login_pw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     return TOTP_MENU
 
 # ── PASSWORD RESET (unauthenticated path) ───────────────────
-# Flow:
-#   1. reset_pw_start      -> ask Vault ID / Telegram ID
-#   2. reset_id_input      -> send OTP to vault owner
-#   3. reset_otp_input     -> verify OTP
-#   4. reset_secure_key    -> NEW: ask for Secure Key (or skip)
-#   5a. skip (no restore)  -> delete all TOTP, then set new password
-#   5b. correct Secure Key -> decrypt all TOTP with sk, then re-encrypt with new pw
-#   6. reset_new_pw        -> collect new password
-#   7. reset_new_pw_confirm -> apply
-
 async def reset_pw_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -942,13 +879,11 @@ async def reset_otp_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     mark_otp_used(vid)
     ctx.user_data["reset_otp_verified"] = True
 
-    # Check if user has any TOTP accounts (determines if Secure Key matters)
     with get_db() as c:
         totp_count = c.execute(
             "SELECT COUNT(*) as n FROM totp_accounts WHERE vault_id=?", (vid,)
         ).fetchone()["n"]
 
-    # ── NEW: Ask for Secure Key before new password ──
     await update.message.reply_text(
         "✅ *OTP verified\\!*\n\n"
         "🛡 *Secure Key Required*\n\n"
@@ -963,9 +898,6 @@ async def reset_otp_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     return RESET_SECURE_KEY_INPUT
 
 async def reset_secure_key_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """
-    User typed their Secure Key. Validate it and store it for the re-encryption step.
-    """
     candidate = update.message.text.strip().replace(" ", "")
     try:
         await update.message.delete()
@@ -973,7 +905,6 @@ async def reset_secure_key_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
         pass
     vid = ctx.user_data.get("reset_vid")
 
-    # Validate format (must be 64 hex chars)
     if not re.match(r"^[0-9a-fA-F]{64}$", candidate):
         await update.message.reply_text(
             "❌ *Invalid Secure Key format\\.* It should be 64 hex characters\\.\n\n"
@@ -983,9 +914,7 @@ async def reset_secure_key_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
         )
         return RESET_SECURE_KEY_INPUT
 
-    # Verify the key against the stored sk layer on a TOTP record
     if not verify_secure_key_by_totp(vid, candidate):
-        # Possibly no TOTPs with sk layer (old accounts), try a different check approach
         await update.message.reply_text(
             "❌ *Secure Key does not match\\.* Try again, or skip to lose all TOTP data\\.",
             parse_mode="MarkdownV2",
@@ -993,7 +922,6 @@ async def reset_secure_key_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
         )
         return RESET_SECURE_KEY_INPUT
 
-    # Key is valid -- store it in user_data for the re-encryption step
     ctx.user_data["reset_secure_key"] = candidate
     await update.message.reply_text(
         "✅ *Secure Key verified\\!* Your TOTP data will be restored\\.\n\n"
@@ -1004,10 +932,6 @@ async def reset_secure_key_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
     return RESET_NEW_PW
 
 async def reset_sk_skip(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """
-    User chose to skip Secure Key entry. All TOTP data will be deleted.
-    Confirm before proceeding.
-    """
     q = update.callback_query
     await q.answer()
     ctx.user_data["reset_sk_skipped"] = True
@@ -1058,7 +982,7 @@ async def reset_new_pw_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         return RESET_NEW_PW
 
-    secure_key  = ctx.user_data.get("reset_secure_key")   # None if skipped
+    secure_key  = ctx.user_data.get("reset_secure_key")
     sk_skipped  = ctx.user_data.get("reset_sk_skipped", False)
     new_salt    = os.urandom(16)
     reenc_ok    = 0
@@ -1072,43 +996,19 @@ async def reset_new_pw_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ).fetchall()
 
         if sk_skipped:
-            # User chose no restore: delete ALL TOTP accounts
             c.execute("DELETE FROM totp_accounts WHERE vault_id=?", (vid,))
             deleted_cnt = len(rows)
-
         elif secure_key:
-            # User provided the Secure Key: decrypt sk layer -> get raw TOTP secret ->
-            # re-encrypt with new password and new sk layer (using same secure_key since
-            # secure_key NEVER changes)
             for row in rows:
                 try:
                     if row["sk_enc"]:
-                        # Unwrap sk layer to get the password-encrypted ciphertext
-                        pw_ct = sk_decrypt_totp(
+                        plain_secret_bytes = sk_decrypt_totp(
                             row["sk_enc"], row["sk_salt"], row["sk_iv"], secure_key, vid
                         )
-                        # We now have the password-encrypted CT but NOT the original secret,
-                        # because we cannot decrypt it without the OLD password.
-                        # SOLUTION: Since sk layer wraps the password-encrypted CT,
-                        # we need to first unwrap sk, then we still have pw-encrypted CT.
-                        # We cannot go further without the old password.
-                        # CORRECT APPROACH: The sk layer should wrap the PLAINTEXT secret.
-                        # See _do_save_totp for the double-encryption order used at save time.
-                        # pw_ct is the password-encrypted ciphertext as bytes.
-                        # We cannot decrypt pw layer without old pw during unauthenticated reset.
-                        # So we must re-wrap the pw_ct bytes directly with the new pw.
-                        # BUT we need the plaintext to re-encrypt with new pw.
-                        # *** This is the core challenge. ***
-                        #
-                        # Resolution: The sk layer wraps the PLAINTEXT secret (not the pw_ct).
-                        # See _do_save_totp: sk encrypts `secret` plaintext, not the pw ciphertext.
-                        # So after sk_decrypt_totp we get the PLAINTEXT secret bytes back.
-                        plaintext_secret = pw_ct.decode()  # pw_ct is actually plaintext here
-                        # Re-encrypt with new password
-                        new_ct, new_s, new_iv = encrypt(plaintext_secret, new_pw, vid)
-                        # Re-wrap with same Secure Key (it never changes)
+                        plain_secret = plain_secret_bytes.decode()
+                        new_ct, new_s, new_iv = encrypt(plain_secret, new_pw, vid)
                         new_sk_ct, new_sk_s, new_sk_iv = sk_encrypt_totp(
-                            plaintext_secret.encode(), secure_key, vid
+                            plain_secret.encode(), secure_key, vid
                         )
                         c.execute(
                             "UPDATE totp_accounts SET secret_enc=?, salt=?, iv=?, "
@@ -1117,7 +1017,6 @@ async def reset_new_pw_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                         )
                         reenc_ok += 1
                     else:
-                        # Old account without sk layer: cannot decrypt without old password
                         c.execute("DELETE FROM totp_accounts WHERE id=?", (row["id"],))
                         reenc_fail += 1
                 except Exception as e:
@@ -1125,17 +1024,13 @@ async def reset_new_pw_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     c.execute("DELETE FROM totp_accounts WHERE id=?", (row["id"],))
                     reenc_fail += 1
         else:
-            # Fallback: no secure key, no skip flag -- treat as skip (should not happen normally)
             c.execute("DELETE FROM totp_accounts WHERE vault_id=?", (vid,))
             deleted_cnt = len(rows)
 
-        # Update password hash
         c.execute(
             "UPDATE users SET password_hash=?, pw_salt=? WHERE vault_id=?",
             (hash_pw(new_pw, new_salt), new_salt, vid),
         )
-        # Re-encrypt the stored Secure Key with the new password
-        # (Secure Key itself does not change, only its encryption wrapper does)
         if secure_key:
             ct, s, iv = encrypt(secure_key, new_pw, vid)
             c.execute(
@@ -1145,7 +1040,7 @@ async def reset_new_pw_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         c.commit()
 
     for k in ("reset_vid", "reset_new_pw", "reset_otp_verified",
-              "password", "reset_secure_key", "reset_sk_skipped"):
+              "reset_secure_key", "reset_sk_skipped"):
         ctx.user_data.pop(k, None)
 
     if sk_skipped or deleted_cnt > 0:
@@ -1175,9 +1070,7 @@ async def reset_new_pw_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
     return AUTH_MENU
 
-# ── SETTINGS RESET (while LOGGED IN -- no Secure Key needed) ──
-# When the user is already logged in, we have their password in ctx.user_data
-# so re-encryption works normally. No Secure Key required in this path.
+# ── SETTINGS RESET (while LOGGED IN) ────────────────────────
 async def settings_reset_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q   = update.callback_query
     await q.answer()
@@ -1300,7 +1193,6 @@ async def settings_reset_pw_confirm(update: Update, ctx: ContextTypes.DEFAULT_TY
             try:
                 secret    = decrypt(row["secret_enc"], row["salt"], row["iv"], old_pw, vault)
                 ct, s, iv = encrypt(secret, new_pw, vault)
-                # Re-wrap the sk layer with same Secure Key (it never changes)
                 sk = load_user_secure_key(vault, old_pw)
                 if sk:
                     sk_ct, sk_s, sk_iv = sk_encrypt_totp(secret.encode(), sk, vault)
@@ -1321,7 +1213,6 @@ async def settings_reset_pw_confirm(update: Update, ctx: ContextTypes.DEFAULT_TY
             "UPDATE users SET password_hash=?, pw_salt=? WHERE vault_id=?",
             (hash_pw(new_pw, new_salt), new_salt, vault),
         )
-        # Re-wrap the stored Secure Key with the new password
         sk = load_user_secure_key(vault, old_pw)
         if sk:
             ct, s, iv = encrypt(sk, new_pw, vault)
@@ -1338,7 +1229,7 @@ async def settings_reset_pw_confirm(update: Update, ctx: ContextTypes.DEFAULT_TY
     )
     return TOTP_MENU
 
-# ── VIEW SECURE KEY (from settings, requires password) ──────
+# ── VIEW SECURE KEY (from settings) ─────────────────────────
 async def view_secure_key_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -1382,7 +1273,6 @@ async def view_secure_key_pw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             reply_markup=kb_main(),
         )
         return TOTP_MENU
-    # Format for readability (groups of 8)
     sk_display = " ".join(sk[i:i+8] for i in range(0, len(sk), 8))
     msg = await update.message.reply_text(
         f"🛡 *Your Secure Key*\n\n"
@@ -1585,7 +1475,6 @@ async def change_pw_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             try:
                 secret    = decrypt(row["secret_enc"], row["salt"], row["iv"], old_pw, vault)
                 ct, s, iv = encrypt(secret, new_pw, vault)
-                # Re-wrap sk layer with same Secure Key
                 sk = load_user_secure_key(vault, old_pw)
                 if sk:
                     sk_ct, sk_s, sk_iv = sk_encrypt_totp(secret.encode(), sk, vault)
@@ -1606,7 +1495,6 @@ async def change_pw_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "UPDATE users SET password_hash=?, pw_salt=? WHERE vault_id=?",
             (hash_pw(new_pw, ns), ns, vault),
         )
-        # Re-wrap stored Secure Key with new password
         sk = load_user_secure_key(vault, old_pw)
         if sk:
             ct, s, iv = encrypt(sk, new_pw, vault)
@@ -1644,26 +1532,12 @@ async def add_totp_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     return ADD_WAITING
 
 async def _do_save_totp(update, vault, data, pw):
-    """
-    Save a TOTP account with double-layer encryption:
-      Layer 1: AES-256-GCM with the user's password (standard layer)
-      Layer 2: AES-256-GCM with the Secure Key (wraps the plaintext secret independently)
-
-    Both layers are stored separately so that:
-      - Normal usage: decrypt layer 1 with password -> get plaintext
-      - Unauthenticated reset with Secure Key: decrypt layer 2 with SK -> get plaintext,
-        then re-encrypt layer 1 with new password
-    """
-    uid = update.effective_user.id
-    # Layer 1: password encryption
     ct, salt, iv = encrypt(data["secret"], pw, vault)
-    # Layer 2: Secure Key encryption (wraps plaintext secret, independent of layer 1)
     sk = load_user_secure_key(vault, pw)
     if sk:
         sk_ct, sk_s, sk_iv = sk_encrypt_totp(data["secret"].encode(), sk, vault)
     else:
         sk_ct = sk_s = sk_iv = None
-
     with get_db() as c:
         c.execute(
             "INSERT INTO totp_accounts (vault_id, name, issuer, secret_enc, salt, iv, "
@@ -1691,7 +1565,6 @@ async def _process_input(update, ctx, vault, pw):
           and update.message.document.mime_type
           and update.message.document.mime_type.startswith("image")):
         file_obj = await update.message.document.get_file()
-
     if file_obj:
         try:
             await update.message.delete()
@@ -1719,12 +1592,9 @@ async def _process_input(update, ctx, vault, pw):
                 reply_markup=kb_cancel(),
             )
         return None, True
-
     if not update.message.text:
         return None, False
-
     text = update.message.text.strip()
-
     if text.startswith("otpauth://"):
         try:
             await update.message.delete()
@@ -1739,7 +1609,6 @@ async def _process_input(update, ctx, vault, pw):
             reply_markup=kb_cancel(),
         )
         return None, True
-
     ok, cleaned = validate_secret(text)
     if ok and len(cleaned) >= 8:
         try:
@@ -1760,7 +1629,6 @@ async def _process_input(update, ctx, vault, pw):
             return None, True
         except Exception:
             pass
-
     return None, False
 
 async def handle_add_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -2261,7 +2129,6 @@ async def import_pw_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     continue
                 totp_now(secret)
                 ct, s, iv = encrypt(secret, pw, vault)
-                # Also wrap with Secure Key layer
                 sk = load_user_secure_key(vault, pw)
                 if sk:
                     sk_ct, sk_s, sk_iv = sk_encrypt_totp(secret.encode(), sk, vault)
@@ -2507,7 +2374,6 @@ def main():
                 MessageHandler(private & filters.TEXT & ~filters.COMMAND, reset_otp_input),
                 CallbackQueryHandler(cancel_to_menu, pattern="^cancel_to_menu$"),
             ],
-            # NEW state: Secure Key entry during unauthenticated reset
             RESET_SECURE_KEY_INPUT: [
                 MessageHandler(private & filters.TEXT & ~filters.COMMAND, reset_secure_key_input),
                 CallbackQueryHandler(reset_sk_skip,  pattern="^reset_sk_skip$"),
@@ -2623,7 +2489,6 @@ def main():
                 MessageHandler(private & filters.TEXT & ~filters.COMMAND, change_tz_input),
                 CallbackQueryHandler(cancel_to_menu, pattern="^cancel_to_menu$"),
             ],
-            # NEW state: view Secure Key (logged in, requires password)
             SECURE_KEY_VIEW_PW: [
                 MessageHandler(private & filters.TEXT & ~filters.COMMAND, view_secure_key_pw),
                 CallbackQueryHandler(cancel_to_menu, pattern="^cancel_to_menu$"),
