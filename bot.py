@@ -38,7 +38,7 @@ logger = logging.getLogger(__name__)
 
 DB_PATH             = os.environ.get("DB_PATH", "auth.db")
 SERVER_KEY          = os.environ.get("ENCRYPTION_KEY", "").encode()
-BOT_USERNAME        = os.environ.get("BOT_USERNAME", "YourBotUsername")  # set without @
+BOT_USERNAME        = os.environ.get("BOT_USERNAME", "TotpNafiBot")  # set without @
 PBKDF2_ITER         = 1_000_000
 OTP_TTL             = 60
 MAX_RESET_ATTEMPTS  = 3
