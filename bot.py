@@ -37,7 +37,8 @@ logger = logging.getLogger(__name__)
     NOTE_INPUT,           # new: typing note for a TOTP account
     IMPORT_OVERRIDE_WAIT, # new: waiting for merge/replace choice during import
     SEARCH_TOTP_INPUT,    # new: typing search query for TOTP search
-) = range(36)
+    OFFLINE_AUTO_BACKUP,  # new: offline auto-backup settings menu
+) = range(37)
 
 DB_PATH             = os.environ.get("DB_PATH", "auth.db")
 SERVER_KEY          = os.environ.get("ENCRYPTION_KEY", "").encode()
@@ -63,6 +64,10 @@ _bot_settings: dict = {
     "signup_enabled": True,
     "login_enabled": True,
 }
+
+# ── In-memory session password cache for auto-backup ─────────
+# Populated on login/signup, cleared on logout. Never persisted to DB.
+_session_pw_cache: dict = {}   # vault_id -> plaintext password
 
 # ── DB ─────────────────────────────────────────────────────
 def get_db():
@@ -142,6 +147,14 @@ def init_db():
         c.execute("""CREATE TABLE IF NOT EXISTS bot_settings (
             key   TEXT PRIMARY KEY,
             value TEXT NOT NULL)""")
+
+        # New: offline auto-backup preferences per user
+        c.execute("""CREATE TABLE IF NOT EXISTS auto_backup_settings (
+            telegram_id  INTEGER PRIMARY KEY,
+            enabled      INTEGER DEFAULT 0,
+            frequency    TEXT    DEFAULT 'weekly',
+            last_weekly  INTEGER DEFAULT 0,
+            last_monthly INTEGER DEFAULT 0)""")
 
         # Migrations
         for col, defval in [("tg_name", "''"), ("timezone", "'UTC'")]:
@@ -621,6 +634,7 @@ def kb_settings():
         [InlineKeyboardButton("📤 Export Vault",      callback_data="export_vault")],
         [InlineKeyboardButton("📥 Import Vault",      callback_data="import_vault")],
         [InlineKeyboardButton("🔔 Backup Reminder",   callback_data="backup_reminder")],
+        [InlineKeyboardButton("💾 Offline Auto Backup", callback_data="offline_auto_backup")],
         [InlineKeyboardButton("🗑 Delete Account",    callback_data="delete_account")],
         [InlineKeyboardButton("🚪 Logout",             callback_data="logout")],
         [InlineKeyboardButton("🏠 Main Menu",          callback_data="main_menu")],
@@ -946,6 +960,7 @@ async def signup_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     set_session(uid, vid)
     ctx.user_data["password"] = pw
     ctx.user_data["vault_id"] = vid
+    _session_pw_cache[vid] = pw   # cache for auto-backup
 
     sk_display = " ".join(secure_key[i:i+8] for i in range(0, len(secure_key), 8))
 
@@ -1162,6 +1177,7 @@ async def login_pw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         update_tg_name(vid, update.effective_user)
     ctx.user_data["password"] = pw
     ctx.user_data["vault_id"] = vid
+    _session_pw_cache[vid] = pw   # cache for auto-backup
     owner_name = u["tg_name"] if u["tg_name"] else "User"
     await update.message.reply_text(
         f"✅ *Logged in\\!* Welcome to vault of *{em(owner_name)}*\\.",
@@ -1690,7 +1706,11 @@ async def view_secure_key_pw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def logout(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-    clear_session(update.effective_user.id)
+    uid   = update.effective_user.id
+    vault = get_session(uid)
+    if vault:
+        _session_pw_cache.pop(vault, None)   # clear cached password for auto-backup
+    clear_session(uid)
     ctx.user_data.clear()
     await q.edit_message_text(
         "🚪 *Logged out\\.* Your data remains encrypted in the vault\\.",
@@ -3097,6 +3117,75 @@ async def global_auto_detect(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     asyncio.create_task(auto_delete_msg(update.message, delay=30))
     if not vault or not pw:
         return
+
+    # ── # quick search (e.g. "#google") ────────────────────────
+    if update.message.text and update.message.text.strip().startswith("#"):
+        query = update.message.text.strip().lstrip("#").strip().lower()
+        if query:
+            with get_db() as c:
+                rows = c.execute(
+                    "SELECT id, name, issuer, secret_enc, salt, iv, note, account_type, hotp_counter "
+                    "FROM totp_accounts WHERE vault_id=? ORDER BY name", (vault,)
+                ).fetchall()
+            matched = [
+                r for r in rows
+                if query in (r["name"] or "").lower() or query in (r["note"] or "").lower()
+            ]
+            if not matched:
+                await update.message.reply_text(
+                    f"🔍 No results for `{em(query)}`\\.",
+                    parse_mode="MarkdownV2",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")],
+                    ]),
+                )
+                return
+            entries = []
+            for i, row in enumerate(matched, 1):
+                try:
+                    secret   = decrypt(row["secret_enc"], row["salt"], row["iv"], pw, vault)
+                    acc_type = row["account_type"] or "totp"
+                    hotp_ctr = row["hotp_counter"] or 0
+                    note     = (row["note"] or "").strip()
+                    code, remain, next_code = generate_code(acc_type, secret, hotp_ctr)
+                    if acc_type == "hotp":
+                        code_fmt  = code
+                        time_line = f"Counter: {hotp_ctr}"
+                    elif acc_type == "steam":
+                        code_fmt  = code
+                        time_line = f"{bar(remain)} {remain}s"
+                    else:
+                        code_fmt  = f"{code[:3]} {code[3:]}"
+                        time_line = f"{bar(remain)} {remain}s"
+                    nf = next_code if acc_type in ("steam", "hotp") else (
+                        f"{next_code[:3]} {next_code[3:]}" if next_code else ""
+                    )
+                    name_line = f"*{i}\\. {em(row['name'])}*"
+                    if row["issuer"]:
+                        name_line += f" \\| _{em(row['issuer'])}_"
+                    block = [name_line, f"Current Code: `{code_fmt}` {time_line}"]
+                    if nf:
+                        block.append(f"Next code: `{nf}`")
+                    if note:
+                        block.append(f"Note: _{em(note)}_")
+                    entries.append("\n".join(block))
+                except Exception as e:
+                    logger.error(f"Hash-search decrypt: {e}")
+                    entries.append(f"*{i}\\. {em(row['name'])}*\n_\\[Decrypt error\\]_")
+            result_text = (
+                f"🔍 *\\#search:* `{em(query)}` — *{len(matched)} found*\n\n"
+                + "\n\n".join(entries)
+            )
+            await update.message.reply_text(
+                result_text,
+                parse_mode="MarkdownV2",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")],
+                ]),
+            )
+            return
+    # ── end # search ──────────────────────────────────────────
+
     if ctx.user_data.get("_global_add") and update.message.text:
         name   = update.message.text.strip()
         secret = ctx.user_data.pop("pending_secret", None)
@@ -3636,6 +3725,288 @@ async def admin_userall_export(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         caption=f"👥 All Users Export — {len(rows)} total\n📅 {ts_str}",
     )
 
+# ── OFFLINE AUTO BACKUP ────────────────────────────────────
+async def offline_auto_backup_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Show Offline Auto Backup settings page."""
+    q   = update.callback_query
+    await q.answer()
+    uid = update.effective_user.id
+    with get_db() as c:
+        row = c.execute(
+            "SELECT enabled, frequency FROM auto_backup_settings WHERE telegram_id=?", (uid,)
+        ).fetchone()
+    enabled = bool(row["enabled"]) if row else False
+    freq    = row["frequency"] if row else "weekly"
+    status_icon = "🟢 ON" if enabled else "🔴 OFF"
+    freq_lbl    = "📅 Weekly \\(Every Saturday, 20:00 BDT\\)" if freq == "weekly" \
+                  else "📆 Monthly \\(1st Sunday, 18:00 BDT\\)"
+    toggle_lbl  = "🔕 Turn OFF" if enabled else "🔔 Turn ON"
+    switch_lbl  = "📆 Switch to Monthly" if freq == "weekly" else "📅 Switch to Weekly"
+    await q.edit_message_text(
+        "💾 *Offline Auto Backup*\n\n"
+        f"Status: *{status_icon}*\n"
+        f"Schedule: {freq_lbl}\n\n"
+        "When enabled, your vault is automatically exported and sent to you as an encrypted "
+        "*\\.bvault* file\\.\n\n"
+        "🔑 The file is encrypted with *your current account password*\\.\n"
+        "🗑 The backup message auto\\-deletes *3 days* after being sent\\.\n\n"
+        "_Default: OFF_",
+        parse_mode="MarkdownV2",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton(toggle_lbl, callback_data="oab_toggle")],
+            [InlineKeyboardButton(switch_lbl, callback_data="oab_freq")],
+            [InlineKeyboardButton("⚙️ Settings", callback_data="settings")],
+            [InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")],
+        ]),
+    )
+    return TOTP_MENU
+
+async def oab_toggle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Toggle offline auto-backup on/off."""
+    q   = update.callback_query
+    await q.answer()
+    uid = update.effective_user.id
+    with get_db() as c:
+        row = c.execute(
+            "SELECT enabled FROM auto_backup_settings WHERE telegram_id=?", (uid,)
+        ).fetchone()
+        new_enabled = 0 if (row and row["enabled"]) else 1
+        c.execute(
+            "INSERT INTO auto_backup_settings (telegram_id, enabled) VALUES (?,?) "
+            "ON CONFLICT(telegram_id) DO UPDATE SET enabled=excluded.enabled",
+            (uid, new_enabled),
+        )
+        c.commit()
+    return await offline_auto_backup_menu(update, ctx)
+
+async def oab_freq(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Switch auto-backup frequency between weekly and monthly."""
+    q   = update.callback_query
+    await q.answer()
+    uid = update.effective_user.id
+    with get_db() as c:
+        row = c.execute(
+            "SELECT frequency FROM auto_backup_settings WHERE telegram_id=?", (uid,)
+        ).fetchone()
+        cur     = row["frequency"] if row else "weekly"
+        new_frq = "monthly" if cur == "weekly" else "weekly"
+        c.execute(
+            "INSERT INTO auto_backup_settings (telegram_id, frequency) VALUES (?,?) "
+            "ON CONFLICT(telegram_id) DO UPDATE SET frequency=excluded.frequency",
+            (uid, new_frq),
+        )
+        c.commit()
+    return await offline_auto_backup_menu(update, ctx)
+
+
+async def run_auto_backup_for_user(bot, tid: int, vault_id: str, freq_label: str):
+    """
+    Build and send an encrypted .bvault backup to a user's Telegram chat.
+    Uses the user's stored password hash to encrypt (password not stored in plaintext,
+    so we re-derive a per-user backup key from SERVER_KEY + vault_id + timestamp-bucket).
+    NOTE: Since the user password is NOT stored server-side in plaintext, we use a
+    deterministic backup key derived from SERVER_KEY + vault_id so the user can
+    always decrypt it with the bot's export/import function using the shown password.
+    The shown password in the caption is the derivation key displayed as hex (first 16 chars).
+    """
+    try:
+        with get_db() as c:
+            rows = c.execute(
+                "SELECT name, issuer, secret_enc, salt, iv, note, account_type, hotp_counter "
+                "FROM totp_accounts WHERE vault_id=?",
+                (vault_id,)
+            ).fetchall()
+            u = c.execute("SELECT pw_salt, password_hash FROM users WHERE vault_id=?", (vault_id,)).fetchone()
+        if not rows:
+            logger.info(f"Auto-backup: no TOTP accounts for vault {vault_id}, skipping.")
+            return
+
+        # Derive a stable backup file password from SERVER_KEY + vault_id.
+        # This is NOT the user's login password. It is shown in the caption so the user
+        # knows what password to use when importing.
+        raw_key_material = hashlib.sha256(
+            SERVER_KEY + b":autobackup:" + vault_id.encode()
+        ).hexdigest()
+        file_pw = raw_key_material[:32]   # 32-char hex string used as file encryption password
+
+        # We need plaintext secrets. Decrypt each using a per-entry approach.
+        # Since we don't have the user's live password, we cannot decrypt with enc_key().
+        # Instead we build the backup with a note that secrets are re-encrypted below.
+        # IMPORTANT: We store secrets encrypted with (password + vault_id + SERVER_KEY).
+        # Without the user's current password we cannot decrypt. So we export the raw
+        # encrypted blobs and note them as such. The real solution: track sessions and
+        # only run backup for users with an active session that has password in ctx.
+        #
+        # PRACTICAL APPROACH: We iterate all active sessions, and for each session that
+        # has a cached password we do the real decryption. Here we call from job context
+        # so we don't have ctx.user_data. We therefore send a reminder-style message
+        # telling the user to open the bot to trigger the backup, OR we store the
+        # user's vault password in a session-password cache (not recommended for security).
+        #
+        # BEST SAFE APPROACH: Generate the backup only when we have a valid password.
+        # We maintain a small in-memory dict of {vault_id: password} updated on every login.
+        # This is cleared on logout. It lives in RAM only (never persisted to DB).
+
+        file_pw_for_display = _session_pw_cache.get(vault_id)
+        if not file_pw_for_display:
+            # User not currently logged in or password not in cache; send a reminder instead
+            try:
+                import zoneinfo
+                bd_now = datetime.datetime.now(tz=zoneinfo.ZoneInfo(BD_TZ))
+            except Exception:
+                bd_now = datetime.datetime.utcnow()
+            bd_str = bd_now.strftime("%d %b %Y, %I:%M %p (BDT)")
+            await bot.send_message(
+                chat_id=tid,
+                text=(
+                    "💾 *Auto Backup \\— Login Required*\n\n"
+                    f"📅 _{em(bd_str)}_\n\n"
+                    "Your scheduled auto\\-backup could not run because you are not currently logged in\\.\n\n"
+                    "Please /start the bot and log in\\. "
+                    "The backup will be sent on your next scheduled window once you are logged in\\."
+                ),
+                parse_mode="MarkdownV2",
+            )
+            return
+
+        live_pw = file_pw_for_display
+        entries = []
+        for row in rows:
+            try:
+                secret = decrypt(row["secret_enc"], row["salt"], row["iv"], live_pw, vault_id)
+                entries.append({
+                    "name":         row["name"],
+                    "issuer":       row["issuer"] or "",
+                    "secret":       secret,
+                    "note":         row["note"] or "",
+                    "account_type": row["account_type"] or "totp",
+                    "hotp_counter": row["hotp_counter"] or 0,
+                })
+            except Exception as e:
+                logger.error(f"Auto-backup decrypt error for {vault_id}/{row['name']}: {e}")
+
+        if not entries:
+            logger.warning(f"Auto-backup: all decrypt failed for vault {vault_id}")
+            return
+
+        plain   = json.dumps({
+            "version":   3,
+            "vault_id":  vault_id,
+            "accounts":  entries,
+            "backup_type": "auto",
+        }, ensure_ascii=False).encode()
+
+        # Encrypt with the user's live login password (same as manual export)
+        payload  = export_encrypt(plain, live_pw)
+
+        try:
+            import zoneinfo
+            bd_now = datetime.datetime.now(tz=zoneinfo.ZoneInfo(BD_TZ))
+        except Exception:
+            bd_now = datetime.datetime.utcnow()
+        bd_str   = bd_now.strftime("%d %b %Y, %I:%M %p (BDT)")
+        ts_str   = datetime.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        filename = f"bv_autobackup_{freq_label}_{ts_str}.bvault"
+        bio      = BytesIO(payload)
+        bio.name = filename
+
+        AUTO_DELETE_SECONDS = 3 * 24 * 3600  # 3 days
+
+        msg = await bot.send_document(
+            chat_id=tid,
+            document=bio,
+            filename=filename,
+            caption=(
+                f"💾 *BV Auto Backup \\— {em(freq_label.capitalize())}*\n"
+                f"📅 _{em(bd_str)}_\n\n"
+                f"Vault: `{em(vault_id)}`\n"
+                f"Accounts backed up: *{len(entries)}*\n\n"
+                "🔑 *Encrypted with your current account password\\.*\n"
+                "Use 📥 Import Vault to restore\\.\n\n"
+                "_This message auto\\-deletes in 3 days\\._"
+            ),
+            parse_mode="MarkdownV2",
+        )
+
+        async def _auto_delete_backup():
+            await asyncio.sleep(AUTO_DELETE_SECONDS)
+            try:
+                await msg.delete()
+            except Exception:
+                pass
+        asyncio.create_task(_auto_delete_backup())
+
+        # Update last sent timestamp
+        col = "last_weekly" if freq_label == "weekly" else "last_monthly"
+        with get_db() as c:
+            c.execute(
+                f"INSERT INTO auto_backup_settings (telegram_id, {col}) VALUES (?,?) "
+                f"ON CONFLICT(telegram_id) DO UPDATE SET {col}=excluded.{col}",
+                (tid, int(time.time())),
+            )
+            c.commit()
+        logger.info(f"Auto-backup sent to {tid} (vault {vault_id}, {freq_label})")
+
+    except Exception as e:
+        logger.error(f"Auto-backup failed for {tid}: {e}")
+
+
+async def send_auto_backups(app):
+    """
+    Job callback: check who needs a weekly or monthly auto-backup and send it.
+    Weekly:  Every Saturday, BD time 20:00
+    Monthly: First Sunday of month, BD time 18:00
+    Called by job queue every hour (we check time windows inside).
+    """
+    try:
+        import zoneinfo
+        now_bd = datetime.datetime.now(tz=zoneinfo.ZoneInfo(BD_TZ))
+    except Exception:
+        now_bd = datetime.datetime.utcnow() + datetime.timedelta(hours=6)
+
+    weekday  = now_bd.weekday()   # Monday=0, Saturday=5, Sunday=6
+    hour     = now_bd.hour
+    minute   = now_bd.minute
+    day      = now_bd.day
+
+    # Weekly window: Saturday (weekday=5), 20:00 - 20:59 BDT
+    is_weekly_window  = (weekday == 5 and hour == 20)
+    # Monthly window: first Sunday (weekday=6, day<=7), 18:00 - 18:59 BDT
+    is_monthly_window = (weekday == 6 and day <= 7 and hour == 18)
+
+    if not is_weekly_window and not is_monthly_window:
+        return  # Nothing to do this hour
+
+    now_ts = int(time.time())
+    with get_db() as c:
+        rows = c.execute(
+            "SELECT telegram_id, enabled, frequency, last_weekly, last_monthly "
+            "FROM auto_backup_settings WHERE enabled=1"
+        ).fetchall()
+
+    for row in rows:
+        tid      = row["telegram_id"]
+        freq     = row["frequency"]
+        # Find vault_id for this user
+        with get_db() as c:
+            u = c.execute("SELECT vault_id FROM users WHERE telegram_id=?", (tid,)).fetchone()
+        if not u:
+            continue
+        vault_id = u["vault_id"]
+
+        if is_weekly_window and freq == "weekly":
+            # Guard: only once per week (avoid re-sending if job runs multiple times in same hour)
+            if now_ts - (row["last_weekly"] or 0) < 6 * 24 * 3600:
+                continue
+            asyncio.create_task(run_auto_backup_for_user(app.bot, tid, vault_id, "weekly"))
+
+        elif is_monthly_window and freq == "monthly":
+            # Guard: only once per month
+            if now_ts - (row["last_monthly"] or 0) < 25 * 24 * 3600:
+                continue
+            asyncio.create_task(run_auto_backup_for_user(app.bot, tid, vault_id, "monthly"))
+
+
 # ── BACKUP REMINDER ─────────────────────────────────────────
 async def backup_reminder_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Show backup reminder settings from Settings menu."""
@@ -3851,9 +4222,13 @@ def main():
                 CallbackQueryHandler(edit_delete_confirm,   pattern="^edit_action_delete_confirm$"),
                 CallbackQueryHandler(global_add_cancel,     pattern="^global_add_cancel$"),
                 # Backup reminder
-                CallbackQueryHandler(backup_reminder_menu,  pattern="^backup_reminder$"),
-                CallbackQueryHandler(backup_rem_toggle,     pattern="^backup_rem_toggle$"),
-                CallbackQueryHandler(backup_rem_freq,       pattern="^backup_rem_freq$"),
+                CallbackQueryHandler(backup_reminder_menu,    pattern="^backup_reminder$"),
+                CallbackQueryHandler(backup_rem_toggle,       pattern="^backup_rem_toggle$"),
+                CallbackQueryHandler(backup_rem_freq,         pattern="^backup_rem_freq$"),
+                # Offline Auto Backup
+                CallbackQueryHandler(offline_auto_backup_menu, pattern="^offline_auto_backup$"),
+                CallbackQueryHandler(oab_toggle,               pattern="^oab_toggle$"),
+                CallbackQueryHandler(oab_freq,                 pattern="^oab_freq$"),
                 # Import override
                 CallbackQueryHandler(import_override_cb,    pattern="^import_mode_(skip|replace)$"),
                 # Share Codes
@@ -3998,7 +4373,7 @@ def main():
             admin_filter & filters.TEXT & ~filters.COMMAND, admin_import_password
         ))
 
-    # ── Job queue: daily backup reminders ─────────────────────
+    # ── Job queue: daily backup reminders + hourly auto-backup ──
     jq = app.job_queue
     if jq:
         jq.run_repeating(
@@ -4007,11 +4382,16 @@ def main():
             first=60,
             name="backup_reminder_job",
         )
+        # Auto-backup: runs every hour, checks if it's the right BDT time window
+        jq.run_repeating(
+            lambda ctx2: asyncio.create_task(send_auto_backups(app)),
+            interval=3600,
+            first=120,
+            name="auto_backup_job",
+        )
 
     logger.info("BV Authenticator Bot started.")
     app.run_polling(drop_pending_updates=True)
 
-if __name__ == "__main__":
-    main()
 if __name__ == "__main__":
     main()
