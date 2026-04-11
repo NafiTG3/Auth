@@ -84,6 +84,7 @@ def init_db():
             password_hash BLOB    NOT NULL,
             pw_salt       BLOB    NOT NULL,
             tg_name       TEXT    DEFAULT '',
+            tg_username   TEXT    DEFAULT '',
             timezone      TEXT    DEFAULT 'UTC',
             created_at    INTEGER DEFAULT (strftime('%s','now')))""")
         c.execute("""CREATE TABLE IF NOT EXISTS sessions (
@@ -157,7 +158,7 @@ def init_db():
             last_monthly INTEGER DEFAULT 0)""")
 
         # Migrations
-        for col, defval in [("tg_name", "''"), ("timezone", "'UTC'")]:
+        for col, defval in [("tg_name", "''"), ("timezone", "'UTC'"), ("tg_username", "''")]:
             try:
                 c.execute(f"ALTER TABLE users ADD COLUMN {col} TEXT DEFAULT {defval}")
             except Exception:
@@ -808,17 +809,22 @@ def update_tg_name(vault_id: str, tg_user):
     u = get_user(vault_id)
     if not u or tg_user.id != u["telegram_id"]:
         return
-    name = ((tg_user.first_name or "") + " " + (tg_user.last_name or "")).strip()
-    if name:
-        with get_db() as c:
-            c.execute("UPDATE users SET tg_name=? WHERE vault_id=?", (name, vault_id))
-            c.commit()
+    name     = ((tg_user.first_name or "") + " " + (tg_user.last_name or "")).strip()
+    username = tg_user.username or ""
+    with get_db() as c:
+        c.execute(
+            "UPDATE users SET tg_name=?, tg_username=? WHERE vault_id=?",
+            (name or u["tg_name"], username, vault_id),
+        )
+        c.commit()
 
 # ── /start ──────────────────────────────────────────────────
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not update.message:
         return
     uid  = update.effective_user.id
+    # Auto-delete the /start command message
+    asyncio.create_task(auto_delete_msg(update.message, delay=3))
     # Update last_seen for any active user
     update_last_seen(uid)
     # Handle deep link: /start <share_token>
@@ -945,12 +951,13 @@ async def signup_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return AUTH_MENU
 
     salt    = os.urandom(16)
-    tg_name = ((update.effective_user.first_name or "") + " " + (update.effective_user.last_name or "")).strip()
+    tg_name     = ((update.effective_user.first_name or "") + " " + (update.effective_user.last_name or "")).strip()
+    tg_username = update.effective_user.username or ""
 
     with get_db() as c:
         c.execute(
-            "INSERT INTO users (vault_id,telegram_id,password_hash,pw_salt,tg_name) VALUES (?,?,?,?,?)",
-            (vid, uid, hash_pw(pw, salt), salt, tg_name),
+            "INSERT INTO users (vault_id,telegram_id,password_hash,pw_salt,tg_name,tg_username) VALUES (?,?,?,?,?,?)",
+            (vid, uid, hash_pw(pw, salt), salt, tg_name, tg_username),
         )
         c.commit()
 
@@ -2204,7 +2211,7 @@ async def _render_list_page(q_or_msg, vault: str, pw: str, page: int, is_edit: b
             else:
                 next_line = ""
 
-            note_line = f"Note: _{em(note)}_" if note else ""
+            note_line = f"Note: {em(note)}" if note else ""
 
             # Build entry block
             name_line = f"*{i}\\. {em(row['name'])}*"
@@ -3167,7 +3174,7 @@ async def global_auto_detect(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     if nf:
                         block.append(f"Next code: `{nf}`")
                     if note:
-                        block.append(f"Note: _{em(note)}_")
+                        block.append(f"Note: {em(note)}")
                     entries.append("\n".join(block))
                 except Exception as e:
                     logger.error(f"Hash-search decrypt: {e}")
@@ -3321,7 +3328,7 @@ async def search_totp_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 next_line = f"Next code: `{nf}`"
             else:
                 next_line = ""
-            note_line = f"Note: _{em(note)}_" if note else ""
+            note_line = f"Note: {em(note)}" if note else ""
             name_line = f"*{i}\\. {em(row['name'])}*"
             if row["issuer"]:
                 name_line += f" \\| _{em(row['issuer'])}_"
@@ -3372,13 +3379,11 @@ def _admin_decrypt(payload: bytes, password: str) -> bytes:
     return AESGCM(_admin_full_export_key(password, salt)).decrypt(iv, ct, None)
 
 def _get_user_by_username(username: str):
-    """Resolve @username → user row (requires username stored in tg_name or via bot API)."""
+    """Resolve @username -> user row using stored tg_username column."""
     uname = username.lstrip("@").lower()
     with get_db() as c:
-        # Try matching stored tg_name (first word comparison is unreliable;
-        # we store raw name, not username). Best effort via a separate lookup.
         return c.execute(
-            "SELECT * FROM users WHERE LOWER(tg_name)=?", (uname,)
+            "SELECT * FROM users WHERE LOWER(tg_username)=?", (uname,)
         ).fetchone()
 
 def _resolve_user(raw: str):
@@ -3395,15 +3400,17 @@ def _resolve_user(raw: str):
         if u: return u
     return None
 
-def _fmt_user_info(u, bot_username_lookup: str = "") -> str:
+def _fmt_user_info(u) -> str:
     """Build the admin /user info block. Returns plain text (not Markdown)."""
-    vault_id   = u["vault_id"]
-    tid        = u["telegram_id"]
-    tg_name    = u["tg_name"] or "Unknown"
-    created_at = fmt_bd_time(u["created_at"]) if u["created_at"] else "N/A"
-    last_seen  = fmt_bd_time(u["last_seen"]) if u.get("last_seen") else "Never"
-    status     = "Disabled" if u.get("account_disabled") else "Good"
-    tz         = u.get("timezone") or "UTC"
+    vault_id    = u["vault_id"]
+    tid         = u["telegram_id"]
+    tg_name     = u["tg_name"] or "Unknown"
+    tg_username = u["tg_username"] if u["tg_username"] else ""
+    username_str = f"@{tg_username}" if tg_username else f"(no username, ID: {tid})"
+    created_at  = fmt_bd_time(u["created_at"]) if u["created_at"] else "N/A"
+    last_seen   = fmt_bd_time(u["last_seen"]) if u.get("last_seen") else "Never"
+    status      = "Disabled" if u.get("account_disabled") else "Active"
+    tz          = u.get("timezone") or "UTC"
     with get_db() as c:
         totp_cnt = c.execute(
             "SELECT COUNT(*) AS n FROM totp_accounts WHERE vault_id=?", (vault_id,)
@@ -3423,23 +3430,24 @@ def _fmt_user_info(u, bot_username_lookup: str = "") -> str:
     failed_login = la["attempts"] if la else 0
     failed_reset = ra["attempts"] if ra else 0
     return (
-        f"Vault ID : {vault_id}\n"
-        f"Telegram Username : @{bot_username_lookup or str(tid)}\n"
-        f"Name : {tg_name}\n\n"
-        f"Total TOTP Added : {totp_cnt} Account\n\n"
-        f"Vault Created Date : {created_at}\n\n"
-        f"Last Online : {last_seen}\n\n"
+        f"Vault ID       : {vault_id}\n"
+        f"Telegram       : {username_str}\n"
+        f"Telegram ID    : {tid}\n"
+        f"Name           : {tg_name}\n\n"
+        f"Total TOTP     : {totp_cnt} Account(s)\n\n"
+        f"Created        : {created_at}\n\n"
+        f"Last Online    : {last_seen}\n\n"
         f"Account Status : {status}\n\n"
-        f"Reminder Status : {reminder_status}\n\n"
-        f"Failed Login : {failed_login}\n\n"
-        f"Failed Reset : {failed_reset}"
+        f"Reminder       : {reminder_status}\n\n"
+        f"Failed Logins  : {failed_login}\n\n"
+        f"Failed Resets  : {failed_reset}"
     )
 
 # ── ADMIN COMMANDS ──────────────────────────────────────────
 async def admin_maintenance(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """
-    /maintenance on   — enable maintenance mode
-    /maintenance off  — disable maintenance mode
+    /maintenance on   -- enable maintenance mode
+    /maintenance off  -- disable maintenance mode
     """
     if not _is_admin_msg(update):
         return
@@ -3447,31 +3455,36 @@ async def admin_maintenance(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     state = args[0].lower() if args else ""
     if state == "on":
         _save_setting("maintenance", True)
-        await update.message.reply_text("🔧 Maintenance mode ON. Users are blocked.")
+        msg = await update.message.reply_text("🔧 Maintenance mode ON. Users are blocked.")
     elif state == "off":
         _save_setting("maintenance", False)
-        await update.message.reply_text("✅ Maintenance mode OFF. Bot is live.")
+        msg = await update.message.reply_text("✅ Maintenance mode OFF. Bot is live.")
     else:
         cur = "ON" if is_maintenance() else "OFF"
-        await update.message.reply_text(
+        msg = await update.message.reply_text(
             f"Usage: /maintenance on|off\nCurrent: {cur}"
         )
+    asyncio.create_task(auto_delete_msg(msg, delay=60))
+    asyncio.create_task(auto_delete_msg(update.message, delay=60))
 
 async def admin_signup_toggle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """/sign-up on|off"""
+    """/signup on|off"""
     if not _is_admin_msg(update):
         return
-    args  = (ctx.args or [])
-    state = args[0].lower() if args else ""
+    # Parse arg from either ctx.args or raw message text
+    raw_text = (update.message.text or "").strip().split()
+    state = raw_text[1].lower() if len(raw_text) > 1 else ""
     if state == "on":
         _save_setting("signup_enabled", True)
-        await update.message.reply_text("✅ Sign-up ENABLED.")
+        msg = await update.message.reply_text("✅ Sign-up ENABLED.")
     elif state == "off":
         _save_setting("signup_enabled", False)
-        await update.message.reply_text("🚫 Sign-up DISABLED.")
+        msg = await update.message.reply_text("🚫 Sign-up DISABLED.")
     else:
         cur = "ON" if is_signup_enabled() else "OFF"
-        await update.message.reply_text(f"Usage: /sign-up on|off\nCurrent: {cur}")
+        msg = await update.message.reply_text(f"Usage: /signup on|off\nCurrent: {cur}")
+    asyncio.create_task(auto_delete_msg(msg, delay=60))
+    asyncio.create_task(auto_delete_msg(update.message, delay=60))
 
 async def admin_login_toggle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """/login on|off"""
@@ -3481,13 +3494,15 @@ async def admin_login_toggle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     state = args[0].lower() if args else ""
     if state == "on":
         _save_setting("login_enabled", True)
-        await update.message.reply_text("✅ Login ENABLED.")
+        msg = await update.message.reply_text("✅ Login ENABLED.")
     elif state == "off":
         _save_setting("login_enabled", False)
-        await update.message.reply_text("🚫 Login DISABLED.")
+        msg = await update.message.reply_text("🚫 Login DISABLED.")
     else:
         cur = "ON" if is_login_enabled() else "OFF"
-        await update.message.reply_text(f"Usage: /login on|off\nCurrent: {cur}")
+        msg = await update.message.reply_text(f"Usage: /login on|off\nCurrent: {cur}")
+    asyncio.create_task(auto_delete_msg(msg, delay=60))
+    asyncio.create_task(auto_delete_msg(update.message, delay=60))
 
 async def admin_user_info(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """/user <vault_id|telegram_id|@username>"""
@@ -3501,43 +3516,56 @@ async def admin_user_info(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not u:
         await update.message.reply_text(f"❌ User not found: {raw}")
         return
-    info = _fmt_user_info(u, bot_username_lookup=raw.lstrip("@") if raw.startswith("@") else str(u["telegram_id"]))
-    await update.message.reply_text(f"👤 User Info\n\n{info}")
+    info = _fmt_user_info(u)
+    msg  = await update.message.reply_text(f"👤 User Info\n\n{info}")
+    asyncio.create_task(auto_delete_msg(msg, delay=60))
 
 async def admin_account_disable(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """/account disable <vault_id|tid|@username>"""
+    """/account disable|enable <vault_id|tid|@username>"""
     if not _is_admin_msg(update):
         return
     args = ctx.args or []
     if len(args) < 2 or args[0].lower() not in ("disable", "enable"):
-        await update.message.reply_text(
+        msg = await update.message.reply_text(
             "Usage: /account disable <vault_id|tid|@username>\n"
             "       /account enable  <vault_id|tid|@username>"
         )
+        asyncio.create_task(auto_delete_msg(msg, delay=60))
+        asyncio.create_task(auto_delete_msg(update.message, delay=60))
         return
     action = args[0].lower()
     raw    = " ".join(args[1:]).strip()
     u      = _resolve_user(raw)
     if not u:
-        await update.message.reply_text(f"❌ User not found: {raw}")
+        msg = await update.message.reply_text(f"❌ User not found: {raw}")
+        asyncio.create_task(auto_delete_msg(msg, delay=60))
+        asyncio.create_task(auto_delete_msg(update.message, delay=60))
         return
     flag = 1 if action == "disable" else 0
     with get_db() as c:
         c.execute("UPDATE users SET account_disabled=? WHERE vault_id=?", (flag, u["vault_id"]))
-        # Also clear all sessions if disabling
         if flag:
+            # Clear all active sessions for this vault
             c.execute("DELETE FROM sessions WHERE vault_id=?", (u["vault_id"],))
         c.commit()
+    # Clear pw cache so auto-backup also stops for disabled account
+    if flag:
+        _session_pw_cache.pop(u["vault_id"], None)
     word = "DISABLED" if flag else "ENABLED"
-    await update.message.reply_text(
-        f"✅ Account `{u['vault_id']}` has been {word}."
+    resp = await update.message.reply_text(
+        f"✅ Account `{u['vault_id']}` ({u['tg_username'] or u['telegram_id']}) has been {word}.\n"
+        f"All active sessions cleared." if flag else
+        f"✅ Account `{u['vault_id']}` ({u['tg_username'] or u['telegram_id']}) has been {word}."
     )
+    asyncio.create_task(auto_delete_msg(resp, delay=60))
+    asyncio.create_task(auto_delete_msg(update.message, delay=60))
     # Notify the user
     try:
         if flag:
             await ctx.bot.send_message(
                 chat_id=u["telegram_id"],
-                text="🚫 *Your account has been disabled by an administrator\\.*",
+                text="🚫 *Your account has been disabled by an administrator\\.*\n\n"
+                     "_Your data is safe and has not been deleted\\._",
                 parse_mode="MarkdownV2",
             )
         else:
@@ -3553,9 +3581,9 @@ async def admin_broadcast(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """/broadcast <message>  OR  reply to a message with /broadcast"""
     if not _is_admin_msg(update):
         return
+    asyncio.create_task(auto_delete_msg(update.message, delay=60))
     with get_db() as c:
         users = c.execute("SELECT telegram_id FROM users").fetchall()
-    # Determine what to send
     reply_to = update.message.reply_to_message
     text_msg  = " ".join(ctx.args) if ctx.args else None
     sent = 0; failed = 0
@@ -3571,9 +3599,10 @@ async def admin_broadcast(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             sent += 1
         except Exception:
             failed += 1
-    await update.message.reply_text(
+    msg = await update.message.reply_text(
         f"📢 Broadcast complete.\nSent: {sent}  |  Failed: {failed}"
     )
+    asyncio.create_task(auto_delete_msg(msg, delay=60))
 
 async def admin_export(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """
@@ -3582,15 +3611,17 @@ async def admin_export(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """
     if not _is_admin_msg(update):
         return
+    asyncio.create_task(auto_delete_msg(update.message, delay=60))
     if not ctx.args:
-        await update.message.reply_text("Usage: /export <encryption_password>")
+        msg = await update.message.reply_text("Usage: /export <encryption_password>")
+        asyncio.create_task(auto_delete_msg(msg, delay=60))
         return
     password = ctx.args[0]
-    # Dump all tables to JSON
     tables = [
         "users", "totp_accounts", "sessions", "reset_otps",
         "reset_attempts", "login_alerts", "share_links",
         "login_attempts", "backup_reminders", "bot_settings",
+        "auto_backup_settings",
     ]
     dump = {}
     with get_db() as c:
@@ -3610,7 +3641,7 @@ async def admin_export(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         document=bio,
         filename=fname,
         caption=(
-            f"🔒 BV Authenticator — Full DB Export\n"
+            f"🔒 BV Authenticator -- Full DB Export\n"
             f"📅 {ts_str}\n"
             f"🔑 Encrypted with the password you provided.\n\n"
             f"Use /import to restore."
@@ -3621,14 +3652,16 @@ async def admin_export(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 _admin_import_pending: dict = {}   # chat_id → {"password": str}
 
 async def admin_import(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """/import  — starts the import process in the admin group."""
+    """/import  -- starts the import process in the admin group."""
     if not _is_admin_msg(update):
         return
+    asyncio.create_task(auto_delete_msg(update.message, delay=60))
     chat_id = update.effective_chat.id
     _admin_import_pending[chat_id] = {"step": "wait_file"}
-    await update.message.reply_text(
+    msg = await update.message.reply_text(
         "📥 Admin Import\n\nSend the .bvadmin backup file now."
     )
+    asyncio.create_task(auto_delete_msg(msg, delay=60))
 
 async def admin_import_file_recv(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Receive the .bvadmin file in admin group during /import flow."""
@@ -3639,15 +3672,18 @@ async def admin_import_file_recv(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
     if state.get("step") != "wait_file":
         return
     if not update.message.document:
-        await update.message.reply_text("⚠️ Please send a .bvadmin file.")
+        msg = await update.message.reply_text("⚠️ Please send a .bvadmin file.")
+        asyncio.create_task(auto_delete_msg(msg, delay=60))
         return
+    asyncio.create_task(auto_delete_msg(update.message, delay=60))
     bio = BytesIO()
     f   = await update.message.document.get_file()
     await f.download_to_memory(bio)
     _admin_import_pending[chat_id] = {"step": "wait_password", "payload": bio.getvalue()}
-    await update.message.reply_text(
+    msg = await update.message.reply_text(
         "🔒 File received. Now send the encryption password."
     )
+    asyncio.create_task(auto_delete_msg(msg, delay=60))
 
 async def admin_import_password(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Receive the decryption password for admin import."""
@@ -3696,23 +3732,27 @@ async def admin_import_password(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 async def admin_userall_export(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """/userall export — send a .txt file listing all users."""
+    """/userall -- send a .txt file listing all users with @username."""
     if not _is_admin_msg(update):
         return
+    asyncio.create_task(auto_delete_msg(update.message, delay=60))
     with get_db() as c:
         rows = c.execute(
-            "SELECT u.telegram_id, u.tg_name, u.vault_id, COUNT(t.id) AS totp_cnt "
+            "SELECT u.telegram_id, u.tg_name, u.tg_username, u.vault_id, u.account_disabled, "
+            "COUNT(t.id) AS totp_cnt "
             "FROM users u LEFT JOIN totp_accounts t ON u.vault_id=t.vault_id "
             "GROUP BY u.vault_id ORDER BY u.created_at",
         ).fetchall()
     if not rows:
-        await update.message.reply_text("No users found.")
+        msg = await update.message.reply_text("No users found.")
+        asyncio.create_task(auto_delete_msg(msg, delay=60))
         return
     lines = []
     for i, r in enumerate(rows, 1):
-        tname = r["tg_name"] or "Unknown"
+        uname  = f"@{r['tg_username']}" if r["tg_username"] else f"(ID:{r['telegram_id']})"
+        status = "DISABLED" if r["account_disabled"] else "Active"
         lines.append(
-            f"{i} — {r['telegram_id']} ~ {tname} ~ {r['vault_id']} ~ {r['totp_cnt']} TOTP"
+            f"{i} | {uname} | {r['vault_id']} | {r['totp_cnt']} TOTP | {status}"
         )
     content = "\n".join(lines)
     ts_str  = datetime.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
@@ -3722,7 +3762,7 @@ async def admin_userall_export(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_document(
         document=bio,
         filename=fname,
-        caption=f"👥 All Users Export — {len(rows)} total\n📅 {ts_str}",
+        caption=f"👥 All Users Export -- {len(rows)} total\n📅 {ts_str}",
     )
 
 # ── OFFLINE AUTO BACKUP ────────────────────────────────────
@@ -4357,7 +4397,7 @@ def main():
     if ADMIN_GROUP_ID != 0:
         admin_filter = filters.Chat(chat_id=ADMIN_GROUP_ID)
         app.add_handler(CommandHandler("maintenance",  admin_maintenance,     filters=admin_filter))
-        app.add_handler(CommandHandler("sign_up",      admin_signup_toggle,   filters=admin_filter))
+        app.add_handler(CommandHandler("signup",       admin_signup_toggle,   filters=admin_filter))
         app.add_handler(CommandHandler("login",        admin_login_toggle,    filters=admin_filter))
         app.add_handler(CommandHandler("user",         admin_user_info,       filters=admin_filter))
         app.add_handler(CommandHandler("account",      admin_account_disable, filters=admin_filter))
