@@ -69,6 +69,45 @@ _bot_settings: dict = {
 # Populated on login/signup, cleared on logout. Never persisted to DB.
 _session_pw_cache: dict = {}   # vault_id -> plaintext password
 
+def _oab_pw_enc_key(vault_id: str) -> bytes:
+    """Derive a 32-byte AES key for encrypting the backup password in DB.
+    Uses SERVER_KEY + vault_id so it is unique per vault and tied to the server."""
+    salt = hashlib.sha256(SERVER_KEY + b":oabpw:" + vault_id.encode()).digest()[:16]
+    return PBKDF2HMAC(
+        algorithm=hashes.SHA256(), length=32, salt=salt, iterations=100_000
+    ).derive(SERVER_KEY + vault_id.encode())
+
+def _oab_store_password(telegram_id: int, vault_id: str, password: str):
+    """Encrypt and persist the user's password for offline auto-backup."""
+    key  = _oab_pw_enc_key(vault_id)
+    iv   = os.urandom(12)
+    salt = os.urandom(16)   # stored but not used for key (kept for schema compat)
+    ct   = AESGCM(key).encrypt(iv, password.encode(), None)
+    with get_db() as c:
+        c.execute(
+            "INSERT INTO auto_backup_settings (telegram_id, pw_enc, pw_salt, pw_iv) VALUES (?,?,?,?) "
+            "ON CONFLICT(telegram_id) DO UPDATE SET pw_enc=excluded.pw_enc, "
+            "pw_salt=excluded.pw_salt, pw_iv=excluded.pw_iv",
+            (telegram_id, ct, salt, iv),
+        )
+        c.commit()
+
+def _oab_load_password(telegram_id: int, vault_id: str) -> str | None:
+    """Load and decrypt the stored backup password. Returns None if not available."""
+    with get_db() as c:
+        row = c.execute(
+            "SELECT pw_enc, pw_iv FROM auto_backup_settings WHERE telegram_id=?",
+            (telegram_id,)
+        ).fetchone()
+    if not row or not row["pw_enc"]:
+        return None
+    try:
+        key = _oab_pw_enc_key(vault_id)
+        return AESGCM(key).decrypt(bytes(row["pw_iv"]), bytes(row["pw_enc"]), None).decode()
+    except Exception as e:
+        logger.warning(f"_oab_load_password failed for {telegram_id}: {e}")
+        return None
+
 # ── DB ─────────────────────────────────────────────────────
 def get_db():
     conn = sqlite3.connect(DB_PATH)
@@ -155,12 +194,22 @@ def init_db():
             enabled      INTEGER DEFAULT 0,
             frequency    TEXT    DEFAULT 'weekly',
             last_weekly  INTEGER DEFAULT 0,
-            last_monthly INTEGER DEFAULT 0)""")
+            last_monthly INTEGER DEFAULT 0,
+            pw_enc       BLOB,
+            pw_salt      BLOB,
+            pw_iv        BLOB)""")
 
         # Migrations
         for col, defval in [("tg_name", "''"), ("timezone", "'UTC'"), ("tg_username", "''")]:
             try:
                 c.execute(f"ALTER TABLE users ADD COLUMN {col} TEXT DEFAULT {defval}")
+            except Exception:
+                pass
+
+        # Migrate auto_backup_settings: add encrypted password columns
+        for col, coltype in [("pw_enc", "BLOB"), ("pw_salt", "BLOB"), ("pw_iv", "BLOB")]:
+            try:
+                c.execute(f"ALTER TABLE auto_backup_settings ADD COLUMN {col} {coltype}")
             except Exception:
                 pass
 
@@ -246,7 +295,10 @@ MAINTENANCE_MSG = (
 
 def update_last_seen(telegram_id: int):
     with get_db() as c:
-        c.execute("UPDATE users SET last_seen=? WHERE telegram_id=?", (int(time.time()), telegram_id))
+        c.execute(
+            "UPDATE users SET last_seen=? WHERE telegram_id=?",
+            (int(time.time()), telegram_id)
+        )
         c.commit()
 
 def fmt_bd_time(ts: int) -> str:
@@ -967,7 +1019,8 @@ async def signup_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     set_session(uid, vid)
     ctx.user_data["password"] = pw
     ctx.user_data["vault_id"] = vid
-    _session_pw_cache[vid] = pw   # cache for auto-backup
+    _session_pw_cache[vid] = pw             # RAM cache for auto-backup
+    _oab_store_password(uid, vid, pw)       # DB encrypted store for auto-backup
 
     sk_display = " ".join(secure_key[i:i+8] for i in range(0, len(secure_key), 8))
 
@@ -1163,7 +1216,7 @@ async def login_pw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         remaining, _ = get_login_freeze_remaining(vid)
         h, m = remaining // 3600, (remaining % 3600) // 60
         await update.message.reply_text(
-            f"🔒 *Account temporarily locked\\.* Too many failed login attempts\\.\n\n"
+            f"🔒 *Account temporarily disabled\\.* Too many failed login attempts\\.\n\n"
             f"Try again in *{h}h {m}m*\\.",
             parse_mode="MarkdownV2",
             reply_markup=kb_auth(),
@@ -1177,7 +1230,7 @@ async def login_pw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             remaining, _ = get_login_freeze_remaining(vid)
             h, m = remaining // 3600, (remaining % 3600) // 60
             await update.message.reply_text(
-                f"🔒 *Account locked for {h}h {m}m* due to {MAX_LOGIN_ATTEMPTS} failed attempts\\.\n\n"
+                f"🔒 *Account disabled for {h}h {m}m* due to {MAX_LOGIN_ATTEMPTS} failed attempts\\.\n\n"
                 "Please wait or use *Forgot Password* to reset\\.",
                 parse_mode="MarkdownV2",
                 reply_markup=kb_auth(),
@@ -1190,7 +1243,7 @@ async def login_pw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 attempts = row["attempts"] if row else 1
             left = max(0, MAX_LOGIN_ATTEMPTS - attempts)
             await update.message.reply_text(
-                f"❌ Wrong password\\. *{left} attempt\\(s\\) remaining* before lockout\\.\n\nTry again:",
+                f"❌ Wrong password\\. *{left} attempt\\(s\\) remaining* before being disabled\\.\n\nTry again:",
                 parse_mode="MarkdownV2",
                 reply_markup=kb_cancel(),
             )
@@ -1198,6 +1251,7 @@ async def login_pw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     # Successful login: clear any failed attempt records
     clear_login_failures(vid)
+    update_last_seen(uid)
 
     if uid != u["telegram_id"]:
         new_username = update.effective_user.username or str(uid)
@@ -1210,7 +1264,8 @@ async def login_pw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         update_tg_name(vid, update.effective_user)
     ctx.user_data["password"] = pw
     ctx.user_data["vault_id"] = vid
-    _session_pw_cache[vid] = pw   # cache for auto-backup
+    _session_pw_cache[vid] = pw             # RAM cache for auto-backup
+    _oab_store_password(uid, vid, pw)       # DB encrypted store for auto-backup
     owner_name = u["tg_name"] if u["tg_name"] else "User"
     await update.message.reply_text(
         f"✅ *Logged in\\!* Welcome to vault of *{em(owner_name)}*\\.",
@@ -1264,8 +1319,8 @@ async def reset_id_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         remaining, _ = get_login_freeze_remaining(vid)
         h, m = remaining // 3600, (remaining % 3600) // 60
         await update.message.reply_text(
-            f"🔒 *Account locked due to too many failed login attempts\\.*\n\n"
-            f"Password reset is blocked until the lockout expires\\.\n"
+            f"🔒 *Account disabled due to too many failed login attempts\\.*\n\n"
+            f"Password reset is blocked until the disable period expires\\.\n"
             f"Try again in *{h}h {m}m*\\.",
             parse_mode="MarkdownV2",
             reply_markup=kb_auth(),
@@ -1277,7 +1332,7 @@ async def reset_id_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         remaining = get_freeze_remaining(vid)
         h, m      = remaining // 3600, (remaining % 3600) // 60
         await update.message.reply_text(
-            f"⚠️ *Account temporarily frozen* due to too many failed reset attempts\\.\n\n"
+            f"⚠️ *Account temporarily disabled* due to too many failed reset attempts\\.\n\n"
             f"Try again in *{h}h {m}m*\\.",
             parse_mode="MarkdownV2",
             reply_markup=kb_cancel(),
@@ -1326,7 +1381,7 @@ async def reset_otp_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if frozen:
             h, m = get_freeze_remaining(vid) // 3600, (get_freeze_remaining(vid) % 3600) // 60
             await update.message.reply_text(
-                f"⚠️ *Too many failed attempts\\.* Account frozen for *{h}h {m}m*\\.",
+                f"⚠️ *Too many failed attempts\\.* Account disabled for *{h}h {m}m*\\.",
                 parse_mode="MarkdownV2",
                 reply_markup=kb_auth(),
             )
@@ -1337,7 +1392,7 @@ async def reset_otp_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             attempts = row["attempts"] if row else 0
             left     = max(0, MAX_RESET_ATTEMPTS - attempts)
         await update.message.reply_text(
-            f"❌ *Invalid or expired OTP\\.* {left} attempt\\(s\\) remaining before freeze\\.",
+            f"❌ *Invalid or expired OTP\\.* {left} attempt\\(s\\) remaining before being disabled\\.",
             parse_mode="MarkdownV2",
             reply_markup=kb_cancel(),
         )
@@ -1592,7 +1647,7 @@ async def settings_reset_otp(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if frozen:
             h, m = get_freeze_remaining(vault) // 3600, (get_freeze_remaining(vault) % 3600) // 60
             await update.message.reply_text(
-                f"⚠️ *Too many failed attempts\\.* Account frozen for *{h}h {m}m*\\.",
+                f"⚠️ *Too many failed attempts\\.* Account disabled for *{h}h {m}m*\\.",
                 parse_mode="MarkdownV2",
                 reply_markup=kb_cancel(),
             )
@@ -1691,6 +1746,8 @@ async def settings_reset_pw_confirm(update: Update, ctx: ContextTypes.DEFAULT_TY
             )
         c.commit()
     ctx.user_data["password"] = new_pw
+    _session_pw_cache[vault] = new_pw           # update RAM cache
+    _oab_store_password(uid, vault, new_pw)     # update DB encrypted store
     await update.message.reply_text(
         "✅ *Password reset\\! All TOTP secrets re\\-encrypted\\.*",
         parse_mode="MarkdownV2",
@@ -1977,6 +2034,8 @@ async def change_pw_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             )
         c.commit()
     ctx.user_data["password"] = new_pw
+    _session_pw_cache[vault] = new_pw           # update RAM cache
+    _oab_store_password(uid, vault, new_pw)     # update DB encrypted store
     await update.message.reply_text(
         "✅ *Password changed\\! All TOTP secrets re\\-encrypted\\.*",
         parse_mode="MarkdownV2",
@@ -3177,6 +3236,9 @@ async def global_auto_detect(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     pw    = ctx.user_data.get("password")
     # Auto-delete the incoming message after 30s regardless of content
     asyncio.create_task(auto_delete_msg(update.message, delay=30))
+    # Update last_seen for every message interaction
+    if vault:
+        update_last_seen(uid)
     if not vault or not pw:
         return
 
@@ -3461,15 +3523,29 @@ def _fmt_user_info(u) -> str:
         vault_id    = u["vault_id"]
         tid         = u["telegram_id"]
         tg_name     = u["tg_name"] or "Unknown"
-        # tg_username may not exist for older accounts (KeyError safe)
         try:
             tg_username = u["tg_username"] or ""
         except (KeyError, IndexError):
             tg_username = ""
         username_str = f"@{tg_username}" if tg_username else f"(no username, ID: {tid})"
         created_at  = fmt_bd_time(u["created_at"]) if u["created_at"] else "N/A"
+        # Last seen: show time + how long ago for accuracy
         try:
-            last_seen = fmt_bd_time(u["last_seen"]) if u["last_seen"] else "Never"
+            ls_ts = u["last_seen"]
+            if ls_ts:
+                ls_fmt  = fmt_bd_time(ls_ts)
+                ago_sec = int(time.time()) - ls_ts
+                if ago_sec < 60:
+                    ago_str = "just now"
+                elif ago_sec < 3600:
+                    ago_str = f"{ago_sec // 60}m ago"
+                elif ago_sec < 86400:
+                    ago_str = f"{ago_sec // 3600}h {(ago_sec % 3600) // 60}m ago"
+                else:
+                    ago_str = f"{ago_sec // 86400}d ago"
+                last_seen = f"{ls_fmt} ({ago_str})"
+            else:
+                last_seen = "Never"
         except (KeyError, TypeError):
             last_seen = "Never"
         try:
@@ -3483,15 +3559,23 @@ def _fmt_user_info(u) -> str:
             br = c.execute(
                 "SELECT frequency, enabled FROM backup_reminders WHERE telegram_id=?", (tid,)
             ).fetchone()
+            ab = c.execute(
+                "SELECT enabled, frequency FROM auto_backup_settings WHERE telegram_id=?", (tid,)
+            ).fetchone()
             la = c.execute(
                 "SELECT attempts FROM login_attempts WHERE vault_id=?", (vault_id,)
             ).fetchone()
             ra = c.execute(
                 "SELECT attempts FROM reset_attempts WHERE vault_id=?", (vault_id,)
             ).fetchone()
+        # Backup Reminder status
         reminder_status = "Off"
         if br and br["enabled"]:
-            reminder_status = f"On - {br['frequency']}"
+            reminder_status = f"On - {br['frequency'].capitalize()}"
+        # Offline Auto Backup status
+        auto_backup_status = "Off"
+        if ab and ab["enabled"]:
+            auto_backup_status = f"On - {ab['frequency'].capitalize()}"
         failed_login = la["attempts"] if la else 0
         failed_reset = ra["attempts"] if ra else 0
         return (
@@ -3503,7 +3587,8 @@ def _fmt_user_info(u) -> str:
             f"Created        : {created_at}\n\n"
             f"Last Online    : {last_seen}\n\n"
             f"Account Status : {status}\n\n"
-            f"Reminder       : {reminder_status}\n\n"
+            f"Reminder       : {reminder_status}\n"
+            f"Auto Backup    : {auto_backup_status}\n\n"
             f"Failed Logins  : {failed_login}\n\n"
             f"Failed Resets  : {failed_reset}"
         )
@@ -3929,76 +4014,55 @@ async def oab_freq(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def run_auto_backup_for_user(bot, tid: int, vault_id: str, freq_label: str):
     """
     Build and send an encrypted .bvault backup to a user's Telegram chat.
-    Uses the user's stored password hash to encrypt (password not stored in plaintext,
-    so we re-derive a per-user backup key from SERVER_KEY + vault_id + timestamp-bucket).
-    NOTE: Since the user password is NOT stored server-side in plaintext, we use a
-    deterministic backup key derived from SERVER_KEY + vault_id so the user can
-    always decrypt it with the bot's export/import function using the shown password.
-    The shown password in the caption is the derivation key displayed as hex (first 16 chars).
+    Password is loaded from DB (encrypted). Falls back to RAM cache if DB not yet populated.
     """
     try:
-        with get_db() as c:
-            rows = c.execute(
-                "SELECT name, issuer, secret_enc, salt, iv, note, account_type, hotp_counter "
-                "FROM totp_accounts WHERE vault_id=?",
-                (vault_id,)
-            ).fetchall()
-            u = c.execute("SELECT pw_salt, password_hash FROM users WHERE vault_id=?", (vault_id,)).fetchone()
-        if not rows:
-            logger.info(f"Auto-backup: no TOTP accounts for vault {vault_id}, skipping.")
-            return
+        # Load password: prefer RAM cache (fresher), fall back to DB store
+        live_pw = _session_pw_cache.get(vault_id) or _oab_load_password(tid, vault_id)
 
-        # Derive a stable backup file password from SERVER_KEY + vault_id.
-        # This is NOT the user's login password. It is shown in the caption so the user
-        # knows what password to use when importing.
-        raw_key_material = hashlib.sha256(
-            SERVER_KEY + b":autobackup:" + vault_id.encode()
-        ).hexdigest()
-        file_pw = raw_key_material[:32]   # 32-char hex string used as file encryption password
-
-        # We need plaintext secrets. Decrypt each using a per-entry approach.
-        # Since we don't have the user's live password, we cannot decrypt with enc_key().
-        # Instead we build the backup with a note that secrets are re-encrypted below.
-        # IMPORTANT: We store secrets encrypted with (password + vault_id + SERVER_KEY).
-        # Without the user's current password we cannot decrypt. So we export the raw
-        # encrypted blobs and note them as such. The real solution: track sessions and
-        # only run backup for users with an active session that has password in ctx.
-        #
-        # PRACTICAL APPROACH: We iterate all active sessions, and for each session that
-        # has a cached password we do the real decryption. Here we call from job context
-        # so we don't have ctx.user_data. We therefore send a reminder-style message
-        # telling the user to open the bot to trigger the backup, OR we store the
-        # user's vault password in a session-password cache (not recommended for security).
-        #
-        # BEST SAFE APPROACH: Generate the backup only when we have a valid password.
-        # We maintain a small in-memory dict of {vault_id: password} updated on every login.
-        # This is cleared on logout. It lives in RAM only (never persisted to DB).
-
-        file_pw_for_display = _session_pw_cache.get(vault_id)
-        if not file_pw_for_display:
-            # User not currently logged in or password not in cache; send a reminder instead
+        if not live_pw:
+            # Password not available at all — user never logged in after feature was added
             try:
                 import zoneinfo
                 bd_now = datetime.datetime.now(tz=zoneinfo.ZoneInfo(BD_TZ))
             except Exception:
-                bd_now = datetime.datetime.utcnow()
+                bd_now = datetime.datetime.utcnow() + datetime.timedelta(hours=6)
             bd_str = bd_now.strftime("%d %b %Y, %I:%M %p (BDT)")
             await bot.send_message(
                 chat_id=tid,
                 text=(
-                    "💾 *Auto Backup \\— Login Required*\n\n"
+                    "💾 *Auto Backup \\— Action Required*\n\n"
                     f"📅 _{em(bd_str)}_\n\n"
-                    "Your scheduled auto\\-backup could not run because you are not currently logged in\\.\n\n"
-                    "Please /start the bot and log in\\. "
-                    "The backup will be sent on your next scheduled window once you are logged in\\."
+                    "Your scheduled auto\\-backup could not run\\.\n\n"
+                    "Please /start the bot, log in once, and your backup will work "
+                    "automatically from the next scheduled window\\."
                 ),
                 parse_mode="MarkdownV2",
             )
+            # Mark as attempted so we don't spam every hour
+            col = "last_weekly" if freq_label == "weekly" else "last_monthly"
+            with get_db() as c:
+                c.execute(
+                    f"INSERT INTO auto_backup_settings (telegram_id, {col}) VALUES (?,?) "
+                    f"ON CONFLICT(telegram_id) DO UPDATE SET {col}=excluded.{col}",
+                    (tid, int(time.time())),
+                )
+                c.commit()
             return
 
-        live_pw = file_pw_for_display
+        with get_db() as c:
+            totp_rows = c.execute(
+                "SELECT name, issuer, secret_enc, salt, iv, note, account_type, hotp_counter "
+                "FROM totp_accounts WHERE vault_id=?",
+                (vault_id,)
+            ).fetchall()
+
+        if not totp_rows:
+            logger.info(f"Auto-backup: no TOTP accounts for vault {vault_id}, skipping.")
+            return
+
         entries = []
-        for row in rows:
+        for row in totp_rows:
             try:
                 secret = decrypt(row["secret_enc"], row["salt"], row["iv"], live_pw, vault_id)
                 entries.append({
@@ -4013,31 +4077,38 @@ async def run_auto_backup_for_user(bot, tid: int, vault_id: str, freq_label: str
                 logger.error(f"Auto-backup decrypt error for {vault_id}/{row['name']}: {e}")
 
         if not entries:
-            logger.warning(f"Auto-backup: all decrypt failed for vault {vault_id}")
+            logger.warning(f"Auto-backup: all decrypt failed for vault {vault_id} — password may have changed")
+            # Password mismatch means user changed password without triggering a new store.
+            # Clear the stale DB password so next login re-stores the correct one.
+            with get_db() as c:
+                c.execute(
+                    "UPDATE auto_backup_settings SET pw_enc=NULL, pw_salt=NULL, pw_iv=NULL "
+                    "WHERE telegram_id=?", (tid,)
+                )
+                c.commit()
             return
 
-        plain   = json.dumps({
-            "version":   3,
-            "vault_id":  vault_id,
-            "accounts":  entries,
+        plain = json.dumps({
+            "version":     3,
+            "vault_id":    vault_id,
+            "accounts":    entries,
             "backup_type": "auto",
         }, ensure_ascii=False).encode()
 
-        # Encrypt with the user's live login password (same as manual export)
-        payload  = export_encrypt(plain, live_pw)
+        payload = export_encrypt(plain, live_pw)
 
         try:
             import zoneinfo
             bd_now = datetime.datetime.now(tz=zoneinfo.ZoneInfo(BD_TZ))
         except Exception:
-            bd_now = datetime.datetime.utcnow()
+            bd_now = datetime.datetime.utcnow() + datetime.timedelta(hours=6)
         bd_str   = bd_now.strftime("%d %b %Y, %I:%M %p (BDT)")
         ts_str   = datetime.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
         filename = f"bv_autobackup_{freq_label}_{ts_str}.bvault"
         bio      = BytesIO(payload)
         bio.name = filename
 
-        AUTO_DELETE_SECONDS = 3 * 24 * 3600  # 3 days
+        AUTO_DELETE_SECONDS = 3 * 24 * 3600   # 3 days
 
         msg = await bot.send_document(
             chat_id=tid,
@@ -4055,6 +4126,7 @@ async def run_auto_backup_for_user(bot, tid: int, vault_id: str, freq_label: str
             parse_mode="MarkdownV2",
         )
 
+        # Schedule auto-delete after 3 days
         async def _auto_delete_backup():
             await asyncio.sleep(AUTO_DELETE_SECONDS)
             try:
@@ -4262,6 +4334,8 @@ async def cancel_to_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def main_menu_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
+    uid = update.effective_user.id
+    update_last_seen(uid)
     await q.edit_message_text("Choose an option:", reply_markup=kb_main())
     return TOTP_MENU
 
@@ -4503,15 +4577,21 @@ def main():
     # ── Job queue: daily backup reminders + hourly auto-backup ──
     jq = app.job_queue
     if jq:
+        async def _reminder_job(ctx2):
+            await send_backup_reminders(app)
+
+        async def _autobackup_job(ctx2):
+            await send_auto_backups(app)
+
         jq.run_repeating(
-            lambda ctx2: asyncio.create_task(send_backup_reminders(app)),
+            _reminder_job,
             interval=86400,
             first=60,
             name="backup_reminder_job",
         )
         # Auto-backup: runs every hour, checks if it's the right BDT time window
         jq.run_repeating(
-            lambda ctx2: asyncio.create_task(send_auto_backups(app)),
+            _autobackup_job,
             interval=3600,
             first=120,
             name="auto_backup_job",
