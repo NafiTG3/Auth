@@ -1247,16 +1247,43 @@ async def reset_id_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         return RESET_ID_INPUT
     vid = u["vault_id"]
+
+    # Block password reset for disabled accounts
+    if u["account_disabled"]:
+        await update.message.reply_text(
+            "🚫 *This account has been disabled\\.*\n\n"
+            "Password reset is not allowed for disabled accounts\\. "
+            "Please contact support\\.",
+            parse_mode="MarkdownV2",
+            reply_markup=kb_auth(),
+        )
+        return AUTH_MENU
+
+    # Block password reset while login is frozen (brute-force lockout)
+    if is_login_frozen(vid):
+        remaining, _ = get_login_freeze_remaining(vid)
+        h, m = remaining // 3600, (remaining % 3600) // 60
+        await update.message.reply_text(
+            f"🔒 *Account locked due to too many failed login attempts\\.*\n\n"
+            f"Password reset is blocked until the lockout expires\\.\n"
+            f"Try again in *{h}h {m}m*\\.",
+            parse_mode="MarkdownV2",
+            reply_markup=kb_auth(),
+        )
+        return AUTH_MENU
+
+    # Block password reset while already reset-frozen
     if is_reset_frozen(vid):
         remaining = get_freeze_remaining(vid)
         h, m      = remaining // 3600, (remaining % 3600) // 60
         await update.message.reply_text(
-            f"⚠️ *Account temporarily frozen* due to too many failed attempts\\.\n\n"
+            f"⚠️ *Account temporarily frozen* due to too many failed reset attempts\\.\n\n"
             f"Try again in *{h}h {m}m*\\.",
             parse_mode="MarkdownV2",
             reply_markup=kb_cancel(),
         )
         return RESET_ID_INPUT
+
     otp = gen_otp()
     store_otp(vid, otp)
     ctx.user_data["reset_vid"] = vid
@@ -3479,8 +3506,10 @@ async def admin_maintenance(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """
     if not _is_admin_msg(update):
         return
-    args  = (ctx.args or [])
-    state = args[0].lower() if args else ""
+    # Strip bot @mention from group commands: "/maintenance@Bot on" -> state="on"
+    raw_text     = (update.message.text or "").strip()
+    command_part = raw_text.split()[0] if raw_text else ""
+    state        = raw_text[len(command_part):].strip().lower()
     if state == "on":
         _save_setting("maintenance", True)
         msg = await update.message.reply_text("🔧 Maintenance mode ON. Users are blocked.")
@@ -3499,9 +3528,10 @@ async def admin_signup_toggle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """/signup on|off"""
     if not _is_admin_msg(update):
         return
-    # Parse arg from either ctx.args or raw message text
-    raw_text = (update.message.text or "").strip().split()
-    state = raw_text[1].lower() if len(raw_text) > 1 else ""
+    # Strip bot @mention from group command text
+    raw_text     = (update.message.text or "").strip()
+    command_part = raw_text.split()[0] if raw_text else ""
+    state        = raw_text[len(command_part):].strip().lower()
     if state == "on":
         _save_setting("signup_enabled", True)
         msg = await update.message.reply_text("✅ Sign-up ENABLED.")
@@ -3518,8 +3548,10 @@ async def admin_login_toggle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """/login on|off"""
     if not _is_admin_msg(update):
         return
-    args  = (ctx.args or [])
-    state = args[0].lower() if args else ""
+    # Strip bot @mention from group command text
+    raw_text     = (update.message.text or "").strip()
+    command_part = raw_text.split()[0] if raw_text else ""
+    state        = raw_text[len(command_part):].strip().lower()
     if state == "on":
         _save_setting("login_enabled", True)
         msg = await update.message.reply_text("✅ Login ENABLED.")
@@ -3537,19 +3569,22 @@ async def admin_user_info(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not _is_admin_msg(update):
         return
     asyncio.create_task(auto_delete_msg(update.message, delay=60))
-    # Parse argument from raw message text (ctx.args drops @username in some clients)
+    # In groups, Telegram appends @BotUsername to the command: "/user@BotName arg"
+    # So we must strip the bot mention before extracting the argument.
     raw_text = (update.message.text or "").strip()
-    parts    = raw_text.split(None, 1)   # split on first whitespace: ["/user", "arg"]
-    if len(parts) < 2 or not parts[1].strip():
+    # Remove the command prefix including any @mention: "/user@BotName" -> ""
+    # Then grab everything after the first whitespace as the argument.
+    command_part = raw_text.split()[0] if raw_text else ""   # e.g. "/user" or "/user@BotName"
+    arg_part = raw_text[len(command_part):].strip()          # everything after the command
+    if not arg_part:
         msg = await update.message.reply_text(
             "Usage: /user <vault_id | telegram_id | @username>"
         )
         asyncio.create_task(auto_delete_msg(msg, delay=60))
         return
-    raw = parts[1].strip()
-    u   = _resolve_user(raw)
+    u = _resolve_user(arg_part)
     if not u:
-        msg = await update.message.reply_text(f"❌ User not found: {raw}")
+        msg = await update.message.reply_text(f"❌ User not found: {arg_part}")
         asyncio.create_task(auto_delete_msg(msg, delay=60))
         return
     info = _fmt_user_info(u)
@@ -3560,42 +3595,40 @@ async def admin_account_disable(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """/account disable|enable <vault_id|tid|@username>"""
     if not _is_admin_msg(update):
         return
-    args = ctx.args or []
-    if len(args) < 2 or args[0].lower() not in ("disable", "enable"):
+    asyncio.create_task(auto_delete_msg(update.message, delay=60))
+    # Strip bot @mention from group command text: "/account@BotName disable arg" -> "disable arg"
+    raw_text     = (update.message.text or "").strip()
+    command_part = raw_text.split()[0] if raw_text else ""
+    arg_str      = raw_text[len(command_part):].strip()   # "disable abc123" or "enable @user"
+    arg_parts    = arg_str.split(None, 1)                 # ["disable", "abc123"]
+    if len(arg_parts) < 2 or arg_parts[0].lower() not in ("disable", "enable"):
         msg = await update.message.reply_text(
             "Usage: /account disable <vault_id|tid|@username>\n"
             "       /account enable  <vault_id|tid|@username>"
         )
         asyncio.create_task(auto_delete_msg(msg, delay=60))
-        asyncio.create_task(auto_delete_msg(update.message, delay=60))
         return
-    action = args[0].lower()
-    raw    = " ".join(args[1:]).strip()
+    action = arg_parts[0].lower()
+    raw    = arg_parts[1].strip()
     u      = _resolve_user(raw)
     if not u:
         msg = await update.message.reply_text(f"❌ User not found: {raw}")
         asyncio.create_task(auto_delete_msg(msg, delay=60))
-        asyncio.create_task(auto_delete_msg(update.message, delay=60))
         return
     flag = 1 if action == "disable" else 0
     with get_db() as c:
         c.execute("UPDATE users SET account_disabled=? WHERE vault_id=?", (flag, u["vault_id"]))
         if flag:
-            # Clear all active sessions for this vault
             c.execute("DELETE FROM sessions WHERE vault_id=?", (u["vault_id"],))
         c.commit()
-    # Clear pw cache so auto-backup also stops for disabled account
     if flag:
         _session_pw_cache.pop(u["vault_id"], None)
     word = "DISABLED" if flag else "ENABLED"
+    note = "\nAll active sessions cleared." if flag else ""
     resp = await update.message.reply_text(
-        f"✅ Account `{u['vault_id']}` ({u['tg_username'] or u['telegram_id']}) has been {word}.\n"
-        f"All active sessions cleared." if flag else
-        f"✅ Account `{u['vault_id']}` ({u['tg_username'] or u['telegram_id']}) has been {word}."
+        f"✅ Account `{u['vault_id']}` ({u['tg_username'] or u['telegram_id']}) has been {word}.{note}"
     )
     asyncio.create_task(auto_delete_msg(resp, delay=60))
-    asyncio.create_task(auto_delete_msg(update.message, delay=60))
-    # Notify the user
     try:
         if flag:
             await ctx.bot.send_message(
