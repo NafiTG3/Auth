@@ -3457,46 +3457,59 @@ def _resolve_user(raw: str):
 
 def _fmt_user_info(u) -> str:
     """Build the admin /user info block. Returns plain text (not Markdown)."""
-    vault_id    = u["vault_id"]
-    tid         = u["telegram_id"]
-    tg_name     = u["tg_name"] or "Unknown"
-    tg_username = u["tg_username"] if u["tg_username"] else ""
-    username_str = f"@{tg_username}" if tg_username else f"(no username, ID: {tid})"
-    created_at  = fmt_bd_time(u["created_at"]) if u["created_at"] else "N/A"
-    last_seen   = fmt_bd_time(u["last_seen"]) if u.get("last_seen") else "Never"
-    status      = "Disabled" if u.get("account_disabled") else "Active"
-    tz          = u.get("timezone") or "UTC"
-    with get_db() as c:
-        totp_cnt = c.execute(
-            "SELECT COUNT(*) AS n FROM totp_accounts WHERE vault_id=?", (vault_id,)
-        ).fetchone()["n"]
-        br = c.execute(
-            "SELECT frequency, enabled FROM backup_reminders WHERE telegram_id=?", (tid,)
-        ).fetchone()
-        la = c.execute(
-            "SELECT attempts FROM login_attempts WHERE vault_id=?", (vault_id,)
-        ).fetchone()
-        ra = c.execute(
-            "SELECT attempts FROM reset_attempts WHERE vault_id=?", (vault_id,)
-        ).fetchone()
-    reminder_status = "Off"
-    if br and br["enabled"]:
-        reminder_status = f"On — {br['frequency']}"
-    failed_login = la["attempts"] if la else 0
-    failed_reset = ra["attempts"] if ra else 0
-    return (
-        f"Vault ID       : {vault_id}\n"
-        f"Telegram       : {username_str}\n"
-        f"Telegram ID    : {tid}\n"
-        f"Name           : {tg_name}\n\n"
-        f"Total TOTP     : {totp_cnt} Account(s)\n\n"
-        f"Created        : {created_at}\n\n"
-        f"Last Online    : {last_seen}\n\n"
-        f"Account Status : {status}\n\n"
-        f"Reminder       : {reminder_status}\n\n"
-        f"Failed Logins  : {failed_login}\n\n"
-        f"Failed Resets  : {failed_reset}"
-    )
+    try:
+        vault_id    = u["vault_id"]
+        tid         = u["telegram_id"]
+        tg_name     = u["tg_name"] or "Unknown"
+        # tg_username may not exist for older accounts (KeyError safe)
+        try:
+            tg_username = u["tg_username"] or ""
+        except (KeyError, IndexError):
+            tg_username = ""
+        username_str = f"@{tg_username}" if tg_username else f"(no username, ID: {tid})"
+        created_at  = fmt_bd_time(u["created_at"]) if u["created_at"] else "N/A"
+        try:
+            last_seen = fmt_bd_time(u["last_seen"]) if u["last_seen"] else "Never"
+        except (KeyError, TypeError):
+            last_seen = "Never"
+        try:
+            status = "Disabled" if u["account_disabled"] else "Active"
+        except (KeyError, TypeError):
+            status = "Active"
+        with get_db() as c:
+            totp_cnt = c.execute(
+                "SELECT COUNT(*) AS n FROM totp_accounts WHERE vault_id=?", (vault_id,)
+            ).fetchone()["n"]
+            br = c.execute(
+                "SELECT frequency, enabled FROM backup_reminders WHERE telegram_id=?", (tid,)
+            ).fetchone()
+            la = c.execute(
+                "SELECT attempts FROM login_attempts WHERE vault_id=?", (vault_id,)
+            ).fetchone()
+            ra = c.execute(
+                "SELECT attempts FROM reset_attempts WHERE vault_id=?", (vault_id,)
+            ).fetchone()
+        reminder_status = "Off"
+        if br and br["enabled"]:
+            reminder_status = f"On - {br['frequency']}"
+        failed_login = la["attempts"] if la else 0
+        failed_reset = ra["attempts"] if ra else 0
+        return (
+            f"Vault ID       : {vault_id}\n"
+            f"Telegram       : {username_str}\n"
+            f"Telegram ID    : {tid}\n"
+            f"Name           : {tg_name}\n\n"
+            f"Total TOTP     : {totp_cnt} Account(s)\n\n"
+            f"Created        : {created_at}\n\n"
+            f"Last Online    : {last_seen}\n\n"
+            f"Account Status : {status}\n\n"
+            f"Reminder       : {reminder_status}\n\n"
+            f"Failed Logins  : {failed_login}\n\n"
+            f"Failed Resets  : {failed_reset}"
+        )
+    except Exception as e:
+        logger.error(f"_fmt_user_info error: {e}")
+        return f"[Error building user info: {e}]"
 
 # ── ADMIN COMMANDS ──────────────────────────────────────────
 async def admin_maintenance(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -3582,14 +3595,19 @@ async def admin_user_info(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         asyncio.create_task(auto_delete_msg(msg, delay=60))
         return
-    u = _resolve_user(arg_part)
-    if not u:
-        msg = await update.message.reply_text(f"❌ User not found: {arg_part}")
+    try:
+        u = _resolve_user(arg_part)
+        if not u:
+            msg = await update.message.reply_text(f"❌ User not found: {arg_part}")
+            asyncio.create_task(auto_delete_msg(msg, delay=60))
+            return
+        info = _fmt_user_info(u)
+        msg  = await update.message.reply_text(f"👤 User Info\n\n{info}")
         asyncio.create_task(auto_delete_msg(msg, delay=60))
-        return
-    info = _fmt_user_info(u)
-    msg  = await update.message.reply_text(f"👤 User Info\n\n{info}")
-    asyncio.create_task(auto_delete_msg(msg, delay=60))
+    except Exception as e:
+        logger.error(f"admin_user_info error for '{arg_part}': {e}")
+        msg = await update.message.reply_text(f"❌ Error fetching user info: {e}")
+        asyncio.create_task(auto_delete_msg(msg, delay=60))
 
 async def admin_account_disable(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """/account disable|enable <vault_id|tid|@username>"""
