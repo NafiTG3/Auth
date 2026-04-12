@@ -109,10 +109,31 @@ def _oab_load_password(telegram_id: int, vault_id: str) -> str | None:
         return None
 
 # ── DB ─────────────────────────────────────────────────────
-def get_db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+class _DB:
+    """SQLite connection context manager that commits AND closes on exit."""
+    def __init__(self):
+        self._conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+        self._conn.row_factory = sqlite3.Row
+    def __enter__(self):
+        return self._conn
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if exc_type is None:
+            self._conn.commit()
+        else:
+            try:
+                self._conn.rollback()
+            except Exception:
+                pass
+        self._conn.close()
+        return False
+    # Allow using the connection directly (non-context-manager usage)
+    def execute(self, *a, **kw):
+        return self._conn.execute(*a, **kw)
+    def close(self):
+        self._conn.close()
+
+def get_db() -> "_DB":
+    return _DB()
 
 def init_db():
     with get_db() as c:
@@ -456,8 +477,10 @@ def verify_secure_key_by_totp(vault_id: str, candidate_hex: str) -> bool:
     if row and row["sk_verifier"]:
         expected = hmac.new(SERVER_KEY, candidate.encode(), hashlib.sha256).hexdigest()
         return hmac.compare_digest(row["sk_verifier"], expected)
-    # No verifier stored (old account) and no TOTP entries: accept if format valid
-    return True
+    # No verifier stored (old account) and no TOTP entries.
+    # Reject: cannot verify the key, so we cannot safely accept any input.
+    # The user should skip secure key and lose TOTP data (there are none anyway).
+    return False
 
 # ── TOTP ───────────────────────────────────────────────────
 def clean_secret(s: str) -> str:
@@ -627,14 +650,36 @@ def fmt_time(ts, tz="UTC") -> str:
     return dt.strftime(f"%d %b %Y, %I:%M %p ({tz})")
 
 def parse_tz(raw: str):
+    """Parse user timezone input like +6, -5:30, +5:45 into a valid IANA tz string.
+    Uses fixed-offset IANA names: Etc/GMT signs are INVERTED (POSIX convention),
+    so we use a direct UTC±HH:MM approach via zoneinfo fixed offsets instead."""
     m = re.match(r"^([+-])(\d{1,2})(?::(\d{2}))?$", raw.strip())
     if not m:
         return None
     sign, h, mn = m.group(1), int(m.group(2)), int(m.group(3) or 0)
     if h > 14 or mn not in (0, 30, 45):
         return None
-    es = "-" if sign == "+" else "+"
-    return f"Etc/GMT{es}{h}" if mn == 0 else f"UTC{sign}{h:02d}:{mn:02d}"
+    # Use Etc/GMT only for whole-hour offsets (Etc/GMT inverts sign: +6 -> Etc/GMT-6 = UTC+6)
+    # For half-hour and quarter-hour offsets, use well-known IANA zone names where possible.
+    tz_map = {
+        (+5, 30): "Asia/Kolkata",
+        (+5, 45): "Asia/Kathmandu",
+        (+6, 0):  "Asia/Dhaka",
+        (+6, 30): "Asia/Rangoon",
+        (+9, 30): "Australia/Darwin",
+        (+10, 30): "Australia/Adelaide",
+        (+12, 45): "Pacific/Chatham",
+    }
+    offset_h = h if sign == "+" else -h
+    named = tz_map.get((offset_h, mn))
+    if named:
+        return named
+    if mn == 0:
+        # Etc/GMT uses INVERTED sign: Etc/GMT-6 = UTC+6
+        etc_sign = "-" if sign == "+" else "+"
+        return f"Etc/GMT{etc_sign}{h}"
+    # For other fractional offsets, use a fixed-offset string zoneinfo can parse
+    return f"UTC{sign}{h:02d}:{mn:02d}"
 
 # ── Keyboards ───────────────────────────────────────────────
 def kb_auth():
@@ -2036,6 +2081,8 @@ async def add_totp_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     return ADD_WAITING
 
 async def _do_save_totp(update, vault, data, pw):
+    acc_type    = "totp"   # TOTP-only
+    hotp_ctr    = 0        # TOTP-only
     note        = (data.get("note", "") or "")[:NOTE_MAX_LEN]
     ct, salt, iv = encrypt(data["secret"], pw, vault)
     sk = load_user_secure_key(vault, pw)
@@ -2057,7 +2104,7 @@ async def _do_save_totp(update, vault, data, pw):
     except Exception:
         code, remain = "------", 30
     issuer_line = f"\n_{em(data['issuer'])}_" if data.get("issuer") else ""
-    code_fmt    = f"{code[:3]} {code[3:]}"
+    code_fmt    = code
     time_info   = f"{bar(remain)} {remain}s"
     await update.message.reply_text(
         f"✅ *{em(data['name'])}* added\\!{issuer_line}\n\n"
@@ -2267,11 +2314,11 @@ async def _render_list_page(q_or_msg, vault: str, pw: str, page: int, is_edit: b
             code, remain, next_code = generate_code(secret)
 
             # Format TOTP code: "123 456"
-            code_fmt  = f"{code[:3]} {code[3:]}"
+            code_fmt  = code
             time_line = f"{bar(remain)} {remain}s"
 
             # Next code display
-            next_line = f"Next code: `{next_code[:3]} {next_code[3:]}`" if next_code else ""
+            next_line = f"Next code: `{next_code}`" if next_code else ""
 
             note_line = f"Note: {em(note)}" if note else ""
 
@@ -2280,7 +2327,7 @@ async def _render_list_page(q_or_msg, vault: str, pw: str, page: int, is_edit: b
             if row["issuer"]:
                 name_line += f" \\| _{em(row['issuer'])}_"
 
-            block = [name_line, f"Current Code: `{code_fmt}` {time_line}"]
+            block = [name_line, f"Current Code: `{code}` {time_line}"]
             if next_line:
                 block.append(next_line)
             if note_line:
@@ -2505,7 +2552,7 @@ async def handle_share_view(update: Update, token: str):
             code, rm = totp_now(secret)
             lines.append(
                 f"*{em(name)}*\n"
-                f"`{code[:3]} {code[3:]}` {bar(rm)} {rm}s"
+                f"`{code}` {bar(rm)} {rm}s"
             )
         except Exception as e:
             logger.error(f"Share view decrypt error idx={i}: {e}")
@@ -3017,13 +3064,16 @@ async def _do_import(update_or_cb, ctx, vault: str, accounts: list, mode: str = 
         ).fetchall()
         # For duplicate detection, decrypt existing secrets and hash them
         existing_by_name   = {r["name"]: r["id"] for r in existing_rows}  # name -> id (for replace)
-        existing_secrets   = set()                                           # sha256(secret) set
+        existing_secrets   = set()    # sha256(secret) set
         for r in existing_rows:
             try:
                 plain = decrypt(r["secret_enc"], r["salt"], r["iv"], pw, vault)
                 existing_secrets.add(hashlib.sha256(plain.encode()).hexdigest())
-            except Exception:
-                pass
+            except Exception as e:
+                # Decrypt failed for existing entry - log and use name-only fallback
+                logger.warning(f"Import duplicate check: decrypt failed for '{r['name']}': {e}")
+                # Mark name as existing so it won't be silently re-imported
+                existing_by_name.setdefault(r["name"], r["id"])
 
         sk = load_user_secure_key(vault, pw)
         for acc in accounts:
@@ -3235,13 +3285,13 @@ async def global_auto_detect(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     secret   = decrypt(row["secret_enc"], row["salt"], row["iv"], pw, vault)
                     note     = (row["note"] or "").strip()
                     code, remain, next_code = generate_code(secret)
-                    code_fmt  = f"{code[:3]} {code[3:]}"
+                    code_fmt  = code
                     time_line = f"{bar(remain)} {remain}s"
-                    nf = f"{next_code[:3]} {next_code[3:]}" if next_code else ""
+                    nf = next_code if next_code else ""
                     name_line = f"*{i}\\. {em(row['name'])}*"
                     if row["issuer"]:
                         name_line += f" \\| _{em(row['issuer'])}_"
-                    block = [name_line, f"Current Code: `{code_fmt}` {time_line}"]
+                    block = [name_line, f"Current Code: `{code}` {time_line}"]
                     if nf:
                         block.append(f"Next code: `{nf}`")
                     if note:
@@ -3288,7 +3338,7 @@ async def global_auto_detect(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 code, remain = "------", 30
             await update.message.reply_text(
                 f"✅ *{em(name)}* added\\!\n\n"
-                f"🔢 `{code[:3]} {code[3:]}`\n"
+                f"🔢 `{code}`\n"
                 f"⏱ {bar(remain)} {remain}s\n\n"
                 f"🔒 _Encrypted with AES\\-256\\-GCM \\+ Secure Key_",
                 parse_mode="MarkdownV2",
@@ -3383,14 +3433,14 @@ async def search_totp_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             secret = decrypt(row["secret_enc"], row["salt"], row["iv"], pw, vault)
             note     = (row["note"] or "").strip()
             code, remain, next_code = generate_code(secret)
-            code_fmt  = f"{code[:3]} {code[3:]}"
+            code_fmt  = code
             time_line = f"{bar(remain)} {remain}s"
-            next_line = f"Next code: `{next_code[:3]} {next_code[3:]}`" if next_code else ""
+            next_line = f"Next code: `{next_code}`" if next_code else ""
             note_line = f"Note: {em(note)}" if note else ""
             name_line = f"*{i}\\. {em(row['name'])}*"
             if row["issuer"]:
                 name_line += f" \\| _{em(row['issuer'])}_"
-            block = [name_line, f"Current Code: `{code_fmt}` {time_line}"]
+            block = [name_line, f"Current Code: `{code}` {time_line}"]
             if next_line:
                 block.append(next_line)
             if note_line:
@@ -4131,13 +4181,19 @@ async def send_auto_backups(app):
         ).fetchall()
 
     for row in rows:
-        tid  = row["telegram_id"]
-        freq = row["frequency"]
+        owner_tid = row["telegram_id"]
+        freq      = row["frequency"]
         with get_db() as c:
-            u = c.execute("SELECT vault_id FROM users WHERE telegram_id=?", (tid,)).fetchone()
+            u = c.execute("SELECT vault_id FROM users WHERE telegram_id=?", (owner_tid,)).fetchone()
         if not u:
             continue
         vault_id = u["vault_id"]
+        # Send to the currently active session (logged-in device), fallback to vault owner
+        with get_db() as c:
+            sess = c.execute(
+                "SELECT telegram_id FROM sessions WHERE vault_id=?", (vault_id,)
+            ).fetchone()
+        tid = sess["telegram_id"] if sess else owner_tid
 
         if is_weekly_window and freq == "weekly":
             if now_ts - (row["last_weekly"] or 0) < 6 * 24 * 3600:
