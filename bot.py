@@ -38,7 +38,8 @@ logger = logging.getLogger(__name__)
     IMPORT_OVERRIDE_WAIT, # new: waiting for merge/replace choice during import
     SEARCH_TOTP_INPUT,    # new: typing search query for TOTP search
     OFFLINE_AUTO_BACKUP,  # new: offline auto-backup settings menu
-) = range(37)
+    SIGNUP_TERMS,         # new: terms & privacy agreement screen before signup
+) = range(38)
 
 DB_PATH             = os.environ.get("DB_PATH", "auth.db")
 SERVER_KEY          = os.environ.get("ENCRYPTION_KEY", "").encode()
@@ -1128,6 +1129,7 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 # ── SIGN UP ─────────────────────────────────────────────────
 async def signup_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Show Terms & Privacy screen before proceeding to account creation."""
     q   = update.callback_query
     await q.answer()
     if is_maintenance():
@@ -1150,13 +1152,38 @@ async def signup_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # Weekly signup limit: max 2 signups per Telegram account per week
     if not check_weekly_signup_limit(uid):
         await q.edit_message_text(
-            "⚠️ *Weekly sign-up limit reached\\.* You can create a maximum of "
+            "⚠️ *Weekly sign\\-up limit reached\\.* You can create a maximum of "
             f"*{MAX_WEEKLY_SIGNUPS}* accounts per week from one Telegram account\\.\n\n"
             "Please try again next week\\.",
             parse_mode="MarkdownV2",
             reply_markup=kb_auth(),
         )
         return AUTH_MENU
+    # Show Terms & Privacy screen
+    await q.edit_message_text(
+        "📋 *Terms \\& Privacy*\n\n"
+        "By creating an account you agree to our terms of service and privacy policy\\.\n\n"
+        "• Your TOTP secrets are encrypted with *AES\\-256\\-GCM* using your password\\.\n"
+        "• We never store your plaintext secrets or passwords\\.\n"
+        "• Your data is linked to your Telegram account\\.\n"
+        "• You are responsible for keeping your Vault ID and Secure Key safe\\.\n"
+        "• We reserve the right to disable accounts that violate our terms\\.\n\n"
+        "[📖 Read Full Privacy Policy](https://antonysrm\\.com/totp/privacy)",
+        parse_mode="MarkdownV2",
+        reply_markup=InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("✅ I Agree",  callback_data="signup_agree"),
+                InlineKeyboardButton("❌ Decline",  callback_data="signup_decline"),
+            ],
+        ]),
+    )
+    return SIGNUP_TERMS
+
+async def signup_terms_agreed(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """User agreed to terms — proceed to vault ID + password setup."""
+    q   = update.callback_query
+    await q.answer()
+    uid = update.effective_user.id
     vid = gen_vault_id(uid)
     ctx.user_data["signup_vid"] = vid
     await q.edit_message_text(
@@ -1169,16 +1196,17 @@ async def signup_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         reply_markup=kb_cancel(),
     )
     return SIGNUP_PASSWORD
+
+async def signup_terms_declined(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """User declined terms — go back to auth menu."""
+    q = update.callback_query
+    await q.answer()
     await q.edit_message_text(
-        "🆕 *Create Your Account*\n\n"
-        "Your *BV Vault ID* \\(auto\\-generated\\):\n\n"
-        f"`{em(vid)}`\n\n"
-        "📌 *Save this ID\\!* You need it to login from other devices\\.\n\n"
-        "Set a *password* \\(minimum 6 characters\\):",
+        "❌ *Sign up cancelled\\.* You must agree to the terms to create an account\\.",
         parse_mode="MarkdownV2",
-        reply_markup=kb_cancel(),
+        reply_markup=kb_auth(),
     )
-    return SIGNUP_PASSWORD
+    return AUTH_MENU
 
 async def signup_pw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     pw = update.message.text.strip()
@@ -4697,8 +4725,12 @@ def main():
         entry_points=[CommandHandler("start", start, filters=private)],
         states={
             AUTH_MENU: [
-                CallbackQueryHandler(signup_start, pattern="^auth_signup$"),
-                CallbackQueryHandler(login_start,  pattern="^auth_login$"),
+                CallbackQueryHandler(signup_start,  pattern="^auth_signup$"),
+                CallbackQueryHandler(login_start,   pattern="^auth_login$"),
+            ],
+            SIGNUP_TERMS: [
+                CallbackQueryHandler(signup_terms_agreed,  pattern="^signup_agree$"),
+                CallbackQueryHandler(signup_terms_declined, pattern="^signup_decline$"),
             ],
             SIGNUP_PASSWORD: [
                 MessageHandler(private & filters.TEXT & ~filters.COMMAND, signup_pw),
