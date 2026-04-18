@@ -265,7 +265,7 @@ Your vault is linked to your Telegram account. Deleting your account through the
 
 ## Self-hosting
 
-BV Authenticator is fully self-hostable. The codebase is a single Python file. You bring your own Telegram bot token, set an encryption key, and deploy. Railway deployment is supported out of the box with the included Dockerfile.
+BlockVeil Authenticator is fully self-hostable. The codebase is a single Python file. You bring your own Telegram bot token, set an encryption key, and deploy. Railway deployment is supported out of the box with the included Dockerfile.
 
 The bot requires no external services beyond Telegram itself. Everything runs locally against a SQLite database.
 
