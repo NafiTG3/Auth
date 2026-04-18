@@ -35,39 +35,39 @@ logger = logging.getLogger(__name__)
     TZ_INPUT,
     SHOW_SECRET_PW,
     SECURE_KEY_VIEW_PW,
-    NOTE_INPUT,
-    IMPORT_OVERRIDE_WAIT,
-    SEARCH_TOTP_INPUT,
-    OFFLINE_AUTO_BACKUP,
-    SIGNUP_TERMS,
+    NOTE_INPUT,           # new: typing note for a TOTP account
+    IMPORT_OVERRIDE_WAIT, # new: waiting for merge/replace choice during import
+    SEARCH_TOTP_INPUT,    # new: typing search query for TOTP search
+    OFFLINE_AUTO_BACKUP,  # new: offline auto-backup settings menu
+    SIGNUP_TERMS,         # new: terms & privacy agreement screen before signup
 ) = range(38)
 
 DB_PATH             = os.environ.get("DB_PATH", "auth.db")
 SERVER_KEY          = os.environ.get("ENCRYPTION_KEY", "").encode()
-BOT_USERNAME        = os.environ.get("BOT_USERNAME", "TotpNafiBot")
-ADMIN_GROUP_ID      = int(os.environ.get("GROUP_ID", "0"))
+BOT_USERNAME        = os.environ.get("BOT_USERNAME", "TotpNafiBot")  # set without @
+ADMIN_GROUP_ID      = int(os.environ.get("GROUP_ID", "0"))           # admin group
 PBKDF2_ITER         = 1_000_000
 OTP_TTL             = 60
 MAX_RESET_ATTEMPTS  = 3
 FREEZE_HOURS        = 18
 ALERT_VISIBLE_HOURS = 72
-SHARE_LINK_TTL      = 600
-MAX_LOGIN_ATTEMPTS  = 5
-LOGIN_FREEZE_HOURS  = 18
-TOTP_PER_PAGE       = 10
-NOTE_MAX_LEN        = 10
+SHARE_LINK_TTL      = 600   # 10 minutes
+MAX_LOGIN_ATTEMPTS  = 5     # max failed logins before freeze
+LOGIN_FREEZE_HOURS  = 18    # freeze duration
+TOTP_PER_PAGE       = 10    # TOTP entries per page in list view
+NOTE_MAX_LEN        = 10    # max note characters
 BACKUP_REMINDER_WEEKLY  = "weekly"
 BACKUP_REMINDER_MONTHLY = "monthly"
-BD_TZ = "Asia/Dhaka"
+BD_TZ = "Asia/Dhaka"       # Bangladesh timezone for admin panel
 
 # ── Rate limit constants ────────────────────────────────────
-TOTP_NAME_MAX_LEN      = 20
-MAX_DAILY_LOGINS       = 7
-MAX_WEEKLY_SIGNUPS     = 2
-MAX_LIFETIME_VAULTS    = 5
-MAX_TOTP_PER_MINUTE    = 20
+TOTP_NAME_MAX_LEN      = 20    # max TOTP account name length
+MAX_DAILY_LOGINS       = 7     # max successful logins per day per telegram_id
+MAX_WEEKLY_SIGNUPS     = 2     # max signups per week per telegram_id
+MAX_LIFETIME_VAULTS    = 5     # max distinct vaults a telegram_id can ever login to
+MAX_TOTP_PER_MINUTE    = 20    # max TOTP accounts added in 1 minute per vault
 
-# ── Bot-wide toggleable settings ───────────────────────────
+# ── Bot-wide toggleable settings (stored in memory + DB bot_settings table) ──
 _bot_settings: dict = {
     "maintenance": False,
     "signup_enabled": True,
@@ -75,18 +75,22 @@ _bot_settings: dict = {
 }
 
 # ── In-memory session password cache for auto-backup ─────────
-_session_pw_cache: dict = {}
+# Populated on login/signup, cleared on logout. Never persisted to DB.
+_session_pw_cache: dict = {}   # vault_id -> plaintext password
 
 def _oab_pw_enc_key(vault_id: str) -> bytes:
+    """Derive a 32-byte AES key for encrypting the backup password in DB.
+    Uses SERVER_KEY + vault_id so it is unique per vault and tied to the server."""
     salt = hashlib.sha256(SERVER_KEY + b":oabpw:" + vault_id.encode()).digest()[:16]
     return PBKDF2HMAC(
         algorithm=hashes.SHA256(), length=32, salt=salt, iterations=100_000
     ).derive(SERVER_KEY + vault_id.encode())
 
 def _oab_store_password(telegram_id: int, vault_id: str, password: str):
+    """Encrypt and persist the user's password for offline auto-backup."""
     key  = _oab_pw_enc_key(vault_id)
     iv   = os.urandom(12)
-    salt = os.urandom(16)
+    salt = os.urandom(16)   # stored but not used for key (kept for schema compat)
     ct   = AESGCM(key).encrypt(iv, password.encode(), None)
     with get_db() as c:
         c.execute(
@@ -98,6 +102,7 @@ def _oab_store_password(telegram_id: int, vault_id: str, password: str):
         c.commit()
 
 def _oab_load_password(telegram_id: int, vault_id: str) -> str | None:
+    """Load and decrypt the stored backup password. Returns None if not available."""
     with get_db() as c:
         row = c.execute(
             "SELECT pw_enc, pw_iv FROM auto_backup_settings WHERE telegram_id=?",
@@ -115,13 +120,16 @@ def _oab_load_password(telegram_id: int, vault_id: str) -> str | None:
 # ── Rate Limit Helpers ──────────────────────────────────────
 
 def _today_bucket() -> str:
+    """Return current UTC date string YYYY-MM-DD for daily buckets."""
     return datetime.datetime.utcnow().strftime("%Y-%m-%d")
 
 def _week_bucket() -> str:
+    """Return current ISO week string YYYY-WNN for weekly buckets."""
     d = datetime.datetime.utcnow()
     return d.strftime("%Y-W%W")
 
 def check_daily_login_limit(telegram_id: int) -> bool:
+    """Returns True if the user has NOT exceeded MAX_DAILY_LOGINS today."""
     today = _today_bucket()
     with get_db() as c:
         row = c.execute(
@@ -129,10 +137,11 @@ def check_daily_login_limit(telegram_id: int) -> bool:
             (telegram_id,)
         ).fetchone()
     if not row or row["day_bucket"] != today:
-        return True
+        return True   # fresh day or no record
     return row["count"] < MAX_DAILY_LOGINS
 
 def record_daily_login(telegram_id: int):
+    """Increment today's login counter for a telegram_id."""
     today = _today_bucket()
     with get_db() as c:
         row = c.execute(
@@ -153,6 +162,7 @@ def record_daily_login(telegram_id: int):
         c.commit()
 
 def check_weekly_signup_limit(telegram_id: int) -> bool:
+    """Returns True if the user has NOT exceeded MAX_WEEKLY_SIGNUPS this week."""
     week = _week_bucket()
     with get_db() as c:
         row = c.execute(
@@ -164,6 +174,7 @@ def check_weekly_signup_limit(telegram_id: int) -> bool:
     return row["count"] < MAX_WEEKLY_SIGNUPS
 
 def record_weekly_signup(telegram_id: int):
+    """Increment this week's signup counter for a telegram_id."""
     week = _week_bucket()
     with get_db() as c:
         row = c.execute(
@@ -184,13 +195,17 @@ def record_weekly_signup(telegram_id: int):
         c.commit()
 
 def check_vault_login_limit(telegram_id: int, vault_id: str) -> bool:
+    """Returns True if the telegram_id can login to this vault.
+    Allowed if vault already in history OR total distinct vaults < MAX_LIFETIME_VAULTS."""
     with get_db() as c:
+        # Check if this vault is already known for this telegram_id
         known = c.execute(
             "SELECT 1 FROM vault_login_history WHERE telegram_id=? AND vault_id=?",
             (telegram_id, vault_id)
         ).fetchone()
         if known:
             return True
+        # Count distinct vaults ever logged in from this telegram_id
         cnt = c.execute(
             "SELECT COUNT(*) AS n FROM vault_login_history WHERE telegram_id=?",
             (telegram_id,)
@@ -198,6 +213,7 @@ def check_vault_login_limit(telegram_id: int, vault_id: str) -> bool:
     return cnt < MAX_LIFETIME_VAULTS
 
 def record_vault_login(telegram_id: int, vault_id: str):
+    """Record this (telegram_id, vault_id) pair in history."""
     with get_db() as c:
         c.execute(
             "INSERT OR IGNORE INTO vault_login_history (telegram_id, vault_id) VALUES (?,?)",
@@ -206,6 +222,7 @@ def record_vault_login(telegram_id: int, vault_id: str):
         c.commit()
 
 def check_totp_add_rate(vault_id: str) -> bool:
+    """Returns True if vault has NOT exceeded MAX_TOTP_PER_MINUTE in the last 60 seconds."""
     now = int(time.time())
     with get_db() as c:
         row = c.execute(
@@ -213,10 +230,11 @@ def check_totp_add_rate(vault_id: str) -> bool:
             (vault_id,)
         ).fetchone()
     if not row or now - row["window_start"] >= 60:
-        return True
+        return True   # window expired or no record
     return row["count"] < MAX_TOTP_PER_MINUTE
 
 def record_totp_add(vault_id: str):
+    """Increment the per-minute TOTP add counter for a vault."""
     now = int(time.time())
     with get_db() as c:
         row = c.execute(
@@ -224,6 +242,7 @@ def record_totp_add(vault_id: str):
             (vault_id,)
         ).fetchone()
         if not row or now - row["window_start"] >= 60:
+            # Start fresh window
             c.execute(
                 "INSERT INTO totp_add_rate (vault_id, count, window_start) VALUES (?,?,?) "
                 "ON CONFLICT(vault_id) DO UPDATE SET count=1, window_start=excluded.window_start",
@@ -237,6 +256,7 @@ def record_totp_add(vault_id: str):
         c.commit()
 
 def _auto_suffix_name(vault_id: str, requested_name: str) -> str:
+    """If 'Google' already exists, return 'Google 1', 'Google 2', etc."""
     base = requested_name.strip()[:TOTP_NAME_MAX_LEN]
     with get_db() as c:
         existing = {
@@ -250,10 +270,11 @@ def _auto_suffix_name(vault_id: str, requested_name: str) -> str:
         candidate = f"{base[:TOTP_NAME_MAX_LEN - len(str(i)) - 1]} {i}"
         if candidate not in existing:
             return candidate
-    return base
+    return base  # fallback (should never happen)
 
 # ── DB ─────────────────────────────────────────────────────
 class _DB:
+    """SQLite connection context manager that commits AND closes on exit."""
     def __init__(self):
         self._conn = sqlite3.connect(DB_PATH, timeout=10.0, check_same_thread=True)
         self._conn.row_factory = sqlite3.Row
@@ -345,18 +366,26 @@ def init_db():
             names       TEXT    NOT NULL,
             expires_at  INTEGER NOT NULL,
             created_at  INTEGER DEFAULT (strftime('%s','now')))""")
+
+        # New: track failed login attempts per vault to prevent brute-force
         c.execute("""CREATE TABLE IF NOT EXISTS login_attempts (
             vault_id     TEXT    PRIMARY KEY,
             attempts     INTEGER DEFAULT 0,
             frozen_until INTEGER DEFAULT 0)""")
+
+        # New: backup reminder preferences per user
         c.execute("""CREATE TABLE IF NOT EXISTS backup_reminders (
             telegram_id INTEGER PRIMARY KEY,
             frequency   TEXT    DEFAULT 'weekly',
             last_sent   INTEGER DEFAULT 0,
             enabled     INTEGER DEFAULT 1)""")
+
+        # New: bot-wide settings (maintenance mode, signup/login toggles)
         c.execute("""CREATE TABLE IF NOT EXISTS bot_settings (
             key   TEXT PRIMARY KEY,
             value TEXT NOT NULL)""")
+
+        # New: offline auto-backup preferences per user
         c.execute("""CREATE TABLE IF NOT EXISTS auto_backup_settings (
             telegram_id  INTEGER PRIMARY KEY,
             enabled      INTEGER DEFAULT 0,
@@ -366,18 +395,26 @@ def init_db():
             pw_enc       BLOB,
             pw_salt      BLOB,
             pw_iv        BLOB)""")
+
+        # New: daily login counter per telegram_id
         c.execute("""CREATE TABLE IF NOT EXISTS daily_login_counts (
             telegram_id  INTEGER PRIMARY KEY,
             count        INTEGER DEFAULT 0,
             day_bucket   TEXT    DEFAULT '')""")
+
+        # New: weekly signup counter per telegram_id
         c.execute("""CREATE TABLE IF NOT EXISTS weekly_signup_counts (
             telegram_id  INTEGER PRIMARY KEY,
             count        INTEGER DEFAULT 0,
             week_bucket  TEXT    DEFAULT '')""")
+
+        # New: lifetime distinct vault logins per telegram_id
         c.execute("""CREATE TABLE IF NOT EXISTS vault_login_history (
             telegram_id  INTEGER NOT NULL,
             vault_id     TEXT    NOT NULL,
             PRIMARY KEY  (telegram_id, vault_id))""")
+
+        # New: TOTP add rate limiting per vault (1-minute window)
         c.execute("""CREATE TABLE IF NOT EXISTS totp_add_rate (
             vault_id     TEXT    PRIMARY KEY,
             count        INTEGER DEFAULT 0,
@@ -389,6 +426,8 @@ def init_db():
                 c.execute(f"ALTER TABLE users ADD COLUMN {col} TEXT DEFAULT {defval}")
             except Exception:
                 pass
+
+        # Argon2id + Master Key migration columns
         for col, coltype, defval in [
             ("kdf_type", "TEXT",    "'pbkdf2'"),
             ("mk_enc",   "BLOB",    "NULL"),
@@ -402,25 +441,33 @@ def init_db():
                 c.execute(stmt)
             except Exception:
                 pass
+
+        # Migrate auto_backup_settings: add encrypted password columns
         for col, coltype in [("pw_enc", "BLOB"), ("pw_salt", "BLOB"), ("pw_iv", "BLOB")]:
             try:
                 c.execute(f"ALTER TABLE auto_backup_settings ADD COLUMN {col} {coltype}")
             except Exception:
                 pass
+
+        # Migrate users: add sk_verifier for secure key verification without password
         try:
             c.execute("ALTER TABLE users ADD COLUMN sk_verifier TEXT DEFAULT ''")
         except Exception:
             pass
+
         for col in [("sk_enc", "BLOB"), ("sk_salt", "BLOB"), ("sk_iv", "BLOB")]:
             try:
                 c.execute(f"ALTER TABLE users ADD COLUMN {col[0]} {col[1]}")
             except Exception:
                 pass
+
         for col in [("sk_enc", "BLOB"), ("sk_salt", "BLOB"), ("sk_iv", "BLOB")]:
             try:
                 c.execute(f"ALTER TABLE totp_accounts ADD COLUMN {col[0]} {col[1]}")
             except Exception:
                 pass
+
+        # Migrate new columns to totp_accounts
         for col, coltype, default in [
             ("note",         "TEXT",    "''"),
             ("account_type", "TEXT",    "'totp'"),
@@ -430,6 +477,8 @@ def init_db():
                 c.execute(f"ALTER TABLE totp_accounts ADD COLUMN {col} {coltype} DEFAULT {default}")
             except Exception:
                 pass
+
+        # Migrate users table: account_disabled, last_seen
         for col, coltype, default in [
             ("account_disabled", "INTEGER", "0"),
             ("last_seen",        "INTEGER", "0"),
@@ -440,10 +489,14 @@ def init_db():
                 pass
 
         c.commit()
+
+        # Load bot_settings into memory
         _load_bot_settings(c)
 
-# ── Bot Settings ────────────────────────────────────────────
+
+# ── Bot Settings (maintenance, signup/login toggles) ───────
 def _load_bot_settings(conn=None):
+    """Load persisted settings from DB into in-memory dict."""
     try:
         db = conn if conn else get_db()
         rows = db.execute("SELECT key, value FROM bot_settings").fetchall()
@@ -491,6 +544,7 @@ def update_last_seen(telegram_id: int):
         c.commit()
 
 def fmt_bd_time(ts: int) -> str:
+    """Format timestamp in Bangladesh time (UTC+6)."""
     try:
         import zoneinfo
         dt = datetime.datetime.fromtimestamp(ts, tz=zoneinfo.ZoneInfo(BD_TZ))
@@ -509,12 +563,14 @@ def gen_vault_id(telegram_id: int) -> str:
         num //= len(alphabet)
     return "".join(chars)
 
+# ── Argon2id parameters (OWASP recommended) ────────────────
 ARGON2_TIME_COST   = 3
-ARGON2_MEMORY_COST = 65536
+ARGON2_MEMORY_COST = 65536   # 64 MB
 ARGON2_PARALLELISM = 1
 ARGON2_HASH_LEN    = 32
 
 def _argon2id_hash(password: str, salt: bytes) -> bytes:
+    """Derive a 32-byte key/hash using Argon2id."""
     return hash_secret_raw(
         secret=password.encode(),
         salt=salt,
@@ -526,23 +582,30 @@ def _argon2id_hash(password: str, salt: bytes) -> bytes:
     )
 
 def hash_pw(password: str, salt: bytes, kdf: str = "argon2id") -> bytes:
+    """Hash password for authentication check.
+    kdf='argon2id' for new users, 'pbkdf2' for legacy compatibility."""
     if kdf == "argon2id":
         return _argon2id_hash(password, salt)
     return PBKDF2HMAC(algorithm=hashes.SHA256(), length=32, salt=salt, iterations=PBKDF2_ITER).derive(password.encode())
 
 def _pw_wrap_key(password: str, salt: bytes) -> bytes:
+    """Derive a 32-byte AES key from password to wrap/unwrap the master key.
+    Always uses Argon2id — the master key wrapping is always modern KDF."""
     return _argon2id_hash(password, salt)
 
 def _pw_wrap_key_legacy(password: str, vault_id: str, salt: bytes) -> bytes:
+    """Legacy PBKDF2 key derivation for existing users without master key."""
     return PBKDF2HMAC(algorithm=hashes.SHA256(), length=32, salt=salt, iterations=PBKDF2_ITER).derive(
         (password + vault_id).encode() + SERVER_KEY
     )
 
 # ── Master Key helpers ──────────────────────────────────────
 def gen_master_key() -> bytes:
+    """Generate a fresh 32-byte random master key for a new vault."""
     return os.urandom(32)
 
 def wrap_master_key(master_key: bytes, password: str) -> tuple:
+    """Encrypt master_key with password → (mk_enc, mk_salt, mk_iv)."""
     salt = os.urandom(16)
     iv   = os.urandom(12)
     wrap_key = _pw_wrap_key(password, salt)
@@ -550,10 +613,12 @@ def wrap_master_key(master_key: bytes, password: str) -> tuple:
     return ct, salt, iv
 
 def unwrap_master_key(mk_enc: bytes, mk_salt: bytes, mk_iv: bytes, password: str) -> bytes:
+    """Decrypt master_key using password."""
     wrap_key = _pw_wrap_key(password, bytes(mk_salt))
     return AESGCM(wrap_key).decrypt(bytes(mk_iv), bytes(mk_enc), None)
 
 def load_master_key(vault_id: str, password: str) -> bytes | None:
+    """Load and unwrap the master key for a vault. Returns None if not migrated yet."""
     with get_db() as c:
         row = c.execute(
             "SELECT mk_enc, mk_salt, mk_iv FROM users WHERE vault_id=?", (vault_id,)
@@ -567,19 +632,28 @@ def load_master_key(vault_id: str, password: str) -> bytes | None:
 
 # ── Symmetric encryption (uses master_key) ─────────────────
 def enc_key(password: str, vault_id: str, salt: bytes) -> bytes:
+    """Legacy PBKDF2 key derivation — only used for old accounts without master key."""
     return _pw_wrap_key_legacy(password, vault_id, salt)
 
 def encrypt(secret: str, password_or_mk: str | bytes, vault_id: str):
+    """Encrypt a secret.
+    If password_or_mk is bytes → it's a master_key (new path).
+    If str → it's a password (legacy path)."""
     salt = os.urandom(16)
     iv   = os.urandom(12)
     if isinstance(password_or_mk, bytes):
+        # New path: master key directly as AES key (no KDF needed)
         key = password_or_mk
     else:
+        # Legacy path: derive key from password
         key = enc_key(password_or_mk, vault_id, salt)
     ct = AESGCM(key).encrypt(iv, secret.encode(), None)
     return ct, salt, iv
 
 def decrypt(ct, salt, iv, password_or_mk: str | bytes, vault_id: str) -> str:
+    """Decrypt a secret.
+    If password_or_mk is bytes → master_key (new path).
+    If str → password (legacy path)."""
     if isinstance(password_or_mk, bytes):
         key = password_or_mk
     else:
@@ -587,6 +661,7 @@ def decrypt(ct, salt, iv, password_or_mk: str | bytes, vault_id: str) -> str:
     return AESGCM(key).decrypt(bytes(iv), bytes(ct), None).decode()
 
 def _get_vault_key(vault_id: str, password: str) -> bytes | str:
+    """Return master_key (bytes) if available, else password (str) for legacy path."""
     mk = load_master_key(vault_id, password)
     return mk if mk is not None else password
 
@@ -606,26 +681,31 @@ def export_decrypt(payload: bytes, password: str) -> bytes:
 
 # ── Share Link crypto ───────────────────────────────────────
 def share_link_aes_key(token: str) -> bytes:
+    """Derive unique 32-byte AES key from SERVER_KEY + token (per-link)."""
     material = f"share:{token}".encode() + SERVER_KEY
     salt     = hashlib.sha256(material).digest()[:16]
     return PBKDF2HMAC(algorithm=hashes.SHA256(), length=32, salt=salt, iterations=100_000).derive(material)
 
 def share_encrypt_secret(secret: str, token: str) -> dict:
+    """Encrypt a TOTP plaintext secret for storage in share_links."""
     key = share_link_aes_key(token)
     iv  = os.urandom(12)
     ct  = AESGCM(key).encrypt(iv, secret.encode(), None)
     return {"ct": ct.hex(), "iv": iv.hex()}
 
 def share_decrypt_secret(enc: dict, token: str) -> str:
+    """Decrypt a TOTP secret from share_links storage."""
     key = share_link_aes_key(token)
     ct  = bytes.fromhex(enc["ct"])
     iv  = bytes.fromhex(enc["iv"])
     return AESGCM(key).decrypt(iv, ct, None).decode()
 
 def gen_share_token() -> str:
+    """Generate a cryptographically random URL-safe 43-char token."""
     return base64.urlsafe_b64encode(secrets.token_bytes(32)).rstrip(b"=").decode()
 
 def purge_expired_share_links():
+    """Remove expired share links. Called on bot startup."""
     with get_db() as c:
         c.execute("DELETE FROM share_links WHERE expires_at <= ?", (int(time.time()),))
         c.commit()
@@ -650,6 +730,7 @@ def sk_decrypt_totp(sk_ct: bytes, sk_salt: bytes, sk_iv: bytes, secure_key_hex: 
     )
 
 def store_user_secure_key(vault_id: str, secure_key_hex: str, password: str):
+    """Store secure key encrypted with master_key (or password for legacy)."""
     vault_key = _get_vault_key(vault_id, password)
     ct, salt, iv = encrypt(secure_key_hex, vault_key, vault_id)
     with get_db() as c:
@@ -660,6 +741,7 @@ def store_user_secure_key(vault_id: str, secure_key_hex: str, password: str):
         c.commit()
 
 def load_user_secure_key(vault_id: str, password: str) -> str | None:
+    """Load and decrypt the secure key using master_key or password (legacy)."""
     with get_db() as c:
         row = c.execute(
             "SELECT sk_enc, sk_salt, sk_iv FROM users WHERE vault_id=?", (vault_id,)
@@ -673,7 +755,10 @@ def load_user_secure_key(vault_id: str, password: str) -> str | None:
         return None
 
 def verify_secure_key_by_totp(vault_id: str, candidate_hex: str) -> bool:
+    """Verify the Secure Key against users table sk_enc OR totp_accounts sk_enc.
+    Falls back gracefully when the user has no TOTP entries."""
     candidate = candidate_hex.strip()
+    # Primary: try to decrypt any TOTP entry's sk_enc with the candidate
     with get_db() as c:
         totp_rows = c.execute(
             "SELECT sk_enc, sk_salt, sk_iv FROM totp_accounts "
@@ -683,11 +768,12 @@ def verify_secure_key_by_totp(vault_id: str, candidate_hex: str) -> bool:
     for row in totp_rows:
         try:
             sk_decrypt_totp(row["sk_enc"], row["sk_salt"], row["sk_iv"], candidate, vault_id)
-            return True
+            return True   # Successfully decrypted = correct key
         except Exception:
             continue
     if totp_rows:
-        return False
+        return False  # Had TOTP entries but none decrypted = wrong key
+    # No TOTP entries at all — verify using users.sk_enc HMAC verifier
     with get_db() as c:
         row = c.execute(
             "SELECT sk_verifier FROM users WHERE vault_id=?", (vault_id,)
@@ -695,6 +781,9 @@ def verify_secure_key_by_totp(vault_id: str, candidate_hex: str) -> bool:
     if row and row["sk_verifier"]:
         expected = hmac.new(SERVER_KEY, candidate.encode(), hashlib.sha256).hexdigest()
         return hmac.compare_digest(row["sk_verifier"], expected)
+    # No verifier stored (old account) and no TOTP entries.
+    # Reject: cannot verify the key, so we cannot safely accept any input.
+    # The user should skip secure key and lose TOTP data (there are none anyway).
     return False
 
 # ── TOTP ───────────────────────────────────────────────────
@@ -722,8 +811,15 @@ def totp_now(secret: str):
     code = str((struct.unpack(">I", h[off:off+4])[0] & 0x7FFFFFFF) % 1_000_000).zfill(6)
     return code, remain
 
+
+
 def generate_code(secret: str):
+    """
+    Generate current and next TOTP code.
+    Returns (code_str, remaining_seconds, next_code_str).
+    """
     code, remain = totp_now(secret)
+    # Next code (next 30s window)
     c   = clean_secret(secret)
     k   = base64.b32decode(c + "=" * ((8 - len(c) % 8) % 8))
     ts  = int(time.time())
@@ -738,7 +834,7 @@ def parse_otpauth(uri: str):
         p      = urlparse(uri)
         if p.scheme != "otpauth":
             return None
-        otp_type = p.netloc.lower()
+        otp_type = p.netloc.lower()  # "totp" or "hotp"
         label  = unquote(p.path.lstrip("/"))
         params = parse_qs(p.query)
         secret = params.get("secret", [None])[0]
@@ -750,8 +846,10 @@ def parse_otpauth(uri: str):
         ok, c = validate_secret(secret)
         if not ok:
             return None
+        # Only TOTP is supported
         if otp_type != "totp":
             return None
+        # Enforce name length limit (QR names auto-truncated silently)
         name = name[:TOTP_NAME_MAX_LEN]
         return {"name": name, "issuer": issuer, "secret": c,
                 "account_type": "totp", "hotp_counter": 0}
@@ -827,11 +925,15 @@ def get_freeze_remaining(vault_id: str) -> int:
             return row["frozen_until"] - int(time.time())
     return 0
 
-# ── MarkdownV2 escaping ────────────────────────────────────
+# ── MarkdownV2 escaping (FIXED) ────────────────────────────
 def em(t) -> str:
+    """Escape special characters for Telegram MarkdownV2."""
     if not t:
         return ""
+    # List of special characters: _ * [ ] ( ) ~ ` > # + - = | { } . ! \
+    # We need to escape each with a backslash
     special_chars = r"_*[]()~`>#+\-=|{}.!\\"
+    # Escape each character
     escaped = []
     for ch in str(t):
         if ch in special_chars:
@@ -854,12 +956,17 @@ def fmt_time(ts, tz="UTC") -> str:
     return dt.strftime(f"%d %b %Y, %I:%M %p ({tz})")
 
 def parse_tz(raw: str):
+    """Parse user timezone input like +6, -5:30, +5:45 into a valid IANA tz string.
+    Uses fixed-offset IANA names: Etc/GMT signs are INVERTED (POSIX convention),
+    so we use a direct UTC±HH:MM approach via zoneinfo fixed offsets instead."""
     m = re.match(r"^([+-])(\d{1,2})(?::(\d{2}))?$", raw.strip())
     if not m:
         return None
     sign, h, mn = m.group(1), int(m.group(2)), int(m.group(3) or 0)
     if h > 14 or mn not in (0, 30, 45):
         return None
+    # Use Etc/GMT only for whole-hour offsets (Etc/GMT inverts sign: +6 -> Etc/GMT-6 = UTC+6)
+    # For half-hour and quarter-hour offsets, use well-known IANA zone names where possible.
     tz_map = {
         (+5, 30): "Asia/Kolkata",
         (+5, 45): "Asia/Kathmandu",
@@ -874,8 +981,10 @@ def parse_tz(raw: str):
     if named:
         return named
     if mn == 0:
+        # Etc/GMT uses INVERTED sign: Etc/GMT-6 = UTC+6
         etc_sign = "-" if sign == "+" else "+"
         return f"Etc/GMT{etc_sign}{h}"
+    # For other fractional offsets, use a fixed-offset string zoneinfo can parse
     return f"UTC{sign}{h:02d}:{mn:02d}"
 
 # ── Keyboards ───────────────────────────────────────────────
@@ -923,7 +1032,13 @@ def kb_reset_secure_key():
         [InlineKeyboardButton("❌ Cancel",              callback_data="cancel_to_menu")],
     ])
 
+
 def build_share_selection_kb(rows: list, selected: set) -> InlineKeyboardMarkup:
+    """
+    Checkbox-style keyboard for Share Codes folder.
+    rows: list of dicts with 'id' and 'name'.
+    selected: set of selected totp account IDs.
+    """
     buttons = []
     for row in rows:
         tid   = row["id"]
@@ -943,6 +1058,7 @@ def build_share_selection_kb(rows: list, selected: set) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(buttons)
 
 def build_totp_list_kb() -> InlineKeyboardMarkup:
+    """Bottom keyboard for the TOTP list view."""
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton("🔄 Refresh",     callback_data="list_totp"),
@@ -1073,8 +1189,11 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not update.message:
         return
     uid  = update.effective_user.id
+    # Auto-delete the /start command message
     asyncio.create_task(auto_delete_msg(update.message, delay=3))
+    # Update last_seen for any active user
     update_last_seen(uid)
+    # Handle deep link: /start <share_token>
     if ctx.args:
         token = ctx.args[0].strip()
         await handle_share_view(update, token)
@@ -1082,6 +1201,7 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if vault:
             return TOTP_MENU
         return AUTH_MENU
+    # Maintenance mode: block all users
     if is_maintenance():
         await update.message.reply_text(
             MAINTENANCE_MSG, parse_mode="MarkdownV2"
@@ -1091,6 +1211,7 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if vault:
         u = get_user(vault)
         if u:
+            # Check if account is disabled
             if u["account_disabled"]:
                 await update.message.reply_text(
                     "🚫 *Your account has been disabled\\.* Please contact support\\.",
@@ -1117,6 +1238,7 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 # ── SIGN UP ─────────────────────────────────────────────────
 async def signup_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Show Terms & Privacy screen before proceeding to account creation."""
     q   = update.callback_query
     await q.answer()
     if is_maintenance():
@@ -1136,6 +1258,7 @@ async def signup_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             reply_markup=kb_auth(),
         )
         return AUTH_MENU
+    # Weekly signup limit: max 2 signups per Telegram account per week
     if not check_weekly_signup_limit(uid):
         await q.edit_message_text(
             "⚠️ *Weekly sign\\-up limit reached\\.* You can create a maximum of "
@@ -1145,6 +1268,7 @@ async def signup_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             reply_markup=kb_auth(),
         )
         return AUTH_MENU
+    # Show Terms & Privacy screen
     await q.edit_message_text(
         "📋 *Terms \\& Privacy*\n\n"
         "By creating an account you agree to our terms of service and privacy policy\\.\n\n"
@@ -1165,6 +1289,7 @@ async def signup_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     return SIGNUP_TERMS
 
 async def signup_terms_agreed(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """User agreed to terms — proceed to vault ID + password setup."""
     q   = update.callback_query
     await q.answer()
     uid = update.effective_user.id
@@ -1182,6 +1307,7 @@ async def signup_terms_agreed(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     return SIGNUP_PASSWORD
 
 async def signup_terms_declined(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """User declined terms — go back to auth menu."""
     q = update.callback_query
     await q.answer()
     await q.edit_message_text(
@@ -1241,6 +1367,7 @@ async def signup_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     tg_name     = ((update.effective_user.first_name or "") + " " + (update.effective_user.last_name or "")).strip()
     tg_username = update.effective_user.username or ""
 
+    # Generate master key for this vault (new architecture)
     master_key       = gen_master_key()
     mk_enc, mk_salt, mk_iv = wrap_master_key(master_key, pw)
 
@@ -1253,8 +1380,10 @@ async def signup_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         c.commit()
 
+    # Store secure key encrypted with master_key (not password)
     secure_key = gen_secure_key()
     store_user_secure_key(vid, secure_key, pw)
+    # Store HMAC verifier so secure key can be verified without password
     sk_verifier = hmac.new(SERVER_KEY, secure_key.encode(), hashlib.sha256).hexdigest()
     with get_db() as c:
         c.execute("UPDATE users SET sk_verifier=? WHERE vault_id=?", (sk_verifier, vid))
@@ -1263,10 +1392,10 @@ async def signup_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     set_session(uid, vid)
     ctx.user_data["password"] = pw
     ctx.user_data["vault_id"] = vid
-    _session_pw_cache[vid] = pw
-    _oab_store_password(uid, vid, pw)
-    record_weekly_signup(uid)
-    record_vault_login(uid, vid)
+    _session_pw_cache[vid] = pw             # RAM cache for auto-backup
+    _oab_store_password(uid, vid, pw)       # DB encrypted store for auto-backup
+    record_weekly_signup(uid)               # track weekly signup count
+    record_vault_login(uid, vid)            # track lifetime vault access
 
     sk_display = " ".join(secure_key[i:i+8] for i in range(0, len(secure_key), 8))
 
@@ -1337,6 +1466,7 @@ async def login_auto(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             reply_markup=kb_auth(),
         )
         return AUTH_MENU
+    # Block disabled accounts before they even enter password
     if u["account_disabled"]:
         await q.edit_message_text(
             "🚫 *This account has been disabled\\.* Please contact support\\.",
@@ -1378,6 +1508,7 @@ async def login_id_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             reply_markup=kb_cancel(),
         )
         return LOGIN_ID_INPUT
+    # Block disabled accounts before password entry
     if u["account_disabled"]:
         await update.message.reply_text(
             "🚫 *This account has been disabled\\.* Please contact support\\.",
@@ -1395,13 +1526,14 @@ async def login_id_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 # ── Login Rate Limiting ────────────────────────────────────
 def record_login_failure(vault_id: str) -> bool:
+    """Record a failed login attempt. Returns True if account is now frozen."""
     now = int(time.time())
     with get_db() as c:
         row = c.execute(
             "SELECT attempts, frozen_until FROM login_attempts WHERE vault_id=?", (vault_id,)
         ).fetchone()
         if row and row["frozen_until"] > now:
-            return True
+            return True  # already frozen
         attempts     = (row["attempts"] if row else 0) + 1
         frozen_until = now + LOGIN_FREEZE_HOURS * 3600 if attempts >= MAX_LOGIN_ATTEMPTS else 0
         c.execute(
@@ -1445,6 +1577,7 @@ async def login_pw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         return AUTH_MENU
 
+    # Final safety net: block disabled accounts even if they reached password step
     if u["account_disabled"]:
         await update.message.reply_text(
             "🚫 *This account has been disabled\\.* Please contact support\\.",
@@ -1453,6 +1586,7 @@ async def login_pw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         return AUTH_MENU
 
+    # Check if account is frozen due to too many failed login attempts
     if is_login_frozen(vid):
         remaining, _ = get_login_freeze_remaining(vid)
         h, m = remaining // 3600, (remaining % 3600) // 60
@@ -1465,6 +1599,7 @@ async def login_pw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return AUTH_MENU
 
     if not hmac.compare_digest(hash_pw(pw, bytes(u["pw_salt"]), u["kdf_type"] or "pbkdf2"), bytes(u["password_hash"])):
+        # Record failed attempt and check freeze
         frozen = record_login_failure(vid)
         if frozen:
             remaining, _ = get_login_freeze_remaining(vid)
@@ -1477,6 +1612,7 @@ async def login_pw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             )
         else:
             _, attempts = get_login_freeze_remaining(vid)
+            # get attempts without freeze context
             with get_db() as c:
                 row = c.execute("SELECT attempts FROM login_attempts WHERE vault_id=?", (vid,)).fetchone()
                 attempts = row["attempts"] if row else 1
@@ -1488,9 +1624,11 @@ async def login_pw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             )
         return LOGIN_PASSWORD
 
+    # Successful login: clear any failed attempt records
     clear_login_failures(vid)
     update_last_seen(uid)
 
+    # Daily login limit: max 7 successful logins per day per telegram_id
     if not check_daily_login_limit(uid):
         await update.message.reply_text(
             f"⚠️ *Daily login limit reached\\.* Maximum *{MAX_DAILY_LOGINS}* logins per day allowed\\.\n\n"
@@ -1500,6 +1638,7 @@ async def login_pw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         return AUTH_MENU
 
+    # Lifetime vault limit: a telegram_id can access at most 5 distinct vaults ever
     if not check_vault_login_limit(uid, vid):
         await update.message.reply_text(
             f"⚠️ *Vault access limit reached\\.* A single Telegram account can access "
@@ -1510,6 +1649,7 @@ async def login_pw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         return AUTH_MENU
 
+    # Record this login
     record_daily_login(uid)
     record_vault_login(uid, vid)
 
@@ -1529,6 +1669,7 @@ async def login_pw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     (new_pw_hash, new_salt, "argon2id", mk_enc, mk_salt, mk_iv, vid),
                 )
                 c.commit()
+            # Re-encrypt all TOTP secrets with master_key (migrate from password-based)
             with get_db() as c:
                 totp_rows = c.execute(
                     "SELECT id, secret_enc, salt, iv FROM totp_accounts WHERE vault_id=?", (vid,)
@@ -1543,7 +1684,8 @@ async def login_pw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                         )
                     except Exception as e:
                         logger.error(f"MK migration TOTP {row['id']}: {e}")
-                sk = load_user_secure_key(vid, pw)
+                # Also re-encrypt sk_enc (secure key) with master_key
+                sk = load_user_secure_key(vid, pw)  # load with old method before migration
                 if sk:
                     sk_ct, sk_s, sk_iv = encrypt(sk, master_key, vid)
                     c.execute(
@@ -1554,6 +1696,7 @@ async def login_pw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             logger.info(f"Auto-upgraded vault {vid} to Argon2id + MasterKey")
         except Exception as e:
             logger.error(f"Auto-upgrade failed for {vid}: {e}")
+    # ────────────────────────────────────────────────────────────
 
     if uid != u["telegram_id"]:
         new_username = update.effective_user.username or str(uid)
@@ -1566,8 +1709,8 @@ async def login_pw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         update_tg_name(vid, update.effective_user)
     ctx.user_data["password"] = pw
     ctx.user_data["vault_id"] = vid
-    _session_pw_cache[vid] = pw
-    _oab_store_password(uid, vid, pw)
+    _session_pw_cache[vid] = pw             # RAM cache for auto-backup
+    _oab_store_password(uid, vid, pw)       # DB encrypted store for auto-backup
     owner_name = u["tg_name"] if u["tg_name"] else "User"
     await update.message.reply_text(
         f"✅ *Logged in\\!* Welcome to vault of *{em(owner_name)}*\\.",
@@ -1605,6 +1748,7 @@ async def reset_id_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return RESET_ID_INPUT
     vid = u["vault_id"]
 
+    # Block password reset for disabled accounts
     if u["account_disabled"]:
         await update.message.reply_text(
             "🚫 *This account has been disabled\\.*\n\n"
@@ -1615,6 +1759,7 @@ async def reset_id_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         return AUTH_MENU
 
+    # Block password reset while login is frozen (brute-force lockout)
     if is_login_frozen(vid):
         remaining, _ = get_login_freeze_remaining(vid)
         h, m = remaining // 3600, (remaining % 3600) // 60
@@ -1627,6 +1772,7 @@ async def reset_id_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         return AUTH_MENU
 
+    # Block password reset while already reset-frozen
     if is_reset_frozen(vid):
         remaining = get_freeze_remaining(vid)
         h, m      = remaining // 3600, (remaining % 3600) // 60
@@ -1817,8 +1963,10 @@ async def reset_new_pw_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ).fetchall()
 
         if sk_skipped:
+            # User skipped secure key: permanently delete ALL TOTP accounts
             c.execute("DELETE FROM totp_accounts WHERE vault_id=?", (vid,))
             deleted_cnt = len(rows)
+            # Generate brand-new master key and secure key
             new_secure_key = gen_secure_key()
             new_master_key = gen_master_key()
             new_mk_enc, new_mk_salt, new_mk_iv = wrap_master_key(new_master_key, new_pw)
@@ -1860,23 +2008,32 @@ async def reset_new_pw_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             c.execute("DELETE FROM totp_accounts WHERE vault_id=?", (vid,))
             deleted_cnt = len(rows)
 
+        # For sk_skipped path, password + new secure key already updated above.
+        # For secure_key or no-sk-at-all paths, update password now.
         if not sk_skipped:
             ns = os.urandom(16)
+            # Check if user has master key - if so, need to re-wrap it
             u_row = c.execute("SELECT mk_enc, mk_salt, mk_iv FROM users WHERE vault_id=?", (vid,)).fetchone()
             if u_row and u_row["mk_enc"] and secure_key:
+                # Unauthenticated reset with secure key: we cannot unwrap old mk_enc
+                # (requires old password). Instead generate new master key and re-encrypt
+                # TOTP with it (we already have plaintext secrets from sk_decrypt above).
                 new_master_key = gen_master_key()
                 new_mk_enc, new_mk_salt, new_mk_iv = wrap_master_key(new_master_key, new_pw)
+                # Re-encrypt all already-re-encrypted TOTP secrets with new master key
                 totp_rows2 = c.execute(
                     "SELECT id, secret_enc, salt, iv FROM totp_accounts WHERE vault_id=?", (vid,)
                 ).fetchall()
                 for tr in totp_rows2:
                     try:
+                        # These are now encrypted with new_pw (done above), re-encrypt with mk
                         plain2 = decrypt(tr["secret_enc"], tr["salt"], tr["iv"], new_pw, vid)
                         nct, ns2, niv = encrypt(plain2, new_master_key, vid)
                         c.execute("UPDATE totp_accounts SET secret_enc=?, salt=?, iv=? WHERE id=?",
                                   (nct, ns2, niv, tr["id"]))
                     except Exception:
                         pass
+                # Store sk encrypted with new master key
                 sk_nct, sk_ns, sk_niv = encrypt(secure_key, new_master_key, vid)
                 c.execute(
                     "UPDATE users SET password_hash=?, pw_salt=?, kdf_type=?, "
@@ -1890,8 +2047,7 @@ async def reset_new_pw_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     (hash_pw(new_pw, ns, "argon2id"), ns, "argon2id", vid),
                 )
                 if secure_key:
-                    vault_key = _get_vault_key(vid, new_pw)
-                    ct, s, iv = encrypt(secure_key, vault_key, vid)
+                    ct, s, iv = encrypt(secure_key, new_pw, vid)
                     c.execute(
                         "UPDATE users SET sk_enc=?, sk_salt=?, sk_iv=? WHERE vault_id=?",
                         (ct, s, iv, vid),
@@ -1902,6 +2058,7 @@ async def reset_new_pw_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
               "reset_secure_key", "reset_sk_skipped"):
         ctx.user_data.pop(k, None)
 
+    # Update auto-backup stored password after reset (use vault owner's telegram_id)
     u_owner = get_user(vid)
     if u_owner:
         _oab_store_password(u_owner["telegram_id"], vid, new_pw)
@@ -2055,6 +2212,7 @@ async def settings_reset_pw_confirm(update: Update, ctx: ContextTypes.DEFAULT_TY
     with get_db() as c:
         u = c.execute("SELECT mk_enc, mk_salt, mk_iv FROM users WHERE vault_id=?", (vault,)).fetchone()
     if u and u["mk_enc"]:
+        # New architecture: only re-wrap master key
         try:
             master_key = unwrap_master_key(u["mk_enc"], u["mk_salt"], u["mk_iv"], old_pw)
             new_mk_enc, new_mk_salt, new_mk_iv = wrap_master_key(master_key, new_pw)
@@ -2075,6 +2233,7 @@ async def settings_reset_pw_confirm(update: Update, ctx: ContextTypes.DEFAULT_TY
             )
             return TOTP_MENU
     else:
+        # Legacy path
         with get_db() as c:
             rows = c.execute(
                 "SELECT id, secret_enc, salt, iv FROM totp_accounts WHERE vault_id=?", (vault,)
@@ -2082,21 +2241,19 @@ async def settings_reset_pw_confirm(update: Update, ctx: ContextTypes.DEFAULT_TY
             for row in rows:
                 try:
                     secret    = decrypt(row["secret_enc"], row["salt"], row["iv"], old_pw, vault)
-                    vault_key_new = _get_vault_key(vault, new_pw)
-                    ct, s, iv = encrypt(secret, vault_key_new, vault)
+                    ct, s, iv = encrypt(secret, new_pw, vault)
                     c.execute("UPDATE totp_accounts SET secret_enc=?, salt=?, iv=? WHERE id=?",
                               (ct, s, iv, row["id"]))
                 except Exception as e:
                     logger.error(f"Re-encrypt TOTP settings_reset (legacy): {e}")
             new_salt = os.urandom(16)
             c.execute(
-                "UPDATE users SET password_hash=?, pw_salt=?, kdf_type=? WHERE vault_id=?",
-                (hash_pw(new_pw, new_salt, "argon2id"), new_salt, "argon2id", vault),
+                "UPDATE users SET password_hash=?, pw_salt=? WHERE vault_id=?",
+                (hash_pw(new_pw, new_salt, "argon2id"), new_salt, vault),
             )
             sk = load_user_secure_key(vault, old_pw)
             if sk:
-                vault_key_new = _get_vault_key(vault, new_pw)
-                ct, s, iv = encrypt(sk, vault_key_new, vault)
+                ct, s, iv = encrypt(sk, new_pw, vault)
                 c.execute("UPDATE users SET sk_enc=?, sk_salt=?, sk_iv=? WHERE vault_id=?",
                           (ct, s, iv, vault))
             c.commit()
@@ -2139,7 +2296,7 @@ async def view_secure_key_pw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not u:
         await update.message.reply_text("Session expired\\. /start", parse_mode="MarkdownV2", reply_markup=kb_auth())
         return AUTH_MENU
-    if not hmac.compare_digest(hash_pw(pw, bytes(u["pw_salt"]), u["kdf_type"] or "pbkdf2"), bytes(u["password_hash"])):
+    if not hmac.compare_digest(hash_pw(pw, bytes(u["pw_salt"])), bytes(u["password_hash"])):
         await update.message.reply_text(
             "❌ *Wrong password\\.*",
             parse_mode="MarkdownV2",
@@ -2183,7 +2340,7 @@ async def logout(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid   = update.effective_user.id
     vault = get_session(uid)
     if vault:
-        _session_pw_cache.pop(vault, None)
+        _session_pw_cache.pop(vault, None)   # clear cached password for auto-backup
     clear_session(uid)
     ctx.user_data.clear()
     await q.edit_message_text(
@@ -2300,7 +2457,7 @@ async def change_pw_old(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid   = update.effective_user.id
     vault = get_session(uid)
     u     = get_user(vault)
-    if not u or not hmac.compare_digest(hash_pw(pw, bytes(u["pw_salt"]), u["kdf_type"] or "pbkdf2"), bytes(u["password_hash"])):
+    if not u or not hmac.compare_digest(hash_pw(pw, bytes(u["pw_salt"])), bytes(u["password_hash"])):
         await update.message.reply_text(
             "❌ Wrong password\\.",
             parse_mode="MarkdownV2",
@@ -2356,6 +2513,7 @@ async def change_pw_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         u = c.execute("SELECT mk_enc, mk_salt, mk_iv, kdf_type, pw_salt, sk_enc, sk_salt, sk_iv "
                       "FROM users WHERE vault_id=?", (vault,)).fetchone()
     if u and u["mk_enc"]:
+        # New architecture: only re-wrap the master key with new password
         try:
             master_key = unwrap_master_key(u["mk_enc"], u["mk_salt"], u["mk_iv"], old_pw)
             new_mk_enc, new_mk_salt, new_mk_iv = wrap_master_key(master_key, new_pw)
@@ -2376,27 +2534,27 @@ async def change_pw_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             )
             return TOTP_MENU
     else:
+        # Legacy path: re-encrypt all TOTP secrets and sk with new password
         with get_db() as c:
             rows = c.execute(
                 "SELECT id, secret_enc, salt, iv FROM totp_accounts WHERE vault_id=?", (vault,)
             ).fetchall()
-            vault_key_new = _get_vault_key(vault, new_pw)
             for row in rows:
                 try:
                     secret    = decrypt(row["secret_enc"], row["salt"], row["iv"], old_pw, vault)
-                    ct, s, iv = encrypt(secret, vault_key_new, vault)
+                    ct, s, iv = encrypt(secret, new_pw, vault)
                     c.execute("UPDATE totp_accounts SET secret_enc=?, salt=?, iv=? WHERE id=?",
                               (ct, s, iv, row["id"]))
                 except Exception as e:
                     logger.error(f"Re-encrypt TOTP during change_pw (legacy): {e}")
             ns = os.urandom(16)
             c.execute(
-                "UPDATE users SET password_hash=?, pw_salt=?, kdf_type=? WHERE vault_id=?",
-                (hash_pw(new_pw, ns, "argon2id"), ns, "argon2id", vault),
+                "UPDATE users SET password_hash=?, pw_salt=? WHERE vault_id=?",
+                (hash_pw(new_pw, ns, "argon2id"), ns, vault),
             )
             sk = load_user_secure_key(vault, old_pw)
             if sk:
-                ct, s, iv = encrypt(sk, vault_key_new, vault)
+                ct, s, iv = encrypt(sk, new_pw, vault)
                 c.execute("UPDATE users SET sk_enc=?, sk_salt=?, sk_iv=? WHERE vault_id=?",
                           (ct, s, iv, vault))
             c.commit()
@@ -2435,6 +2593,7 @@ async def _do_save_totp(update, vault, data, pw):
     hotp_ctr = 0
     note     = (data.get("note", "") or "")[:NOTE_MAX_LEN]
 
+    # Per-minute rate limit: max 20 TOTP additions per minute
     if not check_totp_add_rate(vault):
         await update.message.reply_text(
             f"⚠️ *Too many accounts added\\.*\n\n"
@@ -2445,6 +2604,7 @@ async def _do_save_totp(update, vault, data, pw):
         )
         return TOTP_MENU
 
+    # Auto-suffix name if duplicate, enforce max 20 chars
     final_name = _auto_suffix_name(vault, data["name"])
 
     vault_key = _get_vault_key(vault, pw)
@@ -2465,6 +2625,7 @@ async def _do_save_totp(update, vault, data, pw):
 
     record_totp_add(vault)
 
+    # Show different name if it was auto-suffixed
     display_name = final_name
     suffix_note  = ""
     if final_name != data["name"].strip():
@@ -2641,7 +2802,7 @@ async def handle_manual_secret(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         return ADD_MANUAL_SECRET
     try:
-        totp_now(cleaned)
+        totp_now(cleaned)  # validation: must be valid base32 decodable
     except Exception:
         await update.message.reply_text(
             "⚠️ *Secret key failed TOTP test\\.* Try again:",
@@ -2654,6 +2815,7 @@ async def handle_manual_secret(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 # ── LIST TOTP ────────────────────────────────────────────────
 def build_list_page_kb(page: int, total_pages: int) -> InlineKeyboardMarkup:
+    """Navigation keyboard for paginated TOTP list."""
     nav = []
     if page > 0:
         nav.append(InlineKeyboardButton("⬅️ Back", callback_data=f"list_page_{page-1}"))
@@ -2670,6 +2832,7 @@ def build_list_page_kb(page: int, total_pages: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 async def _render_list_page(q_or_msg, vault: str, pw: str, page: int, is_edit: bool = True):
+    """Render one page of TOTP list with the new card format."""
     with get_db() as c:
         rows = c.execute(
             "SELECT id, name, issuer, secret_enc, salt, iv, note, account_type, hotp_counter "
@@ -2690,20 +2853,27 @@ async def _render_list_page(q_or_msg, vault: str, pw: str, page: int, is_edit: b
     page        = max(0, min(page, total_pages - 1))
     chunk       = rows[page * TOTP_PER_PAGE : (page + 1) * TOTP_PER_PAGE]
 
-    vault_key = _get_vault_key(vault, pw)
     entries = []
     for i, row in enumerate(chunk, start=page * TOTP_PER_PAGE + 1):
         try:
-            secret = decrypt(row["secret_enc"], row["salt"], row["iv"], vault_key, vault)
+            secret = decrypt(row["secret_enc"], row["salt"], row["iv"], pw, vault)
             note     = (row["note"] or "").strip()
             code, remain, next_code = generate_code(secret)
+
+            # Format TOTP code: "123 456"
             code_fmt  = code
             time_line = f"{bar(remain)} {remain}s"
+
+            # Next code display
             next_line = f"Next code: `{next_code}`" if next_code else ""
+
             note_line = f"Note: {em(note)}" if note else ""
+
+            # Build entry block
             name_line = f"*{i}\\. {em(row['name'])}*"
             if row["issuer"]:
                 name_line += f" \\| _{em(row['issuer'])}_"
+
             block = [name_line, f"Current Code: `{code}` {time_line}"]
             if next_line:
                 block.append(next_line)
@@ -2736,6 +2906,7 @@ async def list_totp(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     return TOTP_MENU
 
 async def list_page_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Handle page navigation buttons in list view."""
     q = update.callback_query
     await q.answer()
     if q.data == "list_noop":
@@ -2754,8 +2925,10 @@ async def list_page_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await _render_list_page(q, vault, pw, page)
     return TOTP_MENU
 
+
 # ── SHARE CODES: Open folder ─────────────────────────────────
 async def share_codes_open(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Open the Share Codes folder with checkbox selection."""
     q     = update.callback_query
     await q.answer()
     uid   = update.effective_user.id
@@ -2789,6 +2962,7 @@ async def share_codes_open(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     return TOTP_MENU
 
 async def share_toggle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Toggle a TOTP account in/out of the share selection."""
     q = update.callback_query
     await q.answer()
     try:
@@ -2811,6 +2985,7 @@ async def share_toggle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     return TOTP_MENU
 
 async def share_generate(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Build the share link for selected TOTP accounts."""
     q     = update.callback_query
     await q.answer()
     uid   = update.effective_user.id
@@ -2836,14 +3011,14 @@ async def share_generate(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not db_rows:
         await q.answer("Could not load selected accounts.", show_alert=True)
         return TOTP_MENU
+    # Generate token first (needed for per-link key derivation)
     token       = gen_share_token()
     secrets_enc = []
     final_ids   = []
     final_names = []
-    vault_key   = _get_vault_key(vault, pw)
     for db_row in db_rows:
         try:
-            plain = decrypt(db_row["secret_enc"], db_row["salt"], db_row["iv"], vault_key, vault)
+            plain = decrypt(db_row["secret_enc"], db_row["salt"], db_row["iv"], pw, vault)
             enc   = share_encrypt_secret(plain, token)
             secrets_enc.append(enc)
             final_ids.append(db_row["id"])
@@ -2898,6 +3073,7 @@ async def share_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 # ── Share View (deep link handler) ───────────────────────────
 async def handle_share_view(update: Update, token: str):
+    """Show live TOTP codes for a valid share link."""
     with get_db() as c:
         row = c.execute(
             "SELECT * FROM share_links WHERE token=? AND expires_at > ?",
@@ -2938,7 +3114,7 @@ async def handle_share_view(update: Update, token: str):
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Refresh Codes", url=refresh_url)]])
     await update.message.reply_text(text, parse_mode="MarkdownV2", reply_markup=kb)
 
-# ── EDIT TOTP ───────────────────────────────────────────────
+# ── EDIT TOTP (FIXED) ───────────────────────────────────────
 async def edit_totp_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -2957,6 +3133,7 @@ async def edit_totp_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return TOTP_MENU
         kb = []
         for r in rows:
+            # Button text does not need Markdown escaping; but we use raw name
             kb.append([InlineKeyboardButton(r["name"], callback_data=f"editpick_{r['id']}")])
         kb.append([InlineKeyboardButton("❌ Cancel", callback_data="main_menu")])
         await q.edit_message_text(
@@ -3034,6 +3211,7 @@ async def edit_action(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     elif action == "note":
         name   = ctx.user_data.get("edit_name", "")
         acc_id = ctx.user_data.get("edit_id")
+        # Show current note
         current_note = ""
         if acc_id:
             with get_db() as c:
@@ -3049,7 +3227,7 @@ async def edit_action(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             reply_markup=kb_cancel(),
         )
         return NOTE_INPUT
-    else:
+    else:  # delete
         name = ctx.user_data.get("edit_name", "")
         await q.edit_message_text(
             f"🗑 Delete *{em(name)}*?\n\n_This cannot be undone\\._",
@@ -3096,6 +3274,7 @@ async def edit_rename_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     return TOTP_MENU
 
 async def note_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Save note (max NOTE_MAX_LEN chars) for a TOTP account."""
     raw    = update.message.text.strip()
     uid    = update.effective_user.id
     vault  = get_session(uid)
@@ -3104,6 +3283,7 @@ async def note_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not acc_id:
         await update.message.reply_text("⚠️ Session lost\\.", parse_mode="MarkdownV2", reply_markup=kb_main())
         return TOTP_MENU
+    # Clear note if user sends space or dot
     note = "" if raw in (".", " ", "") else raw[:NOTE_MAX_LEN]
     with get_db() as c:
         c.execute("UPDATE totp_accounts SET note=? WHERE id=? AND vault_id=?", (note, acc_id, vault))
@@ -3130,7 +3310,7 @@ async def show_secret_pw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not u:
         await update.message.reply_text("Session expired\\. /start", parse_mode="MarkdownV2", reply_markup=kb_auth())
         return AUTH_MENU
-    if not hmac.compare_digest(hash_pw(pw, bytes(u["pw_salt"]), u["kdf_type"] or "pbkdf2"), bytes(u["password_hash"])):
+    if not hmac.compare_digest(hash_pw(pw, bytes(u["pw_salt"])), bytes(u["password_hash"])):
         await update.message.reply_text(
             "❌ *Wrong password\\.* Secret key not revealed\\.",
             parse_mode="MarkdownV2",
@@ -3154,8 +3334,7 @@ async def show_secret_pw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ctx.user_data.pop("edit_name", None)
         return TOTP_MENU
     try:
-        vault_key = _get_vault_key(vault, pw)
-        secret = decrypt(row["secret_enc"], row["salt"], row["iv"], vault_key, vault)
+        secret = decrypt(row["secret_enc"], row["salt"], row["iv"], pw, vault)
     except Exception as e:
         logger.error(f"Decrypt for show_secret failed: {e}")
         await update.message.reply_text(
@@ -3211,7 +3390,7 @@ async def export_pw1_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid   = update.effective_user.id
     vault = get_session(uid)
     u     = get_user(vault)
-    if not u or not hmac.compare_digest(hash_pw(pw, bytes(u["pw_salt"]), u["kdf_type"] or "pbkdf2"), bytes(u["password_hash"])):
+    if not u or not hmac.compare_digest(hash_pw(pw, bytes(u["pw_salt"])), bytes(u["password_hash"])):
         await update.message.reply_text(
             "❌ Wrong account password\\.",
             parse_mode="MarkdownV2",
@@ -3254,16 +3433,16 @@ async def export_pw2_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             reply_markup=kb_main(),
         )
         return TOTP_MENU
-    vault_key = _get_vault_key(vault, pw)
     entries = []
     for row in rows:
         try:
-            secret = decrypt(row["secret_enc"], row["salt"], row["iv"], vault_key, vault)
+            secret = decrypt(row["secret_enc"], row["salt"], row["iv"], pw, vault)
             entries.append({"name": row["name"], "issuer": row["issuer"] or "", "secret": secret})
         except Exception as e:
             logger.error(f"Export decrypt: {e}")
     plain   = json.dumps({"version": 3, "vault_id": vault, "accounts": entries}, ensure_ascii=False).encode()
     payload = export_encrypt(plain, file_pw)
+    # Timestamped filename: bv_backup_YYYYMMDD_HHMMSS.bvault
     ts_str   = datetime.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
     filename = f"bv_backup_{ts_str}.bvault"
     bio      = BytesIO(payload)
@@ -3372,6 +3551,7 @@ async def import_pw_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             reply_markup=kb_main(),
         )
         return TOTP_MENU
+    # Check for duplicates
     uid   = update.effective_user.id
     vault = get_session(uid)
     with get_db() as c:
@@ -3395,12 +3575,14 @@ async def import_pw_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             ]),
         )
         return IMPORT_OVERRIDE_WAIT
+    # No duplicates: import all directly
     return await _do_import(update, ctx, vault, accounts, mode="skip")
 
 async def import_override_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Handle Skip / Replace choice for duplicate import entries."""
     q = update.callback_query
     await q.answer()
-    mode     = q.data.split("_")[2]
+    mode     = q.data.split("_")[2]   # "skip" or "replace"
     uid      = update.effective_user.id
     vault    = get_session(uid)
     accounts = ctx.user_data.pop("import_accounts", [])
@@ -3408,28 +3590,37 @@ async def import_override_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text("⚠️ Session expired\\. Please try again\\.",
                                   parse_mode="MarkdownV2", reply_markup=kb_main())
         return TOTP_MENU
+    # Route through a message-less import (callback context)
     await q.edit_message_text("⏳ Importing\\.\\.\\.\\.", parse_mode="MarkdownV2")
     return await _do_import(update, ctx, vault, accounts, mode=mode, reply_obj=q)
 
 async def _do_import(update_or_cb, ctx, vault: str, accounts: list, mode: str = "skip", reply_obj=None):
+    """
+    mode = "skip"    → keep existing, skip duplicates
+    mode = "replace" → overwrite existing with imported version
+    """
     pw       = ctx.user_data.get("password", "")
     imported = 0
     skipped  = 0
     replaced = 0
-    vault_key = _get_vault_key(vault, pw)
     with get_db() as c:
+        # Build duplicate lookup: {(name, secret_sha256_hex): id}
+        # This correctly handles same-name different-secret and same-secret different-name
         existing_rows = c.execute(
             "SELECT id, name, secret_enc, salt, iv FROM totp_accounts WHERE vault_id=?", (vault,)
         ).fetchall()
-        existing_by_name   = {r["name"]: r["id"] for r in existing_rows}
-        existing_secrets   = set()
+        # For duplicate detection, decrypt existing secrets and hash them
+        existing_by_name   = {r["name"]: r["id"] for r in existing_rows}  # name -> id (for replace)
+        existing_secrets   = set()    # sha256(secret) set
+        # Track which entries had decrypt failures - these are protected from overwrite
         undecryptable_names = set()
         for r in existing_rows:
             try:
-                plain = decrypt(r["secret_enc"], r["salt"], r["iv"], vault_key, vault)
+                plain = decrypt(r["secret_enc"], r["salt"], r["iv"], pw, vault)
                 existing_secrets.add(hashlib.sha256(plain.encode()).hexdigest())
             except Exception as e:
                 logger.warning(f"Import duplicate check: decrypt failed for '{r['name']}': {e}")
+                # Cannot read this entry - protect it from being overwritten
                 undecryptable_names.add(r["name"])
 
         sk = load_user_secure_key(vault, pw)
@@ -3440,19 +3631,23 @@ async def _do_import(update_or_cb, ctx, vault: str, accounts: list, mode: str = 
                     skipped += 1
                     continue
                 note     = (acc.get("note", "") or "")[:NOTE_MAX_LEN]
-                totp_now(secret)
+                totp_now(secret)   # sanity check
                 secret_hash = hashlib.sha256(secret.encode()).hexdigest()
+                vault_key = _get_vault_key(vault, pw)
                 ct, s, iv = encrypt(secret, vault_key, vault)
                 sk_ct = sk_s = sk_iv = None
                 if sk:
                     sk_ct, sk_s, sk_iv = sk_encrypt_totp(secret.encode(), sk, vault)
 
+                # Duplicate = same name AND same secret
                 name_exists   = acc["name"] in existing_by_name
                 secret_exists = secret_hash in existing_secrets
 
                 if name_exists and acc["name"] in undecryptable_names:
+                    # Existing entry could not be decrypted — never overwrite it, skip safely
                     skipped += 1
                 elif name_exists and secret_exists:
+                    # True duplicate: same name + same secret
                     if mode == "replace":
                         c.execute(
                             "UPDATE totp_accounts SET issuer=?, secret_enc=?, salt=?, iv=?, "
@@ -3465,6 +3660,7 @@ async def _do_import(update_or_cb, ctx, vault: str, accounts: list, mode: str = 
                     else:
                         skipped += 1
                 else:
+                    # Not a true duplicate: add as new entry
                     c.execute(
                         "INSERT INTO totp_accounts "
                         "(vault_id, name, issuer, secret_enc, salt, iv, sk_enc, sk_salt, sk_iv, "
@@ -3524,7 +3720,7 @@ async def delete_account_password(update: Update, ctx: ContextTypes.DEFAULT_TYPE
     if not u:
         await update.message.reply_text("User not found\\.", parse_mode="MarkdownV2", reply_markup=kb_main())
         return TOTP_MENU
-    if not hmac.compare_digest(hash_pw(pw, bytes(u["pw_salt"]), u["kdf_type"] or "pbkdf2"), bytes(u["password_hash"])):
+    if not hmac.compare_digest(hash_pw(pw, bytes(u["pw_salt"])), bytes(u["password_hash"])):
         await update.message.reply_text(
             "❌ *Wrong password\\.* Account deletion cancelled\\.",
             parse_mode="MarkdownV2",
@@ -3595,17 +3791,25 @@ async def delete_account_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
 
 # ── GLOBAL AUTO-DETECT ──────────────────────────────────────
 async def global_auto_detect(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """
+    Handles QR/secret detection outside conversation state.
+    Also auto-deletes ANY incoming private message (text, photo, document, etc.)
+    after 30 seconds to prevent sensitive data accumulating in chat.
+    """
     if not update.message:
         return
     uid   = update.effective_user.id
     vault = get_session(uid)
     pw    = ctx.user_data.get("password")
+    # Auto-delete the incoming message after 30s regardless of content
     asyncio.create_task(auto_delete_msg(update.message, delay=30))
+    # Update last_seen for every message interaction
     if vault:
         update_last_seen(uid)
     if not vault or not pw:
         return
 
+    # ── # quick search (e.g. "#google") ────────────────────────
     if update.message.text and update.message.text.strip().startswith("#"):
         query = update.message.text.strip().lstrip("#").strip().lower()
         if query:
@@ -3627,13 +3831,13 @@ async def global_auto_detect(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     ]),
                 )
                 return
-            vault_key = _get_vault_key(vault, pw)
             entries = []
             for i, row in enumerate(matched, 1):
                 try:
-                    secret   = decrypt(row["secret_enc"], row["salt"], row["iv"], vault_key, vault)
+                    secret   = decrypt(row["secret_enc"], row["salt"], row["iv"], pw, vault)
                     note     = (row["note"] or "").strip()
                     code, remain, next_code = generate_code(secret)
+                    code_fmt  = code
                     time_line = f"{bar(remain)} {remain}s"
                     nf = next_code if next_code else ""
                     name_line = f"*{i}\\. {em(row['name'])}*"
@@ -3660,12 +3864,14 @@ async def global_auto_detect(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 ]),
             )
             return
+    # ── end # search ──────────────────────────────────────────
 
     if ctx.user_data.get("_global_add") and update.message.text:
         raw_name = update.message.text.strip()
         secret   = ctx.user_data.pop("pending_secret", None)
         ctx.user_data.pop("_global_add", None)
         if raw_name and secret:
+            # Rate limit check
             if not check_totp_add_rate(vault):
                 await update.message.reply_text(
                     f"⚠️ *Too many accounts added\\.*\n\n"
@@ -3674,6 +3880,7 @@ async def global_auto_detect(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     reply_markup=kb_main(),
                 )
                 return
+            # Name length check
             if len(raw_name) > TOTP_NAME_MAX_LEN:
                 await update.message.reply_text(
                     f"⚠️ Name too long\\. Maximum *{TOTP_NAME_MAX_LEN}* characters\\.\n\nPlease try again with a shorter name:",
@@ -3727,7 +3934,9 @@ async def global_add_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await q.edit_message_text("❌ Cancelled\\.", parse_mode="MarkdownV2", reply_markup=kb_main())
 
 # ── CANCEL / MENU ───────────────────────────────────────────
+# ── AUTO-DELETE USER MESSAGES ──────────────────────────────
 async def auto_delete_msg(message, delay: int = 30):
+    """Delete a message after `delay` seconds. Used for sensitive inputs."""
     await asyncio.sleep(delay)
     try:
         await message.delete()
@@ -3736,6 +3945,7 @@ async def auto_delete_msg(message, delay: int = 30):
 
 # ── SEARCH TOTP ────────────────────────────────────────────
 async def search_totp_open(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Open the search prompt for TOTP accounts."""
     q = update.callback_query
     await q.answer()
     uid   = update.effective_user.id
@@ -3756,7 +3966,9 @@ async def search_totp_open(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     return SEARCH_TOTP_INPUT
 
 async def search_totp_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Handle the search query and show matching TOTP accounts."""
     text = update.message.text.strip()
+    # Auto-delete the user's search message after 30s
     asyncio.create_task(auto_delete_msg(update.message, delay=30))
     uid   = update.effective_user.id
     vault = get_session(uid)
@@ -3764,6 +3976,7 @@ async def search_totp_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not vault or not pw:
         await update.message.reply_text("Session expired\\. /start", parse_mode="MarkdownV2")
         return AUTH_MENU
+    # Remove leading '#' and clean query
     query = text.lstrip("#").strip().lower()
     if not query:
         await update.message.reply_text(
@@ -3776,6 +3989,7 @@ async def search_totp_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "SELECT id, name, issuer, secret_enc, salt, iv, note, account_type, hotp_counter "
             "FROM totp_accounts WHERE vault_id=? ORDER BY name", (vault,)
         ).fetchall()
+    # Match against name and note (case-insensitive)
     matched = [
         r for r in rows
         if query in (r["name"] or "").lower() or query in (r["note"] or "").lower()
@@ -3790,13 +4004,13 @@ async def search_totp_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             ]),
         )
         return TOTP_MENU
-    vault_key = _get_vault_key(vault, pw)
     entries = []
     for i, row in enumerate(matched, 1):
         try:
-            secret = decrypt(row["secret_enc"], row["salt"], row["iv"], vault_key, vault)
+            secret = decrypt(row["secret_enc"], row["salt"], row["iv"], pw, vault)
             note     = (row["note"] or "").strip()
             code, remain, next_code = generate_code(secret)
+            code_fmt  = code
             time_line = f"{bar(remain)} {remain}s"
             next_line = f"Next code: `{next_code}`" if next_code else ""
             note_line = f"Note: {em(note)}" if note else ""
@@ -3828,6 +4042,7 @@ async def search_totp_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 # ── ADMIN: helpers ──────────────────────────────────────────
 def _is_admin_msg(update: Update) -> bool:
+    """True if the message comes from the configured admin group."""
     return (
         ADMIN_GROUP_ID != 0
         and update.effective_chat is not None
@@ -3849,6 +4064,7 @@ def _admin_decrypt(payload: bytes, password: str) -> bytes:
     return AESGCM(_admin_full_export_key(password, salt)).decrypt(iv, ct, None)
 
 def _get_user_by_username(username: str):
+    """Resolve @username -> user row using stored tg_username column."""
     uname = username.lstrip("@").lower()
     with get_db() as c:
         return c.execute(
@@ -3856,8 +4072,9 @@ def _get_user_by_username(username: str):
         ).fetchone()
 
 def _resolve_user(raw: str):
+    """Resolve vault_id, telegram_id, or @username to a user row."""
     raw = raw.strip()
-    u   = get_user(raw.lower())
+    u   = get_user(raw.lower())           # vault_id
     if u: return u
     if raw.isdigit():
         with get_db() as c:
@@ -3869,6 +4086,7 @@ def _resolve_user(raw: str):
     return None
 
 def _fmt_user_info(u) -> str:
+    """Build the admin /user info block. Returns plain text (not Markdown)."""
     try:
         vault_id    = u["vault_id"]
         tid         = u["telegram_id"]
@@ -3879,6 +4097,7 @@ def _fmt_user_info(u) -> str:
             tg_username = ""
         username_str = f"@{tg_username}" if tg_username else f"(no username, ID: {tid})"
         created_at  = fmt_bd_time(u["created_at"]) if u["created_at"] else "N/A"
+        # Last seen: show time + how long ago for accuracy
         try:
             ls_ts = u["last_seen"]
             if ls_ts:
@@ -3917,12 +4136,14 @@ def _fmt_user_info(u) -> str:
             ra = c.execute(
                 "SELECT attempts FROM reset_attempts WHERE vault_id=?", (vault_id,)
             ).fetchone()
+        # Backup Reminder status — default is ON/Weekly if no row exists
         if br is None:
             reminder_status = "On - Weekly (default)"
         elif br["enabled"]:
             reminder_status = f"On - {br['frequency'].capitalize()}"
         else:
             reminder_status = "Off"
+        # Offline Auto Backup status
         auto_backup_status = "Off"
         if ab and ab["enabled"]:
             auto_backup_status = f"On - {ab['frequency'].capitalize()}"
@@ -3948,8 +4169,13 @@ def _fmt_user_info(u) -> str:
 
 # ── ADMIN COMMANDS ──────────────────────────────────────────
 async def admin_maintenance(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """
+    /maintenance on   -- enable maintenance mode
+    /maintenance off  -- disable maintenance mode
+    """
     if not _is_admin_msg(update):
         return
+    # Strip bot @mention from group commands: "/maintenance@Bot on" -> state="on"
     raw_text     = (update.message.text or "").strip()
     command_part = raw_text.split()[0] if raw_text else ""
     state        = raw_text[len(command_part):].strip().lower()
@@ -3968,8 +4194,10 @@ async def admin_maintenance(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     asyncio.create_task(auto_delete_msg(update.message, delay=60))
 
 async def admin_signup_toggle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/signup on|off"""
     if not _is_admin_msg(update):
         return
+    # Strip bot @mention from group command text
     raw_text     = (update.message.text or "").strip()
     command_part = raw_text.split()[0] if raw_text else ""
     state        = raw_text[len(command_part):].strip().lower()
@@ -3986,8 +4214,10 @@ async def admin_signup_toggle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     asyncio.create_task(auto_delete_msg(update.message, delay=60))
 
 async def admin_login_toggle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/login on|off"""
     if not _is_admin_msg(update):
         return
+    # Strip bot @mention from group command text
     raw_text     = (update.message.text or "").strip()
     command_part = raw_text.split()[0] if raw_text else ""
     state        = raw_text[len(command_part):].strip().lower()
@@ -4004,12 +4234,17 @@ async def admin_login_toggle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     asyncio.create_task(auto_delete_msg(update.message, delay=60))
 
 async def admin_user_info(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/user <vault_id|telegram_id|@username>"""
     if not _is_admin_msg(update):
         return
     asyncio.create_task(auto_delete_msg(update.message, delay=60))
+    # In groups, Telegram appends @BotUsername to the command: "/user@BotName arg"
+    # So we must strip the bot mention before extracting the argument.
     raw_text = (update.message.text or "").strip()
-    command_part = raw_text.split()[0] if raw_text else ""
-    arg_part = raw_text[len(command_part):].strip()
+    # Remove the command prefix including any @mention: "/user@BotName" -> ""
+    # Then grab everything after the first whitespace as the argument.
+    command_part = raw_text.split()[0] if raw_text else ""   # e.g. "/user" or "/user@BotName"
+    arg_part = raw_text[len(command_part):].strip()          # everything after the command
     if not arg_part:
         msg = await update.message.reply_text(
             "Usage: /user <vault_id | telegram_id | @username>"
@@ -4031,13 +4266,15 @@ async def admin_user_info(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         asyncio.create_task(auto_delete_msg(msg, delay=60))
 
 async def admin_account_disable(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/account disable|enable <vault_id|tid|@username>"""
     if not _is_admin_msg(update):
         return
     asyncio.create_task(auto_delete_msg(update.message, delay=60))
+    # Strip bot @mention from group command text: "/account@BotName disable arg" -> "disable arg"
     raw_text     = (update.message.text or "").strip()
     command_part = raw_text.split()[0] if raw_text else ""
-    arg_str      = raw_text[len(command_part):].strip()
-    arg_parts    = arg_str.split(None, 1)
+    arg_str      = raw_text[len(command_part):].strip()   # "disable abc123" or "enable @user"
+    arg_parts    = arg_str.split(None, 1)                 # ["disable", "abc123"]
     if len(arg_parts) < 2 or arg_parts[0].lower() not in ("disable", "enable"):
         msg = await update.message.reply_text(
             "Usage: /account disable <vault_id|tid|@username>\n"
@@ -4084,6 +4321,7 @@ async def admin_account_disable(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         logger.warning(f"Could not notify user {u['telegram_id']}: {e}")
 
 async def admin_broadcast(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/broadcast <message>  OR  reply to a message with /broadcast"""
     if not _is_admin_msg(update):
         return
     asyncio.create_task(auto_delete_msg(update.message, delay=60))
@@ -4110,6 +4348,10 @@ async def admin_broadcast(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     asyncio.create_task(auto_delete_msg(msg, delay=60))
 
 async def admin_export(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """
+    /export <password>
+    Exports the entire DB as an encrypted .bvadmin file to the admin group.
+    """
     if not _is_admin_msg(update):
         return
     asyncio.create_task(auto_delete_msg(update.message, delay=60))
@@ -4149,9 +4391,11 @@ async def admin_export(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ),
     )
 
-_admin_import_pending: dict = {}
+# Admin import state: waiting for the .bvadmin file
+_admin_import_pending: dict = {}   # chat_id → {"password": str}
 
 async def admin_import(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/import  -- starts the import process in the admin group."""
     if not _is_admin_msg(update):
         return
     asyncio.create_task(auto_delete_msg(update.message, delay=60))
@@ -4163,6 +4407,7 @@ async def admin_import(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     asyncio.create_task(auto_delete_msg(msg, delay=60))
 
 async def admin_import_file_recv(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Receive the .bvadmin file in admin group during /import flow."""
     if not _is_admin_msg(update):
         return
     chat_id = update.effective_chat.id
@@ -4184,6 +4429,7 @@ async def admin_import_file_recv(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
     asyncio.create_task(auto_delete_msg(msg, delay=60))
 
 async def admin_import_password(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Receive the decryption password for admin import."""
     if not _is_admin_msg(update):
         return
     chat_id = update.effective_chat.id
@@ -4191,6 +4437,7 @@ async def admin_import_password(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if state.get("step") != "wait_password":
         return
     password = update.message.text.strip()
+    # Delete the password message immediately
     try:
         await update.message.delete()
     except Exception:
@@ -4220,6 +4467,7 @@ async def admin_import_password(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 except Exception as e:
                     logger.warning(f"Admin import row into {tbl}: {e}")
         c.commit()
+    # Reload bot settings from DB
     _load_bot_settings()
     await ctx.bot.send_message(
         chat_id=chat_id,
@@ -4227,6 +4475,7 @@ async def admin_import_password(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 async def admin_userall_export(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/userall -- send a .txt file listing all users with @username."""
     if not _is_admin_msg(update):
         return
     asyncio.create_task(auto_delete_msg(update.message, delay=60))
@@ -4261,6 +4510,7 @@ async def admin_userall_export(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 # ── OFFLINE AUTO BACKUP ────────────────────────────────────
 async def offline_auto_backup_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Show Offline Auto Backup settings page."""
     q   = update.callback_query
     await q.answer()
     uid = update.effective_user.id
@@ -4295,6 +4545,7 @@ async def offline_auto_backup_menu(update: Update, ctx: ContextTypes.DEFAULT_TYP
     return TOTP_MENU
 
 async def oab_toggle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Toggle offline auto-backup on/off."""
     q   = update.callback_query
     await q.answer()
     uid = update.effective_user.id
@@ -4309,6 +4560,7 @@ async def oab_toggle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             (uid, new_enabled),
         )
         c.commit()
+    # When enabling, immediately store the current password so backup works from this session
     if new_enabled == 1:
         pw    = ctx.user_data.get("password")
         vault = get_session(uid)
@@ -4317,6 +4569,7 @@ async def oab_toggle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     return await offline_auto_backup_menu(update, ctx)
 
 async def oab_freq(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Switch auto-backup frequency between weekly and monthly."""
     q   = update.callback_query
     await q.answer()
     uid = update.effective_user.id
@@ -4336,10 +4589,16 @@ async def oab_freq(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def run_auto_backup_for_user(bot, tid: int, vault_id: str, freq_label: str):
+    """
+    Build and send an encrypted .bvault backup to a user's Telegram chat.
+    Password is loaded from DB (encrypted). Falls back to RAM cache if DB not yet populated.
+    """
     try:
+        # Load password: prefer RAM cache (fresher), fall back to DB store
         live_pw = _session_pw_cache.get(vault_id) or _oab_load_password(tid, vault_id)
 
         if not live_pw:
+            # Password not available at all — user never logged in after feature was added
             try:
                 import zoneinfo
                 bd_now = datetime.datetime.now(tz=zoneinfo.ZoneInfo(BD_TZ))
@@ -4357,6 +4616,7 @@ async def run_auto_backup_for_user(bot, tid: int, vault_id: str, freq_label: str
                 ),
                 parse_mode="MarkdownV2",
             )
+            # Mark as attempted so we don't spam every hour
             col = "last_weekly" if freq_label == "weekly" else "last_monthly"
             with get_db() as c:
                 c.execute(
@@ -4378,11 +4638,10 @@ async def run_auto_backup_for_user(bot, tid: int, vault_id: str, freq_label: str
             logger.info(f"Auto-backup: no TOTP accounts for vault {vault_id}, skipping.")
             return
 
-        vault_key = _get_vault_key(vault_id, live_pw)
         entries = []
         for row in totp_rows:
             try:
-                secret = decrypt(row["secret_enc"], row["salt"], row["iv"], vault_key, vault_id)
+                secret = decrypt(row["secret_enc"], row["salt"], row["iv"], live_pw, vault_id)
                 entries.append({
                     "name":         row["name"],
                     "issuer":       row["issuer"] or "",
@@ -4396,6 +4655,8 @@ async def run_auto_backup_for_user(bot, tid: int, vault_id: str, freq_label: str
 
         if not entries:
             logger.warning(f"Auto-backup: all decrypt failed for vault {vault_id} — password may have changed")
+            # Password mismatch means user changed password without triggering a new store.
+            # Clear the stale DB password so next login re-stores the correct one.
             with get_db() as c:
                 c.execute(
                     "UPDATE auto_backup_settings SET pw_enc=NULL, pw_salt=NULL, pw_iv=NULL "
@@ -4424,7 +4685,7 @@ async def run_auto_backup_for_user(bot, tid: int, vault_id: str, freq_label: str
         bio      = BytesIO(payload)
         bio.name = filename
 
-        AUTO_DELETE_SECONDS = 3 * 24 * 3600
+        AUTO_DELETE_SECONDS = 3 * 24 * 3600   # 3 days
 
         msg = await bot.send_document(
             chat_id=tid,
@@ -4442,6 +4703,7 @@ async def run_auto_backup_for_user(bot, tid: int, vault_id: str, freq_label: str
             parse_mode="MarkdownV2",
         )
 
+        # Schedule auto-delete after 3 days
         async def _auto_delete_backup():
             await asyncio.sleep(AUTO_DELETE_SECONDS)
             try:
@@ -4450,6 +4712,7 @@ async def run_auto_backup_for_user(bot, tid: int, vault_id: str, freq_label: str
                 pass
         asyncio.create_task(_auto_delete_backup())
 
+        # Update last sent timestamp
         col = "last_weekly" if freq_label == "weekly" else "last_monthly"
         with get_db() as c:
             c.execute(
@@ -4465,18 +4728,26 @@ async def run_auto_backup_for_user(bot, tid: int, vault_id: str, freq_label: str
 
 
 async def send_auto_backups(app):
+    """
+    Job callback: check who needs a weekly or monthly auto-backup and send it.
+    Weekly:  Every Saturday, BD time 20:00
+    Monthly: First Sunday of month, BD time 18:00
+    Runs every 5 minutes; checks if current BDT time is within the target window.
+    """
     try:
         import zoneinfo
         now_bd = datetime.datetime.now(tz=zoneinfo.ZoneInfo(BD_TZ))
     except Exception:
         now_bd = datetime.datetime.utcnow() + datetime.timedelta(hours=6)
 
-    weekday = now_bd.weekday()
+    weekday = now_bd.weekday()   # Monday=0, Saturday=5, Sunday=6
     hour    = now_bd.hour
     minute  = now_bd.minute
     day     = now_bd.day
 
+    # Weekly window:  Saturday 20:00-20:09 BDT
     is_weekly_window  = (weekday == 5 and hour == 20 and minute < 10)
+    # Monthly window: first Sunday (day<=7) 18:00-18:09 BDT
     is_monthly_window = (weekday == 6 and day <= 7 and hour == 18 and minute < 10)
 
     if not is_weekly_window and not is_monthly_window:
@@ -4497,6 +4768,9 @@ async def send_auto_backups(app):
         if not u:
             continue
         vault_id = u["vault_id"]
+        # Always send to vault owner (owner_tid). The file is encrypted with the owner's
+        # password, so only they can open it. Sending to a random active session risks
+        # delivering to a device the owner may no longer use.
         tid = owner_tid
 
         if is_weekly_window and freq == "weekly":
@@ -4512,6 +4786,7 @@ async def send_auto_backups(app):
 
 # ── BACKUP REMINDER ─────────────────────────────────────────
 async def backup_reminder_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Show backup reminder settings from Settings menu."""
     q   = update.callback_query
     await q.answer()
     uid = update.effective_user.id
@@ -4549,6 +4824,7 @@ async def backup_rem_toggle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     with get_db() as c:
         row = c.execute("SELECT enabled FROM backup_reminders WHERE telegram_id=?", (uid,)).fetchone()
+        # Default is enabled=1 (on). If no row, current state is ON, so toggling means OFF.
         current = bool(row["enabled"]) if row else True
         new_enabled = 0 if current else 1
         c.execute(
@@ -4576,10 +4852,16 @@ async def backup_rem_freq(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     return await backup_reminder_menu(update, ctx)
 
 async def send_backup_reminders(app):
+    """
+    Job callback: send backup reminders to users who are due.
+    Called by job queue once per day.
+    Default state: enabled=1, weekly. Users with no row in backup_reminders get weekly reminders.
+    """
     now     = int(time.time())
     week_s  = 7  * 24 * 3600
     month_s = 30 * 24 * 3600
 
+    # Get all users; LEFT JOIN with backup_reminders to include users with no preference row
     with get_db() as c:
         rows = c.execute("""
             SELECT u.telegram_id,
@@ -4737,13 +5019,17 @@ def main():
                 CallbackQueryHandler(edit_action,           pattern=r"^edit_action_(rename|delete|showsecret|note)$"),
                 CallbackQueryHandler(edit_delete_confirm,   pattern="^edit_action_delete_confirm$"),
                 CallbackQueryHandler(global_add_cancel,     pattern="^global_add_cancel$"),
+                # Backup reminder
                 CallbackQueryHandler(backup_reminder_menu,    pattern="^backup_reminder$"),
                 CallbackQueryHandler(backup_rem_toggle,       pattern="^backup_rem_toggle$"),
                 CallbackQueryHandler(backup_rem_freq,         pattern="^backup_rem_freq$"),
+                # Offline Auto Backup
                 CallbackQueryHandler(offline_auto_backup_menu, pattern="^offline_auto_backup$"),
                 CallbackQueryHandler(oab_toggle,               pattern="^oab_toggle$"),
                 CallbackQueryHandler(oab_freq,                 pattern="^oab_freq$"),
+                # Import override
                 CallbackQueryHandler(import_override_cb,    pattern="^import_mode_(skip|replace)$"),
+                # Share Codes
                 CallbackQueryHandler(share_codes_open,      pattern="^share_codes_open$"),
                 CallbackQueryHandler(share_toggle,          pattern=r"^share_toggle_\d+$"),
                 CallbackQueryHandler(share_generate,        pattern="^share_generate$"),
@@ -4854,15 +5140,18 @@ def main():
         per_chat=True,
     )
 
+    # ── User (private) handlers ────────────────────────────────
     app.add_handler(conv)
     app.add_handler(CallbackQueryHandler(global_add_cancel,   pattern="^global_add_cancel$"))
     app.add_handler(CallbackQueryHandler(handle_alert_ack,    pattern="^alert_ack_"))
     app.add_handler(CallbackQueryHandler(handle_alert_logout, pattern="^alert_logout_"))
+    # Auto-delete all incoming private messages (photos, docs, text outside conversation)
     app.add_handler(MessageHandler(
         private & (filters.PHOTO | filters.Document.ALL | filters.TEXT) & ~filters.COMMAND,
         global_auto_detect,
     ))
 
+    # ── Admin (group) commands ─────────────────────────────────
     if ADMIN_GROUP_ID != 0:
         admin_filter = filters.Chat(chat_id=ADMIN_GROUP_ID)
         app.add_handler(CommandHandler("maintenance",  admin_maintenance,     filters=admin_filter))
@@ -4874,6 +5163,7 @@ def main():
         app.add_handler(CommandHandler("export",       admin_export,          filters=admin_filter))
         app.add_handler(CommandHandler("import",       admin_import,          filters=admin_filter))
         app.add_handler(CommandHandler("userall",      admin_userall_export,  filters=admin_filter))
+        # Admin import: receive file and password in group
         app.add_handler(MessageHandler(
             admin_filter & filters.Document.ALL, admin_import_file_recv
         ))
@@ -4881,6 +5171,7 @@ def main():
             admin_filter & filters.TEXT & ~filters.COMMAND, admin_import_password
         ))
 
+    # ── Job queue: daily backup reminders + hourly auto-backup ──
     jq = app.job_queue
     if jq:
         async def _reminder_job(ctx2):
@@ -4895,6 +5186,7 @@ def main():
             first=60,
             name="backup_reminder_job",
         )
+        # Auto-backup: runs every 5 minutes, checks if it's the right BDT time window
         jq.run_repeating(
             _autobackup_job,
             interval=300,
