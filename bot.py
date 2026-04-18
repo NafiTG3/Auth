@@ -498,8 +498,11 @@ def init_db():
 def _load_bot_settings(conn=None):
     """Load persisted settings from DB into in-memory dict."""
     try:
-        db = conn if conn else get_db()
-        rows = db.execute("SELECT key, value FROM bot_settings").fetchall()
+        if conn:
+            rows = conn.execute("SELECT key, value FROM bot_settings").fetchall()
+        else:
+            with get_db() as c2:
+                rows = c2.execute("SELECT key, value FROM bot_settings").fetchall()
         for row in rows:
             if row["key"] in _bot_settings:
                 val = row["value"]
@@ -1676,7 +1679,7 @@ async def login_pw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 ).fetchall()
                 for row in totp_rows:
                     try:
-                        plain = decrypt(row["secret_enc"], row["salt"], row["iv"], pw, vid)
+                        plain = decrypt(row["secret_enc"], row["salt"], row["iv"], _get_vault_key(vid, pw), vid)
                         new_ct, new_s, new_iv = encrypt(plain, master_key, vid)
                         c.execute(
                             "UPDATE totp_accounts SET secret_enc=?, salt=?, iv=? WHERE id=?",
@@ -2240,7 +2243,7 @@ async def settings_reset_pw_confirm(update: Update, ctx: ContextTypes.DEFAULT_TY
             ).fetchall()
             for row in rows:
                 try:
-                    secret    = decrypt(row["secret_enc"], row["salt"], row["iv"], old_pw, vault)
+                    secret    = decrypt(row["secret_enc"], row["salt"], row["iv"], _get_vault_key(vault, old_pw), vault)
                     ct, s, iv = encrypt(secret, new_pw, vault)
                     c.execute("UPDATE totp_accounts SET secret_enc=?, salt=?, iv=? WHERE id=?",
                               (ct, s, iv, row["id"]))
@@ -2296,7 +2299,7 @@ async def view_secure_key_pw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not u:
         await update.message.reply_text("Session expired\\. /start", parse_mode="MarkdownV2", reply_markup=kb_auth())
         return AUTH_MENU
-    if not hmac.compare_digest(hash_pw(pw, bytes(u["pw_salt"])), bytes(u["password_hash"])):
+    if not hmac.compare_digest(hash_pw(pw, bytes(u["pw_salt"]), u["kdf_type"] or "pbkdf2"), bytes(u["password_hash"])):
         await update.message.reply_text(
             "❌ *Wrong password\\.*",
             parse_mode="MarkdownV2",
@@ -2457,7 +2460,7 @@ async def change_pw_old(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid   = update.effective_user.id
     vault = get_session(uid)
     u     = get_user(vault)
-    if not u or not hmac.compare_digest(hash_pw(pw, bytes(u["pw_salt"])), bytes(u["password_hash"])):
+    if not u or not hmac.compare_digest(hash_pw(pw, bytes(u["pw_salt"]), u["kdf_type"] or "pbkdf2"), bytes(u["password_hash"])):
         await update.message.reply_text(
             "❌ Wrong password\\.",
             parse_mode="MarkdownV2",
@@ -2541,7 +2544,7 @@ async def change_pw_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             ).fetchall()
             for row in rows:
                 try:
-                    secret    = decrypt(row["secret_enc"], row["salt"], row["iv"], old_pw, vault)
+                    secret    = decrypt(row["secret_enc"], row["salt"], row["iv"], _get_vault_key(vault, old_pw), vault)
                     ct, s, iv = encrypt(secret, new_pw, vault)
                     c.execute("UPDATE totp_accounts SET secret_enc=?, salt=?, iv=? WHERE id=?",
                               (ct, s, iv, row["id"]))
@@ -2856,7 +2859,7 @@ async def _render_list_page(q_or_msg, vault: str, pw: str, page: int, is_edit: b
     entries = []
     for i, row in enumerate(chunk, start=page * TOTP_PER_PAGE + 1):
         try:
-            secret = decrypt(row["secret_enc"], row["salt"], row["iv"], pw, vault)
+            secret = decrypt(row["secret_enc"], row["salt"], row["iv"], _get_vault_key(vault, pw), vault)
             note     = (row["note"] or "").strip()
             code, remain, next_code = generate_code(secret)
 
@@ -3018,7 +3021,7 @@ async def share_generate(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     final_names = []
     for db_row in db_rows:
         try:
-            plain = decrypt(db_row["secret_enc"], db_row["salt"], db_row["iv"], pw, vault)
+            plain = decrypt(db_row["secret_enc"], db_row["salt"], db_row["iv"], _get_vault_key(vault, pw), vault)
             enc   = share_encrypt_secret(plain, token)
             secrets_enc.append(enc)
             final_ids.append(db_row["id"])
@@ -3310,7 +3313,7 @@ async def show_secret_pw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not u:
         await update.message.reply_text("Session expired\\. /start", parse_mode="MarkdownV2", reply_markup=kb_auth())
         return AUTH_MENU
-    if not hmac.compare_digest(hash_pw(pw, bytes(u["pw_salt"])), bytes(u["password_hash"])):
+    if not hmac.compare_digest(hash_pw(pw, bytes(u["pw_salt"]), u["kdf_type"] or "pbkdf2"), bytes(u["password_hash"])):
         await update.message.reply_text(
             "❌ *Wrong password\\.* Secret key not revealed\\.",
             parse_mode="MarkdownV2",
@@ -3334,7 +3337,7 @@ async def show_secret_pw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ctx.user_data.pop("edit_name", None)
         return TOTP_MENU
     try:
-        secret = decrypt(row["secret_enc"], row["salt"], row["iv"], pw, vault)
+        secret = decrypt(row["secret_enc"], row["salt"], row["iv"], _get_vault_key(vault, pw), vault)
     except Exception as e:
         logger.error(f"Decrypt for show_secret failed: {e}")
         await update.message.reply_text(
@@ -3390,7 +3393,7 @@ async def export_pw1_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid   = update.effective_user.id
     vault = get_session(uid)
     u     = get_user(vault)
-    if not u or not hmac.compare_digest(hash_pw(pw, bytes(u["pw_salt"])), bytes(u["password_hash"])):
+    if not u or not hmac.compare_digest(hash_pw(pw, bytes(u["pw_salt"]), u["kdf_type"] or "pbkdf2"), bytes(u["password_hash"])):
         await update.message.reply_text(
             "❌ Wrong account password\\.",
             parse_mode="MarkdownV2",
@@ -3436,7 +3439,7 @@ async def export_pw2_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     entries = []
     for row in rows:
         try:
-            secret = decrypt(row["secret_enc"], row["salt"], row["iv"], pw, vault)
+            secret = decrypt(row["secret_enc"], row["salt"], row["iv"], _get_vault_key(vault, pw), vault)
             entries.append({"name": row["name"], "issuer": row["issuer"] or "", "secret": secret})
         except Exception as e:
             logger.error(f"Export decrypt: {e}")
@@ -3616,7 +3619,7 @@ async def _do_import(update_or_cb, ctx, vault: str, accounts: list, mode: str = 
         undecryptable_names = set()
         for r in existing_rows:
             try:
-                plain = decrypt(r["secret_enc"], r["salt"], r["iv"], pw, vault)
+                plain = decrypt(r["secret_enc"], r["salt"], r["iv"], _get_vault_key(vault, pw), vault)
                 existing_secrets.add(hashlib.sha256(plain.encode()).hexdigest())
             except Exception as e:
                 logger.warning(f"Import duplicate check: decrypt failed for '{r['name']}': {e}")
@@ -3720,7 +3723,7 @@ async def delete_account_password(update: Update, ctx: ContextTypes.DEFAULT_TYPE
     if not u:
         await update.message.reply_text("User not found\\.", parse_mode="MarkdownV2", reply_markup=kb_main())
         return TOTP_MENU
-    if not hmac.compare_digest(hash_pw(pw, bytes(u["pw_salt"])), bytes(u["password_hash"])):
+    if not hmac.compare_digest(hash_pw(pw, bytes(u["pw_salt"]), u["kdf_type"] or "pbkdf2"), bytes(u["password_hash"])):
         await update.message.reply_text(
             "❌ *Wrong password\\.* Account deletion cancelled\\.",
             parse_mode="MarkdownV2",
@@ -3834,7 +3837,7 @@ async def global_auto_detect(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             entries = []
             for i, row in enumerate(matched, 1):
                 try:
-                    secret   = decrypt(row["secret_enc"], row["salt"], row["iv"], pw, vault)
+                    secret   = decrypt(row["secret_enc"], row["salt"], row["iv"], _get_vault_key(vault, pw), vault)
                     note     = (row["note"] or "").strip()
                     code, remain, next_code = generate_code(secret)
                     code_fmt  = code
@@ -4007,7 +4010,7 @@ async def search_totp_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     entries = []
     for i, row in enumerate(matched, 1):
         try:
-            secret = decrypt(row["secret_enc"], row["salt"], row["iv"], pw, vault)
+            secret = decrypt(row["secret_enc"], row["salt"], row["iv"], _get_vault_key(vault, pw), vault)
             note     = (row["note"] or "").strip()
             code, remain, next_code = generate_code(secret)
             code_fmt  = code
