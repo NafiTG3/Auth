@@ -10,6 +10,7 @@ from telegram.ext import (
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from argon2.low_level import hash_secret_raw, Type as Argon2Type
 from pyzbar.pyzbar import decode as qr_decode
 from PIL import Image
 
@@ -317,6 +318,10 @@ def init_db():
             tg_name       TEXT    DEFAULT '',
             tg_username   TEXT    DEFAULT '',
             timezone      TEXT    DEFAULT 'UTC',
+            kdf_type      TEXT    DEFAULT 'pbkdf2',
+            mk_enc        BLOB,
+            mk_salt       BLOB,
+            mk_iv         BLOB,
             created_at    INTEGER DEFAULT (strftime('%s','now')))""")
         c.execute("""CREATE TABLE IF NOT EXISTS sessions (
             telegram_id INTEGER PRIMARY KEY,
@@ -419,6 +424,21 @@ def init_db():
         for col, defval in [("tg_name", "''"), ("timezone", "'UTC'"), ("tg_username", "''")]:
             try:
                 c.execute(f"ALTER TABLE users ADD COLUMN {col} TEXT DEFAULT {defval}")
+            except Exception:
+                pass
+
+        # Argon2id + Master Key migration columns
+        for col, coltype, defval in [
+            ("kdf_type", "TEXT",    "'pbkdf2'"),
+            ("mk_enc",   "BLOB",    "NULL"),
+            ("mk_salt",  "BLOB",    "NULL"),
+            ("mk_iv",    "BLOB",    "NULL"),
+        ]:
+            try:
+                stmt = f"ALTER TABLE users ADD COLUMN {col} {coltype}"
+                if defval != "NULL":
+                    stmt += f" DEFAULT {defval}"
+                c.execute(stmt)
             except Exception:
                 pass
 
@@ -543,22 +563,107 @@ def gen_vault_id(telegram_id: int) -> str:
         num //= len(alphabet)
     return "".join(chars)
 
-def hash_pw(password: str, salt: bytes) -> bytes:
+# ── Argon2id parameters (OWASP recommended) ────────────────
+ARGON2_TIME_COST   = 3
+ARGON2_MEMORY_COST = 65536   # 64 MB
+ARGON2_PARALLELISM = 1
+ARGON2_HASH_LEN    = 32
+
+def _argon2id_hash(password: str, salt: bytes) -> bytes:
+    """Derive a 32-byte key/hash using Argon2id."""
+    return hash_secret_raw(
+        secret=password.encode(),
+        salt=salt,
+        time_cost=ARGON2_TIME_COST,
+        memory_cost=ARGON2_MEMORY_COST,
+        parallelism=ARGON2_PARALLELISM,
+        hash_len=ARGON2_HASH_LEN,
+        type=Argon2Type.ID,
+    )
+
+def hash_pw(password: str, salt: bytes, kdf: str = "argon2id") -> bytes:
+    """Hash password for authentication check.
+    kdf='argon2id' for new users, 'pbkdf2' for legacy compatibility."""
+    if kdf == "argon2id":
+        return _argon2id_hash(password, salt)
     return PBKDF2HMAC(algorithm=hashes.SHA256(), length=32, salt=salt, iterations=PBKDF2_ITER).derive(password.encode())
 
-def enc_key(password: str, vault_id: str, salt: bytes) -> bytes:
+def _pw_wrap_key(password: str, salt: bytes) -> bytes:
+    """Derive a 32-byte AES key from password to wrap/unwrap the master key.
+    Always uses Argon2id — the master key wrapping is always modern KDF."""
+    return _argon2id_hash(password, salt)
+
+def _pw_wrap_key_legacy(password: str, vault_id: str, salt: bytes) -> bytes:
+    """Legacy PBKDF2 key derivation for existing users without master key."""
     return PBKDF2HMAC(algorithm=hashes.SHA256(), length=32, salt=salt, iterations=PBKDF2_ITER).derive(
         (password + vault_id).encode() + SERVER_KEY
     )
 
-def encrypt(secret: str, password: str, vault_id: str):
+# ── Master Key helpers ──────────────────────────────────────
+def gen_master_key() -> bytes:
+    """Generate a fresh 32-byte random master key for a new vault."""
+    return os.urandom(32)
+
+def wrap_master_key(master_key: bytes, password: str) -> tuple:
+    """Encrypt master_key with password → (mk_enc, mk_salt, mk_iv)."""
     salt = os.urandom(16)
     iv   = os.urandom(12)
-    ct   = AESGCM(enc_key(password, vault_id, salt)).encrypt(iv, secret.encode(), None)
+    wrap_key = _pw_wrap_key(password, salt)
+    ct   = AESGCM(wrap_key).encrypt(iv, master_key, None)
     return ct, salt, iv
 
-def decrypt(ct, salt, iv, password, vault_id) -> str:
-    return AESGCM(enc_key(password, vault_id, bytes(salt))).decrypt(bytes(iv), bytes(ct), None).decode()
+def unwrap_master_key(mk_enc: bytes, mk_salt: bytes, mk_iv: bytes, password: str) -> bytes:
+    """Decrypt master_key using password."""
+    wrap_key = _pw_wrap_key(password, bytes(mk_salt))
+    return AESGCM(wrap_key).decrypt(bytes(mk_iv), bytes(mk_enc), None)
+
+def load_master_key(vault_id: str, password: str) -> bytes | None:
+    """Load and unwrap the master key for a vault. Returns None if not migrated yet."""
+    with get_db() as c:
+        row = c.execute(
+            "SELECT mk_enc, mk_salt, mk_iv FROM users WHERE vault_id=?", (vault_id,)
+        ).fetchone()
+    if not row or not row["mk_enc"]:
+        return None
+    try:
+        return unwrap_master_key(row["mk_enc"], row["mk_salt"], row["mk_iv"], password)
+    except Exception:
+        return None
+
+# ── Symmetric encryption (uses master_key) ─────────────────
+def enc_key(password: str, vault_id: str, salt: bytes) -> bytes:
+    """Legacy PBKDF2 key derivation — only used for old accounts without master key."""
+    return _pw_wrap_key_legacy(password, vault_id, salt)
+
+def encrypt(secret: str, password_or_mk: str | bytes, vault_id: str):
+    """Encrypt a secret.
+    If password_or_mk is bytes → it's a master_key (new path).
+    If str → it's a password (legacy path)."""
+    salt = os.urandom(16)
+    iv   = os.urandom(12)
+    if isinstance(password_or_mk, bytes):
+        # New path: master key directly as AES key (no KDF needed)
+        key = password_or_mk
+    else:
+        # Legacy path: derive key from password
+        key = enc_key(password_or_mk, vault_id, salt)
+    ct = AESGCM(key).encrypt(iv, secret.encode(), None)
+    return ct, salt, iv
+
+def decrypt(ct, salt, iv, password_or_mk: str | bytes, vault_id: str) -> str:
+    """Decrypt a secret.
+    If password_or_mk is bytes → master_key (new path).
+    If str → password (legacy path)."""
+    if isinstance(password_or_mk, bytes):
+        key = password_or_mk
+    else:
+        key = enc_key(password_or_mk, vault_id, bytes(salt))
+    return AESGCM(key).decrypt(bytes(iv), bytes(ct), None).decode()
+
+def _get_vault_key(vault_id: str, password: str) -> bytes | str:
+    """Return master_key (bytes) if available, else password (str) for legacy path."""
+    mk = load_master_key(vault_id, password)
+    return mk if mk is not None else password
 
 def export_enc_key(password: str, salt: bytes) -> bytes:
     return PBKDF2HMAC(algorithm=hashes.SHA256(), length=32, salt=salt, iterations=310_000).derive(password.encode())
@@ -625,7 +730,9 @@ def sk_decrypt_totp(sk_ct: bytes, sk_salt: bytes, sk_iv: bytes, secure_key_hex: 
     )
 
 def store_user_secure_key(vault_id: str, secure_key_hex: str, password: str):
-    ct, salt, iv = encrypt(secure_key_hex, password, vault_id)
+    """Store secure key encrypted with master_key (or password for legacy)."""
+    vault_key = _get_vault_key(vault_id, password)
+    ct, salt, iv = encrypt(secure_key_hex, vault_key, vault_id)
     with get_db() as c:
         c.execute(
             "UPDATE users SET sk_enc=?, sk_salt=?, sk_iv=? WHERE vault_id=?",
@@ -634,14 +741,16 @@ def store_user_secure_key(vault_id: str, secure_key_hex: str, password: str):
         c.commit()
 
 def load_user_secure_key(vault_id: str, password: str) -> str | None:
+    """Load and decrypt the secure key using master_key or password (legacy)."""
     with get_db() as c:
         row = c.execute(
             "SELECT sk_enc, sk_salt, sk_iv FROM users WHERE vault_id=?", (vault_id,)
         ).fetchone()
     if not row or not row["sk_enc"]:
         return None
+    vault_key = _get_vault_key(vault_id, password)
     try:
-        return decrypt(row["sk_enc"], row["sk_salt"], row["sk_iv"], password, vault_id)
+        return decrypt(row["sk_enc"], row["sk_salt"], row["sk_iv"], vault_key, vault_id)
     except Exception:
         return None
 
@@ -1258,13 +1367,20 @@ async def signup_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     tg_name     = ((update.effective_user.first_name or "") + " " + (update.effective_user.last_name or "")).strip()
     tg_username = update.effective_user.username or ""
 
+    # Generate master key for this vault (new architecture)
+    master_key       = gen_master_key()
+    mk_enc, mk_salt, mk_iv = wrap_master_key(master_key, pw)
+
     with get_db() as c:
         c.execute(
-            "INSERT INTO users (vault_id,telegram_id,password_hash,pw_salt,tg_name,tg_username) VALUES (?,?,?,?,?,?)",
-            (vid, uid, hash_pw(pw, salt), salt, tg_name, tg_username),
+            "INSERT INTO users (vault_id,telegram_id,password_hash,pw_salt,tg_name,tg_username,"
+            "kdf_type,mk_enc,mk_salt,mk_iv) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (vid, uid, hash_pw(pw, salt, "argon2id"), salt, tg_name, tg_username,
+             "argon2id", mk_enc, mk_salt, mk_iv),
         )
         c.commit()
 
+    # Store secure key encrypted with master_key (not password)
     secure_key = gen_secure_key()
     store_user_secure_key(vid, secure_key, pw)
     # Store HMAC verifier so secure key can be verified without password
@@ -1482,7 +1598,7 @@ async def login_pw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         return AUTH_MENU
 
-    if not hmac.compare_digest(hash_pw(pw, bytes(u["pw_salt"])), bytes(u["password_hash"])):
+    if not hmac.compare_digest(hash_pw(pw, bytes(u["pw_salt"]), u["kdf_type"] or "pbkdf2"), bytes(u["password_hash"])):
         # Record failed attempt and check freeze
         frozen = record_login_failure(vid)
         if frozen:
@@ -1536,6 +1652,51 @@ async def login_pw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # Record this login
     record_daily_login(uid)
     record_vault_login(uid, vid)
+
+    # ── Auto-upgrade legacy users to Argon2id + Master Key ──────
+    kdf_type = u["kdf_type"] or "pbkdf2"
+    has_mk   = bool(u["mk_enc"])
+    if kdf_type != "argon2id" or not has_mk:
+        try:
+            new_salt = os.urandom(16)
+            new_pw_hash = hash_pw(pw, new_salt, "argon2id")
+            master_key  = gen_master_key()
+            mk_enc, mk_salt, mk_iv = wrap_master_key(master_key, pw)
+            with get_db() as c:
+                c.execute(
+                    "UPDATE users SET password_hash=?, pw_salt=?, kdf_type=?, "
+                    "mk_enc=?, mk_salt=?, mk_iv=? WHERE vault_id=?",
+                    (new_pw_hash, new_salt, "argon2id", mk_enc, mk_salt, mk_iv, vid),
+                )
+                c.commit()
+            # Re-encrypt all TOTP secrets with master_key (migrate from password-based)
+            with get_db() as c:
+                totp_rows = c.execute(
+                    "SELECT id, secret_enc, salt, iv FROM totp_accounts WHERE vault_id=?", (vid,)
+                ).fetchall()
+                for row in totp_rows:
+                    try:
+                        plain = decrypt(row["secret_enc"], row["salt"], row["iv"], pw, vid)
+                        new_ct, new_s, new_iv = encrypt(plain, master_key, vid)
+                        c.execute(
+                            "UPDATE totp_accounts SET secret_enc=?, salt=?, iv=? WHERE id=?",
+                            (new_ct, new_s, new_iv, row["id"]),
+                        )
+                    except Exception as e:
+                        logger.error(f"MK migration TOTP {row['id']}: {e}")
+                # Also re-encrypt sk_enc (secure key) with master_key
+                sk = load_user_secure_key(vid, pw)  # load with old method before migration
+                if sk:
+                    sk_ct, sk_s, sk_iv = encrypt(sk, master_key, vid)
+                    c.execute(
+                        "UPDATE users SET sk_enc=?, sk_salt=?, sk_iv=? WHERE vault_id=?",
+                        (sk_ct, sk_s, sk_iv, vid),
+                    )
+                c.commit()
+            logger.info(f"Auto-upgraded vault {vid} to Argon2id + MasterKey")
+        except Exception as e:
+            logger.error(f"Auto-upgrade failed for {vid}: {e}")
+    # ────────────────────────────────────────────────────────────
 
     if uid != u["telegram_id"]:
         new_username = update.effective_user.username or str(uid)
@@ -1805,15 +1966,17 @@ async def reset_new_pw_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             # User skipped secure key: permanently delete ALL TOTP accounts
             c.execute("DELETE FROM totp_accounts WHERE vault_id=?", (vid,))
             deleted_cnt = len(rows)
-            # Generate a brand-new secure key for this vault
+            # Generate brand-new master key and secure key
             new_secure_key = gen_secure_key()
-            # Store new secure key encrypted with new password
-            ct_sk, s_sk, iv_sk = encrypt(new_secure_key, new_pw, vid)
-            # Store new verifier
+            new_master_key = gen_master_key()
+            new_mk_enc, new_mk_salt, new_mk_iv = wrap_master_key(new_master_key, new_pw)
+            ct_sk, s_sk, iv_sk = encrypt(new_secure_key, new_master_key, vid)
             new_verifier = hmac.new(SERVER_KEY, new_secure_key.encode(), hashlib.sha256).hexdigest()
             c.execute(
-                "UPDATE users SET password_hash=?, pw_salt=?, sk_enc=?, sk_salt=?, sk_iv=?, sk_verifier=? WHERE vault_id=?",
-                (hash_pw(new_pw, new_salt), new_salt, ct_sk, s_sk, iv_sk, new_verifier, vid),
+                "UPDATE users SET password_hash=?, pw_salt=?, kdf_type=?, "
+                "mk_enc=?, mk_salt=?, mk_iv=?, sk_enc=?, sk_salt=?, sk_iv=?, sk_verifier=? WHERE vault_id=?",
+                (hash_pw(new_pw, new_salt, "argon2id"), new_salt, "argon2id",
+                 new_mk_enc, new_mk_salt, new_mk_iv, ct_sk, s_sk, iv_sk, new_verifier, vid),
             )
             c.commit()
         elif secure_key:
@@ -1848,16 +2011,47 @@ async def reset_new_pw_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         # For sk_skipped path, password + new secure key already updated above.
         # For secure_key or no-sk-at-all paths, update password now.
         if not sk_skipped:
-            c.execute(
-                "UPDATE users SET password_hash=?, pw_salt=? WHERE vault_id=?",
-                (hash_pw(new_pw, new_salt), new_salt, vid),
-            )
-            if secure_key:
-                ct, s, iv = encrypt(secure_key, new_pw, vid)
+            ns = os.urandom(16)
+            # Check if user has master key - if so, need to re-wrap it
+            u_row = c.execute("SELECT mk_enc, mk_salt, mk_iv FROM users WHERE vault_id=?", (vid,)).fetchone()
+            if u_row and u_row["mk_enc"] and secure_key:
+                # Unauthenticated reset with secure key: we cannot unwrap old mk_enc
+                # (requires old password). Instead generate new master key and re-encrypt
+                # TOTP with it (we already have plaintext secrets from sk_decrypt above).
+                new_master_key = gen_master_key()
+                new_mk_enc, new_mk_salt, new_mk_iv = wrap_master_key(new_master_key, new_pw)
+                # Re-encrypt all already-re-encrypted TOTP secrets with new master key
+                totp_rows2 = c.execute(
+                    "SELECT id, secret_enc, salt, iv FROM totp_accounts WHERE vault_id=?", (vid,)
+                ).fetchall()
+                for tr in totp_rows2:
+                    try:
+                        # These are now encrypted with new_pw (done above), re-encrypt with mk
+                        plain2 = decrypt(tr["secret_enc"], tr["salt"], tr["iv"], new_pw, vid)
+                        nct, ns2, niv = encrypt(plain2, new_master_key, vid)
+                        c.execute("UPDATE totp_accounts SET secret_enc=?, salt=?, iv=? WHERE id=?",
+                                  (nct, ns2, niv, tr["id"]))
+                    except Exception:
+                        pass
+                # Store sk encrypted with new master key
+                sk_nct, sk_ns, sk_niv = encrypt(secure_key, new_master_key, vid)
                 c.execute(
-                    "UPDATE users SET sk_enc=?, sk_salt=?, sk_iv=? WHERE vault_id=?",
-                    (ct, s, iv, vid),
+                    "UPDATE users SET password_hash=?, pw_salt=?, kdf_type=?, "
+                    "mk_enc=?, mk_salt=?, mk_iv=?, sk_enc=?, sk_salt=?, sk_iv=? WHERE vault_id=?",
+                    (hash_pw(new_pw, ns, "argon2id"), ns, "argon2id",
+                     new_mk_enc, new_mk_salt, new_mk_iv, sk_nct, sk_ns, sk_niv, vid),
                 )
+            else:
+                c.execute(
+                    "UPDATE users SET password_hash=?, pw_salt=?, kdf_type=? WHERE vault_id=?",
+                    (hash_pw(new_pw, ns, "argon2id"), ns, "argon2id", vid),
+                )
+                if secure_key:
+                    ct, s, iv = encrypt(secure_key, new_pw, vid)
+                    c.execute(
+                        "UPDATE users SET sk_enc=?, sk_salt=?, sk_iv=? WHERE vault_id=?",
+                        (ct, s, iv, vid),
+                    )
             c.commit()
 
     for k in ("reset_vid", "reset_new_pw", "reset_otp_verified",
@@ -2016,46 +2210,58 @@ async def settings_reset_pw_confirm(update: Update, ctx: ContextTypes.DEFAULT_TY
         )
         return SETTINGS_RESET_PW
     with get_db() as c:
-        rows = c.execute(
-            "SELECT id, secret_enc, salt, iv FROM totp_accounts WHERE vault_id=?", (vault,)
-        ).fetchall()
-        for row in rows:
-            try:
-                secret    = decrypt(row["secret_enc"], row["salt"], row["iv"], old_pw, vault)
-                ct, s, iv = encrypt(secret, new_pw, vault)
-                sk = load_user_secure_key(vault, old_pw)
-                if sk:
-                    sk_ct, sk_s, sk_iv = sk_encrypt_totp(secret.encode(), sk, vault)
-                    c.execute(
-                        "UPDATE totp_accounts SET secret_enc=?, salt=?, iv=?, "
-                        "sk_enc=?, sk_salt=?, sk_iv=? WHERE id=?",
-                        (ct, s, iv, sk_ct, sk_s, sk_iv, row["id"]),
-                    )
-                else:
-                    c.execute(
-                        "UPDATE totp_accounts SET secret_enc=?, salt=?, iv=? WHERE id=?",
-                        (ct, s, iv, row["id"]),
-                    )
-            except Exception as e:
-                logger.error(f"Re-encrypt TOTP during settings reset: {e}")
-        new_salt = os.urandom(16)
-        c.execute(
-            "UPDATE users SET password_hash=?, pw_salt=? WHERE vault_id=?",
-            (hash_pw(new_pw, new_salt), new_salt, vault),
-        )
-        sk = load_user_secure_key(vault, old_pw)
-        if sk:
-            ct, s, iv = encrypt(sk, new_pw, vault)
-            c.execute(
-                "UPDATE users SET sk_enc=?, sk_salt=?, sk_iv=? WHERE vault_id=?",
-                (ct, s, iv, vault),
+        u = c.execute("SELECT mk_enc, mk_salt, mk_iv FROM users WHERE vault_id=?", (vault,)).fetchone()
+    if u and u["mk_enc"]:
+        # New architecture: only re-wrap master key
+        try:
+            master_key = unwrap_master_key(u["mk_enc"], u["mk_salt"], u["mk_iv"], old_pw)
+            new_mk_enc, new_mk_salt, new_mk_iv = wrap_master_key(master_key, new_pw)
+            ns = os.urandom(16)
+            with get_db() as c:
+                c.execute(
+                    "UPDATE users SET password_hash=?, pw_salt=?, kdf_type=?, "
+                    "mk_enc=?, mk_salt=?, mk_iv=? WHERE vault_id=?",
+                    (hash_pw(new_pw, ns, "argon2id"), ns, "argon2id",
+                     new_mk_enc, new_mk_salt, new_mk_iv, vault),
+                )
+                c.commit()
+        except Exception as e:
+            logger.error(f"settings_reset master key rewrap: {e}")
+            await update.message.reply_text(
+                "❌ Password reset failed\\. Please try again\\.",
+                parse_mode="MarkdownV2", reply_markup=kb_main()
             )
-        c.commit()
+            return TOTP_MENU
+    else:
+        # Legacy path
+        with get_db() as c:
+            rows = c.execute(
+                "SELECT id, secret_enc, salt, iv FROM totp_accounts WHERE vault_id=?", (vault,)
+            ).fetchall()
+            for row in rows:
+                try:
+                    secret    = decrypt(row["secret_enc"], row["salt"], row["iv"], old_pw, vault)
+                    ct, s, iv = encrypt(secret, new_pw, vault)
+                    c.execute("UPDATE totp_accounts SET secret_enc=?, salt=?, iv=? WHERE id=?",
+                              (ct, s, iv, row["id"]))
+                except Exception as e:
+                    logger.error(f"Re-encrypt TOTP settings_reset (legacy): {e}")
+            new_salt = os.urandom(16)
+            c.execute(
+                "UPDATE users SET password_hash=?, pw_salt=? WHERE vault_id=?",
+                (hash_pw(new_pw, new_salt, "argon2id"), new_salt, vault),
+            )
+            sk = load_user_secure_key(vault, old_pw)
+            if sk:
+                ct, s, iv = encrypt(sk, new_pw, vault)
+                c.execute("UPDATE users SET sk_enc=?, sk_salt=?, sk_iv=? WHERE vault_id=?",
+                          (ct, s, iv, vault))
+            c.commit()
     ctx.user_data["password"] = new_pw
-    _session_pw_cache[vault] = new_pw           # update RAM cache
-    _oab_store_password(uid, vault, new_pw)     # update DB encrypted store
+    _session_pw_cache[vault] = new_pw
+    _oab_store_password(uid, vault, new_pw)
     await update.message.reply_text(
-        "✅ *Password reset\\! All TOTP secrets re\\-encrypted\\.*",
+        "✅ *Password reset\\!*",
         parse_mode="MarkdownV2",
         reply_markup=kb_main(),
     )
@@ -2304,46 +2510,59 @@ async def change_pw_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     vault  = get_session(uid)
     old_pw = ctx.user_data.get("password", "")
     with get_db() as c:
-        rows = c.execute(
-            "SELECT id, secret_enc, salt, iv FROM totp_accounts WHERE vault_id=?", (vault,)
-        ).fetchall()
-        for row in rows:
-            try:
-                secret    = decrypt(row["secret_enc"], row["salt"], row["iv"], old_pw, vault)
-                ct, s, iv = encrypt(secret, new_pw, vault)
-                sk = load_user_secure_key(vault, old_pw)
-                if sk:
-                    sk_ct, sk_s, sk_iv = sk_encrypt_totp(secret.encode(), sk, vault)
-                    c.execute(
-                        "UPDATE totp_accounts SET secret_enc=?, salt=?, iv=?, "
-                        "sk_enc=?, sk_salt=?, sk_iv=? WHERE id=?",
-                        (ct, s, iv, sk_ct, sk_s, sk_iv, row["id"]),
-                    )
-                else:
-                    c.execute(
-                        "UPDATE totp_accounts SET secret_enc=?, salt=?, iv=? WHERE id=?",
-                        (ct, s, iv, row["id"]),
-                    )
-            except Exception as e:
-                logger.error(f"Re-encrypt TOTP during change_pw: {e}")
-        ns = os.urandom(16)
-        c.execute(
-            "UPDATE users SET password_hash=?, pw_salt=? WHERE vault_id=?",
-            (hash_pw(new_pw, ns), ns, vault),
-        )
-        sk = load_user_secure_key(vault, old_pw)
-        if sk:
-            ct, s, iv = encrypt(sk, new_pw, vault)
-            c.execute(
-                "UPDATE users SET sk_enc=?, sk_salt=?, sk_iv=? WHERE vault_id=?",
-                (ct, s, iv, vault),
+        u = c.execute("SELECT mk_enc, mk_salt, mk_iv, kdf_type, pw_salt, sk_enc, sk_salt, sk_iv "
+                      "FROM users WHERE vault_id=?", (vault,)).fetchone()
+    if u and u["mk_enc"]:
+        # New architecture: only re-wrap the master key with new password
+        try:
+            master_key = unwrap_master_key(u["mk_enc"], u["mk_salt"], u["mk_iv"], old_pw)
+            new_mk_enc, new_mk_salt, new_mk_iv = wrap_master_key(master_key, new_pw)
+            ns = os.urandom(16)
+            with get_db() as c:
+                c.execute(
+                    "UPDATE users SET password_hash=?, pw_salt=?, kdf_type=?, "
+                    "mk_enc=?, mk_salt=?, mk_iv=? WHERE vault_id=?",
+                    (hash_pw(new_pw, ns, "argon2id"), ns, "argon2id",
+                     new_mk_enc, new_mk_salt, new_mk_iv, vault),
+                )
+                c.commit()
+        except Exception as e:
+            logger.error(f"change_pw master key rewrap failed: {e}")
+            await update.message.reply_text(
+                "❌ Password change failed\\. Please try again\\.",
+                parse_mode="MarkdownV2", reply_markup=kb_main()
             )
-        c.commit()
+            return TOTP_MENU
+    else:
+        # Legacy path: re-encrypt all TOTP secrets and sk with new password
+        with get_db() as c:
+            rows = c.execute(
+                "SELECT id, secret_enc, salt, iv FROM totp_accounts WHERE vault_id=?", (vault,)
+            ).fetchall()
+            for row in rows:
+                try:
+                    secret    = decrypt(row["secret_enc"], row["salt"], row["iv"], old_pw, vault)
+                    ct, s, iv = encrypt(secret, new_pw, vault)
+                    c.execute("UPDATE totp_accounts SET secret_enc=?, salt=?, iv=? WHERE id=?",
+                              (ct, s, iv, row["id"]))
+                except Exception as e:
+                    logger.error(f"Re-encrypt TOTP during change_pw (legacy): {e}")
+            ns = os.urandom(16)
+            c.execute(
+                "UPDATE users SET password_hash=?, pw_salt=? WHERE vault_id=?",
+                (hash_pw(new_pw, ns, "argon2id"), ns, vault),
+            )
+            sk = load_user_secure_key(vault, old_pw)
+            if sk:
+                ct, s, iv = encrypt(sk, new_pw, vault)
+                c.execute("UPDATE users SET sk_enc=?, sk_salt=?, sk_iv=? WHERE vault_id=?",
+                          (ct, s, iv, vault))
+            c.commit()
     ctx.user_data["password"] = new_pw
-    _session_pw_cache[vault] = new_pw           # update RAM cache
-    _oab_store_password(uid, vault, new_pw)     # update DB encrypted store
+    _session_pw_cache[vault] = new_pw
+    _oab_store_password(uid, vault, new_pw)
     await update.message.reply_text(
-        "✅ *Password changed\\! All TOTP secrets re\\-encrypted\\.*",
+        "✅ *Password changed\\!*",
         parse_mode="MarkdownV2",
         reply_markup=kb_main(),
     )
@@ -2388,7 +2607,8 @@ async def _do_save_totp(update, vault, data, pw):
     # Auto-suffix name if duplicate, enforce max 20 chars
     final_name = _auto_suffix_name(vault, data["name"])
 
-    ct, salt, iv = encrypt(data["secret"], pw, vault)
+    vault_key = _get_vault_key(vault, pw)
+    ct, salt, iv = encrypt(data["secret"], vault_key, vault)
     sk = load_user_secure_key(vault, pw)
     if sk:
         sk_ct, sk_s, sk_iv = sk_encrypt_totp(data["secret"].encode(), sk, vault)
@@ -3413,7 +3633,8 @@ async def _do_import(update_or_cb, ctx, vault: str, accounts: list, mode: str = 
                 note     = (acc.get("note", "") or "")[:NOTE_MAX_LEN]
                 totp_now(secret)   # sanity check
                 secret_hash = hashlib.sha256(secret.encode()).hexdigest()
-                ct, s, iv = encrypt(secret, pw, vault)
+                vault_key = _get_vault_key(vault, pw)
+                ct, s, iv = encrypt(secret, vault_key, vault)
                 sk_ct = sk_s = sk_iv = None
                 if sk:
                     sk_ct, sk_s, sk_iv = sk_encrypt_totp(secret.encode(), sk, vault)
@@ -3672,7 +3893,8 @@ async def global_auto_detect(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 ctx.user_data["_global_add"]    = True
                 return
             name = _auto_suffix_name(vault, raw_name)
-            ct, salt, iv = encrypt(secret, pw, vault)
+            vault_key = _get_vault_key(vault, pw)
+            ct, salt, iv = encrypt(secret, vault_key, vault)
             sk = load_user_secure_key(vault, pw)
             if sk:
                 sk_ct, sk_s, sk_iv = sk_encrypt_totp(secret.encode(), sk, vault)
