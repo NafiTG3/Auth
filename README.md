@@ -33,7 +33,7 @@
 
 ## What is BlockVeil Authenticator?
 
-BV Authenticator is a Telegram bot that stores and generates your two-factor authentication (2FA / TOTP) codes. Instead of a separate app on your phone, everything lives inside a conversation with the bot, protected by strong end-to-end encryption.
+BlockVeil Authenticator is a Telegram bot that stores and generates your two-factor authentication (2FA / TOTP) codes. Instead of a separate app on your phone, everything lives inside a conversation with the bot, protected by strong end-to-end encryption.
 
 Your codes belong to you. The server never sees them.
 
