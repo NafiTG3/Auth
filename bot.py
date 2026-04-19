@@ -1004,6 +1004,7 @@ def kb_main():
         [InlineKeyboardButton("✏️ Edit TOTP",    callback_data="edit_totp"),
          InlineKeyboardButton("👤 Profile",       callback_data="profile")],
         [InlineKeyboardButton("⚙️ Settings",      callback_data="settings")],
+        [InlineKeyboardButton("☕ Buy me a coffee", callback_data="donate")],
     ])
 
 def kb_settings():
@@ -1011,6 +1012,7 @@ def kb_settings():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🔐 Security & Access",  callback_data="settings_security")],
         [InlineKeyboardButton("💾 Backup & Restore",   callback_data="settings_backup")],
+        [InlineKeyboardButton("☕ Buy me a Coffee",     callback_data="donate")],
         [InlineKeyboardButton("⚙️ Account",            callback_data="settings_account")],
         [InlineKeyboardButton("🏠 Main Menu",          callback_data="main_menu")],
     ])
@@ -2379,6 +2381,42 @@ async def logout(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     return AUTH_MENU
 
 # ── SETTINGS MENU ───────────────────────────────────────────
+# ── DONATE / SUPPORT ───────────────────────────────────────
+DONATE_ADDRESS = "0x8F2B6f5A3a7b4D9e1C6D0a2B5E8F3c7D4A1b6E9f"  # EVM address
+DONATE_LINK    = "https://nowpayments.io/donation/antonysrm"
+
+async def show_donate(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Show donation/support page with crypto address and NowPayments link."""
+    q = update.callback_query
+    await q.answer()
+    msg = (
+        "\u2615 *Support BV Authenticator*\n\n"
+        "\u0986\u09aa\u09a8\u09bf \u099a\u09be\u0987\u09b2\u09c7 \u09af\u09c7\u0995\u09cb\u09a8\u09cb chain\\-\u098f\u09b0 \u09af\u09c7\u0995\u09cb\u09a8\u09cb token "
+        "NowPayments\\-\u098f\u09b0 \u09ae\u09be\u09a7\u09cd\u09af\u09ae\u09c7 crypto \u09a6\u09bf\u09df\u09c7 easily donate \u0995\u09b0\u09a4\u09c7 \u09aa\u09be\u09b0\u09c7\u09a8, "
+        "\u0985\u09a5\u09ac\u09be \u09a8\u09bf\u099a\u09c7\u09b0 EVM address\\-\u098f "
+        "EVM Chain Supported coin donate \u0995\u09b0\u09a4\u09c7 \u09aa\u09be\u09b0\u09c7\u09a8\n\n"
+        "\U0001f4b3 *EVM Wallet Address:*\n"
+        f"`{DONATE_ADDRESS}`\n\n"
+        "_Tap the address to copy \u2022 Supports ETH, BNB, MATIC, USDT, USDC and any EVM token_"
+    )
+    await q.edit_message_text(
+        msg,
+        parse_mode="MarkdownV2",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton(
+                "\U0001f4b3 Address",
+                copy_text={"text": DONATE_ADDRESS},
+            )],
+            [InlineKeyboardButton(
+                "\U0001f4b8 Pay With NowPayments",
+                url=DONATE_LINK,
+            )],
+            [InlineKeyboardButton("\U0001f3e0 Home", callback_data="main_menu")],
+        ]),
+    )
+    return TOTP_MENU
+
+
 async def settings_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -2455,6 +2493,7 @@ async def show_profile(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         parse_mode="MarkdownV2",
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("🌐 Change Timezone", callback_data="change_tz")],
+            [InlineKeyboardButton("💰 Support Us",       callback_data="donate")],
             [InlineKeyboardButton("🏠 Main Menu",        callback_data="main_menu")],
         ]),
     )
@@ -4116,69 +4155,13 @@ def _admin_full_export_key(password: str, salt: bytes) -> bytes:
     ).derive(password.encode())
 
 def _admin_encrypt(data: bytes, password: str) -> bytes:
-    salt = os.urandom(16)
-    iv   = os.urandom(12)
+    salt = os.urandom(16); iv = os.urandom(12)
     ct   = AESGCM(_admin_full_export_key(password, salt)).encrypt(iv, data, None)
     return salt + iv + ct
 
 def _admin_decrypt(payload: bytes, password: str) -> bytes:
-    # BUG FIX: payload length not checked; short payload caused IndexError
-    if len(payload) < 29:
-        raise ValueError("Payload too short.")
-    salt = payload[:16]
-    iv   = payload[16:28]
-    ct   = payload[28:]
+    salt = payload[:16]; iv = payload[16:28]; ct = payload[28:]
     return AESGCM(_admin_full_export_key(password, salt)).decrypt(iv, ct, None)
-
-
-# ── SQLite file-level export / import ─────────────────────────────────────
-# Why raw SQLite binary instead of JSON:
-# json.dumps(default=str) converts BLOB columns (password_hash, pw_salt,
-# mk_enc, mk_salt, mk_iv, sk_enc, sk_salt, sk_iv) to Python repr strings.
-#   e.g.  b'\x12\xab' -> "b'\\x12\\xab'"
-# On import these come back as plain strings, not bytes. So:
-#   bytes(u["pw_salt"])    -> wrong bytes  -> login fails
-#   AESGCM decrypt(mk_enc) -> TypeError    -> master key unwrap fails
-#   sk_decrypt_totp(...)   -> fails        -> Secure Key verify fails
-# Raw SQLite binary has none of these problems.
-
-def _db_snapshot() -> bytes:
-    """Flush WAL and return a consistent snapshot of the SQLite DB."""
-    try:
-        with get_db() as c:
-            c.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-    except Exception as e:
-        logger.warning(f"WAL checkpoint failed (non-fatal): {e}")
-    with open(DB_PATH, "rb") as fh:
-        return fh.read()
-
-def _db_restore(raw_db: bytes):
-    """Validate and atomically write raw SQLite bytes to disk."""
-    if not raw_db.startswith(b"SQLite format 3\x00"):
-        raise ValueError("Not a valid SQLite database (magic bytes mismatch).")
-    if len(raw_db) < 100:
-        raise ValueError("File too small to be a valid SQLite database.")
-    # Remove WAL/SHM sidecars so SQLite does not get confused
-    for ext in ("-wal", "-shm"):
-        sidecar = DB_PATH + ext
-        try:
-            if os.path.exists(sidecar):
-                os.remove(sidecar)
-        except Exception as exc:
-            logger.warning(f"Could not remove {sidecar}: {exc}")
-    # Atomic write: temp file + os.replace
-    tmp = DB_PATH + "._import_tmp"
-    try:
-        with open(tmp, "wb") as fh:
-            fh.write(raw_db)
-        os.replace(tmp, DB_PATH)
-    except Exception:
-        try:
-            os.remove(tmp)
-        except Exception:
-            pass
-        with open(DB_PATH, "wb") as fh:
-            fh.write(raw_db)
 
 def _get_user_by_username(username: str):
     """Resolve @username -> user row using stored tg_username column."""
@@ -4467,254 +4450,129 @@ async def admin_broadcast(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def admin_export(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """
     /export <password>
-    Exports the full SQLite DB as an AES-256-GCM encrypted .bvadmin file.
-
-    Bugs fixed vs the old JSON approach:
-    1. BLOB corruption: JSON default=str turned bytes into repr strings,
-       breaking login, master key unwrap, TOTP decrypt, Secure Key verify.
-    2. Password with spaces was truncated (ctx.args[0] only took first word).
-    3. Export errors were not caught, causing silent failure.
+    Exports the entire DB as an encrypted .bvadmin file to the admin group.
     """
     if not _is_admin_msg(update):
         return
-    asyncio.create_task(auto_delete_msg(update.message, delay=30))
-
-    # BUG FIX: use raw text instead of ctx.args so "my pass" works as password
-    raw_text     = (update.message.text or "").strip()
-    command_part = raw_text.split()[0] if raw_text else ""
-    password     = raw_text[len(command_part):].strip()
-
-    if not password:
-        msg = await update.message.reply_text(
-            "Usage: /export <password>\n\n"
-            "Exports the full database as an encrypted .bvadmin file.\n"
-            "Use /import to restore. Keep ENCRYPTION_KEY same on new server."
-        )
+    asyncio.create_task(auto_delete_msg(update.message, delay=60))
+    if not ctx.args:
+        msg = await update.message.reply_text("Usage: /export <encryption_password>")
         asyncio.create_task(auto_delete_msg(msg, delay=60))
         return
-
-    try:
-        with get_db() as c:
-            total_users = c.execute("SELECT COUNT(*) AS n FROM users").fetchone()["n"]
-            total_totp  = c.execute("SELECT COUNT(*) AS n FROM totp_accounts").fetchone()["n"]
-    except Exception:
-        total_users = total_totp = 0
-
-    try:
-        raw_db  = _db_snapshot()
-        payload = _admin_encrypt(raw_db, password)
-    except Exception as e:
-        logger.error(f"admin_export error: {e}")
-        msg = await update.message.reply_text(f"\u274c Export failed: {e}")
-        asyncio.create_task(auto_delete_msg(msg, delay=60))
-        return
-
-    ts_str   = datetime.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-    fname    = f"bv_export_{ts_str}.bvadmin"
-    bio      = BytesIO(payload)
+    password = ctx.args[0]
+    tables = [
+        "users", "totp_accounts", "sessions", "reset_otps",
+        "reset_attempts", "login_alerts", "share_links",
+        "login_attempts", "backup_reminders", "bot_settings",
+        "auto_backup_settings",
+    ]
+    dump = {}
+    with get_db() as c:
+        for tbl in tables:
+            try:
+                rows = c.execute(f"SELECT * FROM {tbl}").fetchall()
+                dump[tbl] = [dict(r) for r in rows]
+            except Exception as e:
+                logger.warning(f"Admin export table {tbl}: {e}")
+    plain   = json.dumps(dump, ensure_ascii=False, default=str).encode()
+    payload = _admin_encrypt(plain, password)
+    ts_str  = datetime.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    fname   = f"bv_admin_export_{ts_str}.bvadmin"
+    bio     = BytesIO(payload)
     bio.name = fname
+    await update.message.reply_document(
+        document=bio,
+        filename=fname,
+        caption=(
+            f"🔒 BV Authenticator -- Full DB Export\n"
+            f"📅 {ts_str}\n"
+            f"🔑 Encrypted with the password you provided.\n\n"
+            f"Use /import to restore."
+        ),
+    )
 
-    try:
-        await update.message.reply_document(
-            document=bio,
-            filename=fname,
-            caption=(
-                f"\U0001f512 BV Authenticator \u2014 Full DB Export\n"
-                f"\U0001f4c5 {ts_str} UTC\n\n"
-                f"\U0001f465 Users: {total_users}\n"
-                f"\U0001f511 TOTP accounts: {total_totp}\n\n"
-                f"Full SQLite database \u2014 all data included.\n"
-                f"Use /import to restore.\n\n"
-                f"After import: users log in with their existing password.\n"
-                f"Password, TOTP, Secure Key \u2014 all work as before."
-            ),
-        )
-    except Exception as e:
-        logger.error(f"admin_export send failed: {e}")
-        msg = await update.message.reply_text(f"\u274c Failed to send file: {e}")
-        asyncio.create_task(auto_delete_msg(msg, delay=60))
-
-
-# Admin import state: chat_id -> {"step": "wait_file"|"wait_password", "payload": bytes}
-_admin_import_pending: dict = {}
-
+# Admin import state: waiting for the .bvadmin file
+_admin_import_pending: dict = {}   # chat_id → {"password": str}
 
 async def admin_import(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """/import -- starts the admin DB restore flow."""
+    """/import  -- starts the import process in the admin group."""
     if not _is_admin_msg(update):
         return
-    asyncio.create_task(auto_delete_msg(update.message, delay=30))
+    asyncio.create_task(auto_delete_msg(update.message, delay=60))
     chat_id = update.effective_chat.id
-    # BUG FIX: always reset state so a stale pending import does not block new one
     _admin_import_pending[chat_id] = {"step": "wait_file"}
     msg = await update.message.reply_text(
-        "\U0001f4e5 Admin DB Import\n\n"
-        "Step 1: Send the .bvadmin backup file now.\n\n"
-        "\u26a0\ufe0f WARNING: This replaces the ENTIRE database.\n"
-        "All current data will be overwritten."
+        "📥 Admin Import\n\nSend the .bvadmin backup file now."
     )
-    asyncio.create_task(auto_delete_msg(msg, delay=120))
-
+    asyncio.create_task(auto_delete_msg(msg, delay=60))
 
 async def admin_import_file_recv(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Step 1: receive and validate the .bvadmin file."""
+    """Receive the .bvadmin file in admin group during /import flow."""
     if not _is_admin_msg(update):
         return
     chat_id = update.effective_chat.id
     state   = _admin_import_pending.get(chat_id, {})
     if state.get("step") != "wait_file":
         return
-
     if not update.message.document:
-        msg = await update.message.reply_text(
-            "\u26a0\ufe0f Please send a .bvadmin file.\nType /import to start over."
-        )
+        msg = await update.message.reply_text("⚠️ Please send a .bvadmin file.")
         asyncio.create_task(auto_delete_msg(msg, delay=60))
         return
-
-    # BUG FIX: extension not checked before; any document was accepted
-    fname = (update.message.document.file_name or "").strip()
-    if not fname.lower().endswith(".bvadmin"):
-        msg = await update.message.reply_text(
-            "\u274c Invalid file. Only .bvadmin files are accepted.\n"
-            "Type /import to start over."
-        )
-        asyncio.create_task(auto_delete_msg(msg, delay=60))
-        return
-
-    # BUG FIX: no file size limit; large files could exhaust bot RAM
-    file_size = update.message.document.file_size or 0
-    if file_size > 512 * 1024 * 1024:
-        msg = await update.message.reply_text(
-            "\u274c File too large (max 512 MB).\nType /import to start over."
-        )
-        asyncio.create_task(auto_delete_msg(msg, delay=60))
-        _admin_import_pending.pop(chat_id, None)
-        return
-
-    asyncio.create_task(auto_delete_msg(update.message, delay=10))
-
-    try:
-        bio = BytesIO()
-        tg_file = await update.message.document.get_file()
-        await tg_file.download_to_memory(bio)
-        raw = bio.getvalue()
-    except Exception as e:
-        msg = await update.message.reply_text(
-            f"\u274c Failed to download file: {e}\nType /import to start over."
-        )
-        asyncio.create_task(auto_delete_msg(msg, delay=60))
-        _admin_import_pending.pop(chat_id, None)
-        return
-
-    # BUG FIX: minimum length enforced (need at least 28 bytes for AES header)
-    if len(raw) < 29:
-        msg = await update.message.reply_text(
-            "\u274c File too small or corrupted.\nType /import to start over."
-        )
-        asyncio.create_task(auto_delete_msg(msg, delay=60))
-        _admin_import_pending.pop(chat_id, None)
-        return
-
-    _admin_import_pending[chat_id] = {"step": "wait_password", "payload": raw}
+    asyncio.create_task(auto_delete_msg(update.message, delay=60))
+    bio = BytesIO()
+    f   = await update.message.document.get_file()
+    await f.download_to_memory(bio)
+    _admin_import_pending[chat_id] = {"step": "wait_password", "payload": bio.getvalue()}
     msg = await update.message.reply_text(
-        f"\u2705 File received ({len(raw) // 1024} KB).\n\n"
-        "Step 2: Send the encryption password used during export.\n"
-        "(Password message deleted immediately.)"
+        "🔒 File received. Now send the encryption password."
     )
-    asyncio.create_task(auto_delete_msg(msg, delay=90))
-
+    asyncio.create_task(auto_delete_msg(msg, delay=60))
 
 async def admin_import_password(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """
-    Step 2: decrypt the backup and fully replace the database.
-
-    All bugs fixed:
-    1. BLOB corruption via JSON -> now raw SQLite binary restore.
-    2. Sessions table caused ctx.user_data["password"] to be missing
-       -> RAM cache cleared, users re-login and repopulate ctx.user_data.
-    3. Empty password was accepted silently -> now rejected.
-    4. Wrong password popped state, forcing /import restart
-       -> state kept so admin can just resend the correct password.
-    5. No atomic DB write -> now uses temp file + os.replace().
-    6. Bot settings and RAM session cache reloaded after restore.
-    """
+    """Receive the decryption password for admin import."""
     if not _is_admin_msg(update):
         return
     chat_id = update.effective_chat.id
     state   = _admin_import_pending.get(chat_id, {})
     if state.get("step") != "wait_password":
         return
-
-    password = (update.message.text or "").strip()
+    password = update.message.text.strip()
+    # Delete the password message immediately
     try:
         await update.message.delete()
     except Exception:
         pass
-
-    # BUG FIX: empty password silently caused AES decryption errors
-    if not password:
-        await ctx.bot.send_message(
-            chat_id=chat_id,
-            text="\u274c Password cannot be empty. Send the password again."
-        )
-        return
-
     payload = state.get("payload", b"")
-
     try:
-        raw_db = _admin_decrypt(payload, password)
+        plain = _admin_decrypt(payload, password)
+        dump  = json.loads(plain.decode())
     except Exception:
-        # BUG FIX: keep state so admin can resend correct password without restarting
-        await ctx.bot.send_message(
-            chat_id=chat_id,
-            text=(
-                "\u274c Wrong password or corrupted file.\n\n"
-                "Send the correct password again, or type /import to start over."
-            )
-        )
+        await ctx.bot.send_message(chat_id=chat_id, text="❌ Wrong password or corrupted file.")
+        _admin_import_pending.pop(chat_id, None)
         return
-
     _admin_import_pending.pop(chat_id, None)
-
-    try:
-        _db_restore(raw_db)
-    except ValueError as e:
-        await ctx.bot.send_message(
-            chat_id=chat_id,
-            text=f"\u274c Invalid database: {e}\nType /import to try again."
-        )
-        return
-    except Exception as e:
-        logger.error(f"admin_import_password _db_restore failed: {e}")
-        await ctx.bot.send_message(
-            chat_id=chat_id,
-            text=f"\u274c Failed to write database: {e}"
-        )
-        return
-
+    tables = list(dump.keys())
+    with get_db() as c:
+        for tbl, rows in dump.items():
+            for row in rows:
+                if not rows:
+                    continue
+                cols  = ", ".join(row.keys())
+                phs   = ", ".join("?" for _ in row)
+                try:
+                    c.execute(
+                        f"INSERT OR REPLACE INTO {tbl} ({cols}) VALUES ({phs})",
+                        list(row.values()),
+                    )
+                except Exception as e:
+                    logger.warning(f"Admin import row into {tbl}: {e}")
+        c.commit()
+    # Reload bot settings from DB
     _load_bot_settings()
-    _session_pw_cache.clear()
-
-    try:
-        with get_db() as c:
-            total_users = c.execute("SELECT COUNT(*) AS n FROM users").fetchone()["n"]
-            total_totp  = c.execute("SELECT COUNT(*) AS n FROM totp_accounts").fetchone()["n"]
-    except Exception:
-        total_users = total_totp = "?"
-
     await ctx.bot.send_message(
         chat_id=chat_id,
-        text=(
-            f"\u2705 Import complete!\n\n"
-            f"\U0001f465 Users restored: {total_users}\n"
-            f"\U0001f511 TOTP accounts restored: {total_totp}\n\n"
-            f"Database fully replaced from backup.\n\n"
-            f"Users log in with their existing password.\n"
-            f"Password, TOTP codes, Secure Key \u2014 all work as before."
-        ),
+        text=f"✅ Import complete. Tables restored: {', '.join(tables)}",
     )
-
 
 async def admin_userall_export(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """/userall -- send a .txt file listing all users with @username."""
@@ -5259,6 +5117,7 @@ def main():
                 CallbackQueryHandler(delete_account_start,  pattern="^delete_account$"),
                 CallbackQueryHandler(logout,                pattern="^logout$"),
                 CallbackQueryHandler(main_menu_cb,          pattern="^main_menu$"),
+                CallbackQueryHandler(show_donate,           pattern="^donate$"),
                 CallbackQueryHandler(change_tz_start,       pattern="^change_tz$"),
                 CallbackQueryHandler(edit_pick,             pattern=r"^editpick_\d+$"),
                 CallbackQueryHandler(edit_action,           pattern=r"^edit_action_(rename|delete|showsecret|note)$"),
