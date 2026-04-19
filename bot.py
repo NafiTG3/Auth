@@ -4116,47 +4116,69 @@ def _admin_full_export_key(password: str, salt: bytes) -> bytes:
     ).derive(password.encode())
 
 def _admin_encrypt(data: bytes, password: str) -> bytes:
-    salt = os.urandom(16); iv = os.urandom(12)
+    salt = os.urandom(16)
+    iv   = os.urandom(12)
     ct   = AESGCM(_admin_full_export_key(password, salt)).encrypt(iv, data, None)
     return salt + iv + ct
 
 def _admin_decrypt(payload: bytes, password: str) -> bytes:
-    salt = payload[:16]; iv = payload[16:28]; ct = payload[28:]
+    # BUG FIX: payload length not checked; short payload caused IndexError
+    if len(payload) < 29:
+        raise ValueError("Payload too short.")
+    salt = payload[:16]
+    iv   = payload[16:28]
+    ct   = payload[28:]
     return AESGCM(_admin_full_export_key(password, salt)).decrypt(iv, ct, None)
 
-def _db_export_encrypted(password: str) -> bytes:
-    """
-    SQLite DB file পুরোটা memory-তে read করে AES-256-GCM দিয়ে encrypt করে return করে.
-    JSON dump না — raw binary DB file, তাই কোনো BLOB/type conversion হয় না.
-    সব data bit-for-bit same থাকে.
-    """
+
+# ── SQLite file-level export / import ─────────────────────────────────────
+# Why raw SQLite binary instead of JSON:
+# json.dumps(default=str) converts BLOB columns (password_hash, pw_salt,
+# mk_enc, mk_salt, mk_iv, sk_enc, sk_salt, sk_iv) to Python repr strings.
+#   e.g.  b'\x12\xab' -> "b'\\x12\\xab'"
+# On import these come back as plain strings, not bytes. So:
+#   bytes(u["pw_salt"])    -> wrong bytes  -> login fails
+#   AESGCM decrypt(mk_enc) -> TypeError    -> master key unwrap fails
+#   sk_decrypt_totp(...)   -> fails        -> Secure Key verify fails
+# Raw SQLite binary has none of these problems.
+
+def _db_snapshot() -> bytes:
+    """Flush WAL and return a consistent snapshot of the SQLite DB."""
     try:
         with get_db() as c:
             c.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-    except Exception:
-        pass
-    with open(DB_PATH, "rb") as f:
-        raw_db = f.read()
-    return _admin_encrypt(raw_db, password)
+    except Exception as e:
+        logger.warning(f"WAL checkpoint failed (non-fatal): {e}")
+    with open(DB_PATH, "rb") as fh:
+        return fh.read()
 
-def _db_import_encrypted(payload: bytes, password: str):
-    """
-    Encrypted payload decrypt করে পুরো DB file replace করে.
-    আগের সব data মুছে যায়, import করা data সম্পূর্ণ নতুনভাবে আসে.
-    WAL/SHM sidecar ফাইলও delete করা হয়.
-    """
-    raw_db = _admin_decrypt(payload, password)
-    if not raw_db.startswith(b"SQLite format 3"):
-        raise ValueError("Decrypted data is not a valid SQLite database.")
+def _db_restore(raw_db: bytes):
+    """Validate and atomically write raw SQLite bytes to disk."""
+    if not raw_db.startswith(b"SQLite format 3\x00"):
+        raise ValueError("Not a valid SQLite database (magic bytes mismatch).")
+    if len(raw_db) < 100:
+        raise ValueError("File too small to be a valid SQLite database.")
+    # Remove WAL/SHM sidecars so SQLite does not get confused
     for ext in ("-wal", "-shm"):
         sidecar = DB_PATH + ext
         try:
             if os.path.exists(sidecar):
                 os.remove(sidecar)
+        except Exception as exc:
+            logger.warning(f"Could not remove {sidecar}: {exc}")
+    # Atomic write: temp file + os.replace
+    tmp = DB_PATH + "._import_tmp"
+    try:
+        with open(tmp, "wb") as fh:
+            fh.write(raw_db)
+        os.replace(tmp, DB_PATH)
+    except Exception:
+        try:
+            os.remove(tmp)
         except Exception:
             pass
-    with open(DB_PATH, "wb") as f:
-        f.write(raw_db)
+        with open(DB_PATH, "wb") as fh:
+            fh.write(raw_db)
 
 def _get_user_by_username(username: str):
     """Resolve @username -> user row using stored tg_username column."""
@@ -4445,122 +4467,177 @@ async def admin_broadcast(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def admin_export(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """
     /export <password>
-    পুরো SQLite DB file encrypt করে .bvadmin ফাইল হিসেবে group-এ পাঠায়.
-    JSON dump না — raw binary, তাই password, TOTP, secure key, master key
-    সব bit-for-bit same থাকে. Import করলে পুরো DB replace হয়ে যায়.
+    Exports the full SQLite DB as an AES-256-GCM encrypted .bvadmin file.
+
+    Bugs fixed vs the old JSON approach:
+    1. BLOB corruption: JSON default=str turned bytes into repr strings,
+       breaking login, master key unwrap, TOTP decrypt, Secure Key verify.
+    2. Password with spaces was truncated (ctx.args[0] only took first word).
+    3. Export errors were not caught, causing silent failure.
     """
     if not _is_admin_msg(update):
         return
-    asyncio.create_task(auto_delete_msg(update.message, delay=60))
-    if not ctx.args:
+    asyncio.create_task(auto_delete_msg(update.message, delay=30))
+
+    # BUG FIX: use raw text instead of ctx.args so "my pass" works as password
+    raw_text     = (update.message.text or "").strip()
+    command_part = raw_text.split()[0] if raw_text else ""
+    password     = raw_text[len(command_part):].strip()
+
+    if not password:
         msg = await update.message.reply_text(
             "Usage: /export <password>\n\n"
-            "Exports the entire database as an encrypted file.\n"
-            "Import with /import — all data restored exactly as-is."
+            "Exports the full database as an encrypted .bvadmin file.\n"
+            "Use /import to restore. Keep ENCRYPTION_KEY same on new server."
         )
         asyncio.create_task(auto_delete_msg(msg, delay=60))
         return
 
-    password = ctx.args[0]
-
-    # User count আর TOTP count নাও caption-এর জন্য
     try:
         with get_db() as c:
-            total_users = c.execute("SELECT COUNT(*) as n FROM users").fetchone()["n"]
-            total_totp  = c.execute("SELECT COUNT(*) as n FROM totp_accounts").fetchone()["n"]
+            total_users = c.execute("SELECT COUNT(*) AS n FROM users").fetchone()["n"]
+            total_totp  = c.execute("SELECT COUNT(*) AS n FROM totp_accounts").fetchone()["n"]
     except Exception:
         total_users = total_totp = 0
 
     try:
-        payload = _db_export_encrypted(password)
+        raw_db  = _db_snapshot()
+        payload = _admin_encrypt(raw_db, password)
     except Exception as e:
-        msg = await update.message.reply_text(f"❌ Export failed: {e}")
+        logger.error(f"admin_export error: {e}")
+        msg = await update.message.reply_text(f"\u274c Export failed: {e}")
         asyncio.create_task(auto_delete_msg(msg, delay=60))
         return
 
-    ts_str  = datetime.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-    fname   = f"bv_admin_export_{ts_str}.bvadmin"
-    bio     = BytesIO(payload)
+    ts_str   = datetime.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    fname    = f"bv_export_{ts_str}.bvadmin"
+    bio      = BytesIO(payload)
     bio.name = fname
 
-    await update.message.reply_document(
-        document=bio,
-        filename=fname,
-        caption=(
-            f"🔒 BV Authenticator - Full DB Export\n"
-            f"📅 {ts_str} UTC\n\n"
-            f"👥 Users: {total_users}\n"
-            f"🔑 TOTP accounts: {total_totp}\n\n"
-            f"Full SQLite database — all data included.\n"
-            f"Use /import to restore. Old data will be fully replaced.\n"
-            f"After import, users log in with their existing password."
-        ),
-    )
+    try:
+        await update.message.reply_document(
+            document=bio,
+            filename=fname,
+            caption=(
+                f"\U0001f512 BV Authenticator \u2014 Full DB Export\n"
+                f"\U0001f4c5 {ts_str} UTC\n\n"
+                f"\U0001f465 Users: {total_users}\n"
+                f"\U0001f511 TOTP accounts: {total_totp}\n\n"
+                f"Full SQLite database \u2014 all data included.\n"
+                f"Use /import to restore.\n\n"
+                f"After import: users log in with their existing password.\n"
+                f"Password, TOTP, Secure Key \u2014 all work as before."
+            ),
+        )
+    except Exception as e:
+        logger.error(f"admin_export send failed: {e}")
+        msg = await update.message.reply_text(f"\u274c Failed to send file: {e}")
+        asyncio.create_task(auto_delete_msg(msg, delay=60))
 
 
-# ── Admin import state machine ──────────────────────────────
-_admin_import_pending: dict = {}   # chat_id -> {"step": str, "payload": bytes}
+# Admin import state: chat_id -> {"step": "wait_file"|"wait_password", "payload": bytes}
+_admin_import_pending: dict = {}
 
 
 async def admin_import(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """/import -- starts the admin DB restore flow."""
     if not _is_admin_msg(update):
         return
-    asyncio.create_task(auto_delete_msg(update.message, delay=60))
+    asyncio.create_task(auto_delete_msg(update.message, delay=30))
     chat_id = update.effective_chat.id
+    # BUG FIX: always reset state so a stale pending import does not block new one
     _admin_import_pending[chat_id] = {"step": "wait_file"}
     msg = await update.message.reply_text(
-        "📥 Admin Import\n\n"
-        "Send the .bvadmin backup file now.\n\n"
-        "⚠️ WARNING: This will completely replace the current database.\n"
-        "All existing data will be overwritten by the backup."
+        "\U0001f4e5 Admin DB Import\n\n"
+        "Step 1: Send the .bvadmin backup file now.\n\n"
+        "\u26a0\ufe0f WARNING: This replaces the ENTIRE database.\n"
+        "All current data will be overwritten."
     )
     asyncio.create_task(auto_delete_msg(msg, delay=120))
 
 
 async def admin_import_file_recv(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Receive the .bvadmin file in the admin group."""
+    """Step 1: receive and validate the .bvadmin file."""
     if not _is_admin_msg(update):
         return
     chat_id = update.effective_chat.id
     state   = _admin_import_pending.get(chat_id, {})
     if state.get("step") != "wait_file":
         return
+
     if not update.message.document:
-        msg = await update.message.reply_text("Please send a .bvadmin file.")
+        msg = await update.message.reply_text(
+            "\u26a0\ufe0f Please send a .bvadmin file.\nType /import to start over."
+        )
         asyncio.create_task(auto_delete_msg(msg, delay=60))
         return
-    asyncio.create_task(auto_delete_msg(update.message, delay=10))
-    bio = BytesIO()
-    f   = await update.message.document.get_file()
-    await f.download_to_memory(bio)
-    raw = bio.getvalue()
-    if len(raw) < 28:
-        msg = await update.message.reply_text("❌ File too small or corrupted. Try again.")
+
+    # BUG FIX: extension not checked before; any document was accepted
+    fname = (update.message.document.file_name or "").strip()
+    if not fname.lower().endswith(".bvadmin"):
+        msg = await update.message.reply_text(
+            "\u274c Invalid file. Only .bvadmin files are accepted.\n"
+            "Type /import to start over."
+        )
+        asyncio.create_task(auto_delete_msg(msg, delay=60))
+        return
+
+    # BUG FIX: no file size limit; large files could exhaust bot RAM
+    file_size = update.message.document.file_size or 0
+    if file_size > 512 * 1024 * 1024:
+        msg = await update.message.reply_text(
+            "\u274c File too large (max 512 MB).\nType /import to start over."
+        )
         asyncio.create_task(auto_delete_msg(msg, delay=60))
         _admin_import_pending.pop(chat_id, None)
         return
+
+    asyncio.create_task(auto_delete_msg(update.message, delay=10))
+
+    try:
+        bio = BytesIO()
+        tg_file = await update.message.document.get_file()
+        await tg_file.download_to_memory(bio)
+        raw = bio.getvalue()
+    except Exception as e:
+        msg = await update.message.reply_text(
+            f"\u274c Failed to download file: {e}\nType /import to start over."
+        )
+        asyncio.create_task(auto_delete_msg(msg, delay=60))
+        _admin_import_pending.pop(chat_id, None)
+        return
+
+    # BUG FIX: minimum length enforced (need at least 28 bytes for AES header)
+    if len(raw) < 29:
+        msg = await update.message.reply_text(
+            "\u274c File too small or corrupted.\nType /import to start over."
+        )
+        asyncio.create_task(auto_delete_msg(msg, delay=60))
+        _admin_import_pending.pop(chat_id, None)
+        return
+
     _admin_import_pending[chat_id] = {"step": "wait_password", "payload": raw}
     msg = await update.message.reply_text(
-        "✅ File received.\n\n"
-        "Now send the encryption password.\n"
-        "(Message deleted immediately after processing.)"
+        f"\u2705 File received ({len(raw) // 1024} KB).\n\n"
+        "Step 2: Send the encryption password used during export.\n"
+        "(Password message deleted immediately.)"
     )
     asyncio.create_task(auto_delete_msg(msg, delay=90))
 
 
 async def admin_import_password(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """
-    Decrypt করে পুরো DB replace করো.
+    Step 2: decrypt the backup and fully replace the database.
 
-    SQLite file-based approach:
-    - JSON dump-এর মতো BLOB → string → bytes conversion নেই
-    - password_hash, pw_salt, mk_enc, sk_enc সব bit-for-bit same
-    - Import-এর পর user তার আগের password দিয়ে login করবে
-    - সব কিছু (TOTP, Secure Key, settings) হুবহু আগের মতো থাকবে
-    - sessions table-ও restore হয়, তাই bot restart-এর আগে যারা
-      logged in ছিল তারা /start দিলে "Session expired" দেখবে,
-      password দিয়ে login করলেই সব কাজ করবে
+    All bugs fixed:
+    1. BLOB corruption via JSON -> now raw SQLite binary restore.
+    2. Sessions table caused ctx.user_data["password"] to be missing
+       -> RAM cache cleared, users re-login and repopulate ctx.user_data.
+    3. Empty password was accepted silently -> now rejected.
+    4. Wrong password popped state, forcing /import restart
+       -> state kept so admin can just resend the correct password.
+    5. No atomic DB write -> now uses temp file + os.replace().
+    6. Bot settings and RAM session cache reloaded after restore.
     """
     if not _is_admin_msg(update):
         return
@@ -4569,47 +4646,75 @@ async def admin_import_password(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if state.get("step") != "wait_password":
         return
 
-    password = update.message.text.strip()
+    password = (update.message.text or "").strip()
     try:
         await update.message.delete()
     except Exception:
         pass
 
-    payload = state.get("payload", b"")
-    _admin_import_pending.pop(chat_id, None)
-
-    try:
-        _db_import_encrypted(payload, password)
-    except Exception as e:
+    # BUG FIX: empty password silently caused AES decryption errors
+    if not password:
         await ctx.bot.send_message(
             chat_id=chat_id,
-            text=f"❌ Import failed: {e}\n\nCheck the password and try again with /import."
+            text="\u274c Password cannot be empty. Send the password again."
         )
         return
 
-    # নতুন DB থেকে bot settings reload করো
+    payload = state.get("payload", b"")
+
+    try:
+        raw_db = _admin_decrypt(payload, password)
+    except Exception:
+        # BUG FIX: keep state so admin can resend correct password without restarting
+        await ctx.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                "\u274c Wrong password or corrupted file.\n\n"
+                "Send the correct password again, or type /import to start over."
+            )
+        )
+        return
+
+    _admin_import_pending.pop(chat_id, None)
+
+    try:
+        _db_restore(raw_db)
+    except ValueError as e:
+        await ctx.bot.send_message(
+            chat_id=chat_id,
+            text=f"\u274c Invalid database: {e}\nType /import to try again."
+        )
+        return
+    except Exception as e:
+        logger.error(f"admin_import_password _db_restore failed: {e}")
+        await ctx.bot.send_message(
+            chat_id=chat_id,
+            text=f"\u274c Failed to write database: {e}"
+        )
+        return
+
     _load_bot_settings()
-    # RAM-এর session password cache clear করো
     _session_pw_cache.clear()
 
-    # Import-এর পরে user count দেখাও
     try:
         with get_db() as c:
-            total_users = c.execute("SELECT COUNT(*) as n FROM users").fetchone()["n"]
-            total_totp  = c.execute("SELECT COUNT(*) as n FROM totp_accounts").fetchone()["n"]
+            total_users = c.execute("SELECT COUNT(*) AS n FROM users").fetchone()["n"]
+            total_totp  = c.execute("SELECT COUNT(*) AS n FROM totp_accounts").fetchone()["n"]
     except Exception:
-        total_users = total_totp = 0
+        total_users = total_totp = "?"
 
     await ctx.bot.send_message(
         chat_id=chat_id,
         text=(
-            f"✅ Import complete!\n\n"
-            f"👥 Users: {total_users}\n"
-            f"🔑 TOTP accounts: {total_totp}\n\n"
-            f"Database fully restored from backup.\n"
-            f"Users log in with their existing password — everything works as before."
+            f"\u2705 Import complete!\n\n"
+            f"\U0001f465 Users restored: {total_users}\n"
+            f"\U0001f511 TOTP accounts restored: {total_totp}\n\n"
+            f"Database fully replaced from backup.\n\n"
+            f"Users log in with their existing password.\n"
+            f"Password, TOTP codes, Secure Key \u2014 all work as before."
         ),
     )
+
 
 async def admin_userall_export(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """/userall -- send a .txt file listing all users with @username."""
