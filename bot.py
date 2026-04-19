@@ -4124,6 +4124,34 @@ def _admin_decrypt(payload: bytes, password: str) -> bytes:
     salt = payload[:16]; iv = payload[16:28]; ct = payload[28:]
     return AESGCM(_admin_full_export_key(password, salt)).decrypt(iv, ct, None)
 
+# ── BLOB serialization for admin export/import ──────────────
+# JSON-এ bytes type সরাসরি store করা যায় না।
+# default=str দিলে bytes-এর repr চলে যায় (যেমন "b'\\x12\\xab'"),
+# যা import-এর সময় আর real bytes হয় না। তাই সব BLOB column
+# base64 দিয়ে encode করা হয় এবং একটা tag দিয়ে চিহ্নিত করা হয়।
+# Import-এর সময় tag দেখে আবার bytes-এ convert করা হয়।
+_B64_PREFIX = "__b64__:"
+
+def _encode_row(row: dict) -> dict:
+    """dict-এর প্রতিটা bytes value-কে base64 string-এ রূপান্তর করে export-এর জন্য।"""
+    out = {}
+    for k, v in row.items():
+        if isinstance(v, (bytes, bytearray, memoryview)):
+            out[k] = _B64_PREFIX + base64.b64encode(bytes(v)).decode()
+        else:
+            out[k] = v
+    return out
+
+def _decode_row(row: dict) -> dict:
+    """import-এর সময় base64 string গুলো আবার bytes-এ রূপান্তর করে।"""
+    out = {}
+    for k, v in row.items():
+        if isinstance(v, str) and v.startswith(_B64_PREFIX):
+            out[k] = base64.b64decode(v[len(_B64_PREFIX):])
+        else:
+            out[k] = v
+    return out
+
 def _get_user_by_username(username: str):
     """Resolve @username -> user row using stored tg_username column."""
     uname = username.lstrip("@").lower()
@@ -4411,16 +4439,9 @@ async def admin_broadcast(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def admin_export(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """
     /export <password>
-
-    Export করার সময় কী হয়:
-    - users, totp_accounts সহ সব গুরুত্বপূর্ণ টেবিল dump হয়।
-    - sessions, login_attempts, reset_attempts বাদ দেওয়া হয় কারণ
-      এগুলো import করলে user সমস্যায় পড়ে (stale session + freeze)।
-    - সব data AES-256-GCM দিয়ে encrypt হয়ে .bvadmin ফাইল হিসেবে পাঠানো হয়।
-
-    Import করার পরে user তার নিজের password দিয়ে fresh login করলেই
-    সব কিছু (TOTP, Secure Key, সব) ঠিকঠাক কাজ করবে।
-    ENCRYPTION_KEY একই রাখতে হবে নতুন server-এ।
+    সব user data, TOTP, master key, secure key সহ পুরো DB export করে।
+    BLOB columns base64 encode করা হয় যাতে import-এর সময় সব ঠিকঠাক restore হয়।
+    Sessions ও freeze tables বাদ দেওয়া হয় — user fresh login করলেই সব কাজ করবে।
     """
     if not _is_admin_msg(update):
         return
@@ -4428,29 +4449,29 @@ async def admin_export(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not ctx.args:
         msg = await update.message.reply_text(
             "Usage: /export <encryption_password>\n\n"
-            "This exports ALL vault data (users, TOTP accounts, secure keys, bot settings).\n"
-            "Sessions and freeze-locks are excluded so users can log in fresh after import."
+            "Exports all vault data (users, TOTP, secure keys, master keys, settings).\n"
+            "Sessions and freeze-locks excluded so users can log in fresh after import."
         )
         asyncio.create_task(auto_delete_msg(msg, delay=60))
         return
 
     password = ctx.args[0]
 
-    # এই টেবিলগুলো export করা হবে — সব গুরুত্বপূর্ণ data এখানে আছে।
-    # users         : vault_id, telegram_id, password_hash, pw_salt, kdf_type,
-    #                 mk_enc/mk_salt/mk_iv (master key), sk_enc/sk_salt/sk_iv (secure key),
-    #                 sk_verifier, tg_name, tg_username, timezone, account_disabled, last_seen
-    # totp_accounts : সব TOTP entry — secret_enc, salt, iv (master key দিয়ে encrypt),
-    #                 sk_enc/sk_salt/sk_iv (secure key দিয়ে encrypt), name, issuer, note
-    # backup_reminders, auto_backup_settings, bot_settings : user preferences + bot config
-    # reset_otps, login_alerts, share_links : active state (optional, harmless to include)
+    # Export করা হবে এই টেবিলগুলো:
+    # users           — vault_id, password_hash, pw_salt, kdf_type,
+    #                   mk_enc/mk_salt/mk_iv (master key wrapped with password),
+    #                   sk_enc/sk_salt/sk_iv (secure key encrypted with master key),
+    #                   sk_verifier, tg_name, tg_username, timezone, account_disabled
+    # totp_accounts   — secret_enc/salt/iv (master key encrypted),
+    #                   sk_enc/sk_salt/sk_iv (secure key encrypted), name, issuer, note
+    # bot_settings, backup_reminders, auto_backup_settings — config/preferences
+    # reset_otps, login_alerts, share_links — active state (harmless to include)
     #
     # EXCLUDED (intentionally):
-    # sessions      : import হলে ctx.user_data["password"] নেই, তাই সব কাজ fail করে
-    # login_attempts: import হলে পুরনো freeze আসে, user login করতে পারে না
-    # reset_attempts: একই কারণে বাদ
-    # rate-limit tables (daily_login_counts, weekly_signup_counts, totp_add_rate,
-    #                    vault_login_history): নতুন server-এ এগুলো fresh হওয়া উচিত
+    # sessions            — import হলে ctx.user_data["password"] নেই, সব কাজ fail করে
+    # login_attempts      — পুরনো freeze import হলে user login করতে পারে না
+    # reset_attempts      — পুরনো reset freeze
+    # rate-limit tables   — নতুন server-এ fresh হওয়া উচিত
     EXPORT_TABLES = [
         "users",
         "totp_accounts",
@@ -4462,7 +4483,8 @@ async def admin_export(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "auto_backup_settings",
     ]
 
-    dump = {"_meta": {"version": 2, "exported_at": datetime.datetime.utcnow().isoformat()}}
+    # version 3 = BLOB columns are base64-encoded with _B64_PREFIX tag
+    dump = {"_meta": {"version": 3, "exported_at": datetime.datetime.utcnow().isoformat()}}
     total_users = 0
     total_totp  = 0
 
@@ -4470,7 +4492,8 @@ async def admin_export(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         for tbl in EXPORT_TABLES:
             try:
                 rows = c.execute(f"SELECT * FROM {tbl}").fetchall()
-                dump[tbl] = [dict(r) for r in rows]
+                # প্রতিটা row-এর BLOB column base64 encode করো
+                dump[tbl] = [_encode_row(dict(r)) for r in rows]
                 if tbl == "users":
                     total_users = len(dump[tbl])
                 elif tbl == "totp_accounts":
@@ -4479,7 +4502,7 @@ async def admin_export(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 logger.warning(f"Admin export table {tbl}: {e}")
                 dump[tbl] = []
 
-    plain   = json.dumps(dump, ensure_ascii=False, default=str).encode()
+    plain   = json.dumps(dump, ensure_ascii=False).encode()
     payload = _admin_encrypt(plain, password)
     ts_str  = datetime.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
     fname   = f"bv_admin_export_{ts_str}.bvadmin"
@@ -4494,21 +4517,20 @@ async def admin_export(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"📅 {ts_str} UTC\n\n"
             f"👥 Users: {total_users}\n"
             f"🔑 TOTP accounts: {total_totp}\n\n"
-            f"Includes: users, TOTP data, secure keys, master keys, bot settings\n"
-            f"Excludes: sessions, login freezes, rate limits (intentional)\n\n"
+            f"Includes: users, TOTP, secure keys, master keys, bot settings\n"
+            f"Excludes: sessions, freezes, rate limits (intentional)\n\n"
             f"Use /import to restore.\n"
-            f"After import, users log in fresh with their own password."
+            f"After import, users log in fresh — password, TOTP, Secure Key all work."
         ),
     )
 
 
 # ── Admin import state machine ──────────────────────────────
-# chat_id -> {"step": "wait_file" | "wait_password", "payload": bytes}
-_admin_import_pending: dict = {}
+_admin_import_pending: dict = {}   # chat_id -> {"step": str, "payload": bytes}
 
 
 async def admin_import(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """/import  -- starts the admin import flow in the admin group."""
+    """/import -- starts the admin import flow."""
     if not _is_admin_msg(update):
         return
     asyncio.create_task(auto_delete_msg(update.message, delay=60))
@@ -4517,16 +4539,15 @@ async def admin_import(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = await update.message.reply_text(
         "📥 Admin Import\n\n"
         "Send the .bvadmin backup file now.\n\n"
-        "After import:\n"
-        "- All users log in fresh with their own passwords\n"
-        "- TOTP codes, Secure Keys, everything works normally\n"
-        "- Make sure ENCRYPTION_KEY on this server matches the original"
+        "After import, users log in fresh with their own password.\n"
+        "Password, TOTP codes, and Secure Key will all work normally.\n"
+        "ENCRYPTION_KEY must match the original server."
     )
     asyncio.create_task(auto_delete_msg(msg, delay=120))
 
 
 async def admin_import_file_recv(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Receive the .bvadmin file in the admin group during /import flow."""
+    """Receive the .bvadmin file in the admin group."""
     if not _is_admin_msg(update):
         return
     chat_id = update.effective_chat.id
@@ -4543,7 +4564,7 @@ async def admin_import_file_recv(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
     await f.download_to_memory(bio)
     raw = bio.getvalue()
     if len(raw) < 28:
-        msg = await update.message.reply_text("❌ File too small or corrupted. Send again.")
+        msg = await update.message.reply_text("❌ File too small or corrupted. Try again.")
         asyncio.create_task(auto_delete_msg(msg, delay=60))
         _admin_import_pending.pop(chat_id, None)
         return
@@ -4551,27 +4572,27 @@ async def admin_import_file_recv(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
     msg = await update.message.reply_text(
         "✅ File received.\n\n"
         "Now send the encryption password used during export.\n"
-        "(Message will be deleted immediately after processing.)"
+        "(Message deleted immediately after processing.)"
     )
     asyncio.create_task(auto_delete_msg(msg, delay=90))
 
 
 async def admin_import_password(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """
-    Receive the decryption password, decrypt the backup, and restore all data.
+    Decrypt the backup and restore all data.
 
-    Import strategy:
-    - users, totp_accounts : INSERT OR REPLACE (vault_id is the unique key)
-    - bot_settings         : INSERT OR REPLACE (key is the unique key)
-    - backup_reminders, auto_backup_settings : INSERT OR REPLACE
-    - reset_otps, login_alerts, share_links  : INSERT OR IGNORE
-    - sessions, login_attempts, reset_attempts, rate-limit tables : SKIPPED entirely
+    Critical fix — BLOB columns:
+    JSON round-trip এ bytes type নষ্ট হয়। আগে json.dumps(default=str) দিলে
+    bytes-এর repr চলে যেত (যেমন "b'\\x12\\xab'"), import করলে সেটা আর real bytes
+    থাকত না। তাই password_hash, pw_salt, mk_enc, sk_enc ইত্যাদি BLOB columns
+    দিয়ে password verify ও TOTP decrypt সব fail করত।
+    এখন _encode_row/_decode_row দিয়ে base64 করা হয়, তাই সব ঠিকঠাক restore হয়।
 
-    Skipping sessions is the critical fix:
-    sessions টেবিল import করলে user "Welcome back" দেখে কিন্তু
-    ctx.user_data["password"] RAM-এ নেই, তাই TOTP list, edit, export সব fail করে।
-    Session skip করলে user fresh login করতে বাধ্য হয়, আর login-এ
-    ctx.user_data["password"] set হয়, তখন সব কিছু ঠিকঠাক কাজ করে।
+    Critical fix — sessions skip:
+    sessions import হলে user "Welcome back" দেখে কিন্তু ctx.user_data["password"]
+    RAM-এ নেই, তাই TOTP list/edit/export সব "Session expired" দেখায়।
+    Session skip করলে user fresh login করে, ctx.user_data["password"] set হয়,
+    তারপর সব ঠিকঠাক কাজ করে।
     """
     if not _is_admin_msg(update):
         return
@@ -4581,7 +4602,6 @@ async def admin_import_password(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     password = update.message.text.strip()
-    # Password message সাথে সাথে delete করো
     try:
         await update.message.delete()
     except Exception:
@@ -4601,33 +4621,32 @@ async def admin_import_password(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     _admin_import_pending.pop(chat_id, None)
 
-    # INSERT OR REPLACE: পুরনো data overwrite করবে, নতুন data add করবে
+    # INSERT OR REPLACE: পুরো data overwrite করে restore করে
     REPLACE_TABLES = {
         "users", "totp_accounts", "bot_settings",
         "backup_reminders", "auto_backup_settings",
     }
-    # INSERT OR IGNORE: existing data রাখো, শুধু নতুন add করো
+    # INSERT OR IGNORE: existing রাখো, নতুন add করো
     IGNORE_TABLES = {
         "reset_otps", "login_alerts", "share_links",
     }
-    # সম্পূর্ণ skip (stale/server-specific data যা import হলে user-কে block করে)
+    # সম্পূর্ণ skip — এগুলো import হলে user login/access করতে পারে না
     SKIP_TABLES = {
-        "sessions",             # critical: ctx.user_data["password"] নেই বলে সব fail করে
-        "login_attempts",       # পুরনো freeze user-কে login করতে দেয় না
-        "reset_attempts",       # পুরনো reset freeze
-        "daily_login_counts",   # rate limit: নতুন server-এ fresh হওয়া উচিত
+        "sessions",              # ctx.user_data["password"] নেই তাই সব fail করে
+        "login_attempts",        # পুরনো freeze user-কে block করে
+        "reset_attempts",        # পুরনো reset freeze
+        "daily_login_counts",
         "weekly_signup_counts",
         "vault_login_history",
         "totp_add_rate",
     }
 
-    stats = {"replaced": [], "ignored": [], "skipped": [], "errors": []}
+    stats       = {"replaced": [], "ignored": [], "skipped": [], "errors": []}
     total_users = 0
     total_totp  = 0
 
     with get_db() as c:
         for tbl, rows in dump.items():
-            # _meta block বাদ দাও
             if tbl == "_meta" or not isinstance(rows, list):
                 continue
 
@@ -4639,9 +4658,12 @@ async def admin_import_password(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 continue
 
             inserted = 0
-            for row in rows:
-                if not isinstance(row, dict) or not row:
+            for raw_row in rows:
+                if not isinstance(raw_row, dict) or not raw_row:
                     continue
+
+                # BLOB columns decode করো (base64 → bytes)
+                row  = _decode_row(raw_row)
                 cols = ", ".join(row.keys())
                 phs  = ", ".join("?" for _ in row)
                 vals = list(row.values())
@@ -4651,12 +4673,7 @@ async def admin_import_password(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                         c.execute(
                             f"INSERT OR REPLACE INTO {tbl} ({cols}) VALUES ({phs})", vals
                         )
-                    elif tbl in IGNORE_TABLES:
-                        c.execute(
-                            f"INSERT OR IGNORE INTO {tbl} ({cols}) VALUES ({phs})", vals
-                        )
                     else:
-                        # অজানা টেবিল: safe হওয়ার জন্য IGNORE strategy
                         c.execute(
                             f"INSERT OR IGNORE INTO {tbl} ({cols}) VALUES ({phs})", vals
                         )
@@ -4674,11 +4691,9 @@ async def admin_import_password(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
         c.commit()
 
-    # Bot settings memory-তে reload করো
+    # Bot settings memory-তে reload
     _load_bot_settings()
-
-    # Import-এর পরে সব active in-memory session clear করো
-    # (কোনো user যদি এই server-এ আগে থেকে logged in থাকে তাকেও fresh login করাতে হবে)
+    # RAM session cache clear — existing logged-in user থাকলে তাকেও fresh login করাতে হবে
     _session_pw_cache.clear()
 
     lines = [
@@ -4696,8 +4711,8 @@ async def admin_import_password(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         lines.append(f"\n⚠️ Warnings ({len(stats['errors'])}): {'; '.join(stats['errors'][:5])}")
 
     lines.append(
-        "\nAll users must log in fresh with their own password.\n"
-        "TOTP codes, Secure Keys, and all vault data will work normally after login."
+        "\nAll users log in fresh with their own password.\n"
+        "Password, TOTP codes, and Secure Key all work normally after login."
     )
 
     await ctx.bot.send_message(chat_id=chat_id, text="\n".join(lines))
