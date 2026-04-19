@@ -2382,40 +2382,37 @@ async def logout(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 # ── SETTINGS MENU ───────────────────────────────────────────
 # ── DONATE / SUPPORT ───────────────────────────────────────
-DONATE_ADDRESS = "0x8F2B6f5A3a7b4D9e1C6D0a2B5E8F3c7D4A1b6E9f"  # EVM address
+DONATE_ADDRESS = "0xfE88De8A32A56ca157725305cB71074cE3A07034"
 DONATE_LINK    = "https://nowpayments.io/donation/antonysrm"
 
 async def show_donate(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Show donation/support page with crypto address and NowPayments link."""
+    """Donation / support page.
+
+    Uses HTML parse mode to avoid MarkdownV2 escaping issues with Bengali text,
+    dashes, and dots. Inline URL for NowPayments, monospace for the wallet address.
+    Home button only — no extra buttons per user request.
+    """
     q = update.callback_query
     await q.answer()
     msg = (
-        "\u2615 *Support BV Authenticator*\n\n"
-        "\u0986\u09aa\u09a8\u09bf \u099a\u09be\u0987\u09b2\u09c7 \u09af\u09c7\u0995\u09cb\u09a8\u09cb chain\\-\u098f\u09b0 \u09af\u09c7\u0995\u09cb\u09a8\u09cb token "
-        "NowPayments\\-\u098f\u09b0 \u09ae\u09be\u09a7\u09cd\u09af\u09ae\u09c7 crypto \u09a6\u09bf\u09df\u09c7 easily donate \u0995\u09b0\u09a4\u09c7 \u09aa\u09be\u09b0\u09c7\u09a8, "
-        "\u0985\u09a5\u09ac\u09be \u09a8\u09bf\u099a\u09c7\u09b0 EVM address\\-\u098f "
-        "EVM Chain Supported coin donate \u0995\u09b0\u09a4\u09c7 \u09aa\u09be\u09b0\u09c7\u09a8\n\n"
-        "\U0001f4b3 *EVM Wallet Address:*\n"
-        f"`{DONATE_ADDRESS}`\n\n"
-        "_Tap the address to copy \u2022 Supports ETH, BNB, MATIC, USDT, USDC and any EVM token_"
+        "☕ <b>Support BV Authenticator</b>\n\n"
+        "আপনি চাইলে যেকোনো chain-এর যেকোনো token "
+        f'<a href="{DONATE_LINK}">Pay With NowPayments</a>-এর মাধ্যমে '
+        "crypto দিয়ে easily donate করতে পারেন, "
+        "অথবা নিচের EVM address-এ "
+        "EVM Chain Supported coin donate করতে পারেন.\n\n"
+        "💳 <b>EVM Wallet Address:</b>\n"
+        f"<code>{DONATE_ADDRESS}</code>\n\n"
+        "<i>Supports: ETH, BNB, MATIC, USDT, USDC and any EVM token</i>"
     )
     await q.edit_message_text(
         msg,
-        parse_mode="MarkdownV2",
+        parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton(
-                "\U0001f4b3 Address",
-                copy_text={"text": DONATE_ADDRESS},
-            )],
-            [InlineKeyboardButton(
-                "\U0001f4b8 Pay With NowPayments",
-                url=DONATE_LINK,
-            )],
-            [InlineKeyboardButton("\U0001f3e0 Home", callback_data="main_menu")],
+            [InlineKeyboardButton("🏠 Home", callback_data="main_menu")],
         ]),
     )
     return TOTP_MENU
-
 
 async def settings_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
