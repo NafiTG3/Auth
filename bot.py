@@ -4295,10 +4295,10 @@ def _is_admin_msg(update: Update) -> bool:
 def _adm_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("👤 User Info",      callback_data="adm_user_info"),
-         InlineKeyboardButton("🔐 User Account",   callback_data="adm_noop")],
+         InlineKeyboardButton("🔐 User Account",   callback_data="adm_account")],
         [InlineKeyboardButton("🔧 Maintenance",    callback_data="adm_maintenance"),
-         InlineKeyboardButton("📝 Signup Control", callback_data="adm_noop")],
-        [InlineKeyboardButton("🔑 Login Control",  callback_data="adm_noop"),
+         InlineKeyboardButton("📝 Signup Control", callback_data="adm_signup")],
+        [InlineKeyboardButton("🔑 Login Control",  callback_data="adm_login"),
          InlineKeyboardButton("📢 Broadcast",      callback_data="adm_broadcast")],
         [InlineKeyboardButton("💾 Backup",         callback_data="adm_noop"),
          InlineKeyboardButton("📋 Log",            callback_data="adm_noop")],
@@ -4432,6 +4432,137 @@ async def adm_specific_vault_min_cb(update: Update, ctx: ContextTypes.DEFAULT_TY
         "to change their TOTP Vault per minute limit."
     )
     asyncio.create_task(auto_delete_msg(msg, delay=120))
+
+
+async def adm_signup_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Show signup toggle status with ON/OFF button."""
+    q = update.callback_query; await q.answer()
+    enabled = is_signup_enabled()
+    if enabled:
+        status_text  = "📝 *Signup Control*\n\nCurrent status: *ENABLED*\n\nUsers can create new accounts."
+        toggle_label = "🚫 Disable Signup"
+    else:
+        status_text  = "📝 *Signup Control*\n\nCurrent status: *DISABLED*\n\nNew signups are blocked."
+        toggle_label = "✅ Enable Signup"
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton(toggle_label, callback_data="adm_signup_toggle")],
+        [InlineKeyboardButton("⬅️ Back",    callback_data="adm_back")],
+    ])
+    msg = await q.message.reply_text(status_text, parse_mode="MarkdownV2", reply_markup=kb)
+    asyncio.create_task(auto_delete_msg(msg, delay=300))
+
+
+async def adm_signup_toggle_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Toggle signup enabled/disabled."""
+    q = update.callback_query; await q.answer()
+    new_state = not is_signup_enabled()
+    _save_setting("signup_enabled", new_state)
+    if new_state:
+        status_text  = "📝 *Signup Control*\n\nCurrent status: *ENABLED*\n\nUsers can create new accounts."
+        toggle_label = "🚫 Disable Signup"
+    else:
+        status_text  = "📝 *Signup Control*\n\nCurrent status: *DISABLED*\n\nNew signups are blocked."
+        toggle_label = "✅ Enable Signup"
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton(toggle_label, callback_data="adm_signup_toggle")],
+        [InlineKeyboardButton("⬅️ Back",    callback_data="adm_back")],
+    ])
+    msg = await q.message.reply_text(status_text, parse_mode="MarkdownV2", reply_markup=kb)
+    asyncio.create_task(auto_delete_msg(msg, delay=300))
+
+
+async def adm_login_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Show login toggle status with ON/OFF button."""
+    q = update.callback_query; await q.answer()
+    enabled = is_login_enabled()
+    if enabled:
+        status_text  = "🔑 *Login Control*\n\nCurrent status: *ENABLED*\n\nUsers can log in."
+        toggle_label = "🚫 Disable Login"
+    else:
+        status_text  = "🔑 *Login Control*\n\nCurrent status: *DISABLED*\n\nLogins are blocked."
+        toggle_label = "✅ Enable Login"
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton(toggle_label, callback_data="adm_login_toggle")],
+        [InlineKeyboardButton("⬅️ Back",    callback_data="adm_back")],
+    ])
+    msg = await q.message.reply_text(status_text, parse_mode="MarkdownV2", reply_markup=kb)
+    asyncio.create_task(auto_delete_msg(msg, delay=300))
+
+
+async def adm_login_toggle_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Toggle login enabled/disabled."""
+    q = update.callback_query; await q.answer()
+    new_state = not is_login_enabled()
+    _save_setting("login_enabled", new_state)
+    if new_state:
+        status_text  = "🔑 *Login Control*\n\nCurrent status: *ENABLED*\n\nUsers can log in."
+        toggle_label = "🚫 Disable Login"
+    else:
+        status_text  = "🔑 *Login Control*\n\nCurrent status: *DISABLED*\n\nLogins are blocked."
+        toggle_label = "✅ Enable Login"
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton(toggle_label, callback_data="adm_login_toggle")],
+        [InlineKeyboardButton("⬅️ Back",    callback_data="adm_back")],
+    ])
+    msg = await q.message.reply_text(status_text, parse_mode="MarkdownV2", reply_markup=kb)
+    asyncio.create_task(auto_delete_msg(msg, delay=300))
+
+
+async def adm_account_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Entry point for User Account management from dashboard."""
+    q = update.callback_query; await q.answer()
+    chat_id = update.effective_chat.id
+    _admin_import_pending[chat_id] = {"step": "adm_account_wait"}
+    msg = await q.message.reply_text(
+        "Send the Vault ID, Telegram User ID, or @Username of the user."
+        "\n\nI will show their account status with options to enable or disable it.",
+        parse_mode=None,
+    )
+    asyncio.create_task(auto_delete_msg(msg, delay=300))
+
+
+async def adm_account_action_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Handle disable/enable button press for a specific user account."""
+    q = update.callback_query; await q.answer()
+    data = q.data  # "adm_account_disable:vault_id" or "adm_account_enable:vault_id"
+    parts = data.split(":", 1)
+    if len(parts) != 2:
+        return
+    action, vault_id = parts[0], parts[1]
+    with get_db() as c:
+        u = c.execute("SELECT * FROM users WHERE vault_id=?", (vault_id,)).fetchone()
+        if not u:
+            await q.message.reply_text("User not found.")
+            return
+        flag = 1 if action == "adm_account_disable" else 0
+        c.execute("UPDATE users SET account_disabled=? WHERE vault_id=?", (flag, vault_id))
+        if flag:
+            c.execute("DELETE FROM sessions WHERE vault_id=?", (vault_id,))
+        c.commit()
+    if flag:
+        _session_pw_cache.pop(vault_id, None)
+    word = "DISABLED" if flag else "ENABLED"
+    note = " All active sessions cleared." if flag else ""
+    resp = await q.message.reply_text(
+        f"✅ Account `{vault_id}` ({u['tg_username'] or u['telegram_id']}) has been {word}.{note}"
+    )
+    asyncio.create_task(auto_delete_msg(resp, delay=120))
+    try:
+        if flag:
+            await q.bot.send_message(
+                chat_id=u["telegram_id"],
+                text="🚫 *Your account has been disabled by an administrator\\.*\\n\\n"
+                     "_Your data is safe and has not been deleted\\._",
+                parse_mode="MarkdownV2",
+            )
+        else:
+            await q.bot.send_message(
+                chat_id=u["telegram_id"],
+                text="✅ *Your account has been re\\-enabled\\. You can log in again\\.*",
+                parse_mode="MarkdownV2",
+            )
+    except Exception:
+        pass
 
 
 async def adm_broadcast_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -4763,111 +4894,88 @@ async def admin_import(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
     asyncio.create_task(auto_delete_msg(msg, delay=60))
 
-async def admin_broadcast_recv(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Handle the broadcast message sent by admin after clicking Broadcast button.
-    Supports: text, photo, video, audio, document, voice, sticker, animation, forwarded messages.
-    Sends a summary + failed-IDs .txt file at the end.
+async def admin_group_message_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Unified handler for ALL non-command messages in the admin group.
+    Dispatches based on _admin_import_pending step so every step works correctly
+    regardless of message type (text, photo, video, document, forward, etc.).
     """
-    if not _is_admin_msg(update):
-        return
-    chat_id = update.effective_chat.id
-    state   = _admin_import_pending.get(chat_id, {})
-    if state.get("step") != "adm_broadcast_wait":
-        return
-
-    # Clear the pending state immediately so no duplicate triggers
-    _admin_import_pending.pop(chat_id, None)
-    asyncio.create_task(auto_delete_msg(update.message, delay=10))
-
-    # Fetch all registered telegram_ids
-    with get_db() as c:
-        users = c.execute("SELECT telegram_id FROM users").fetchall()
-
-    total    = len(users)
-    sent     = 0
-    failed   = 0
-    failed_ids: list[int] = []
-
-    progress_msg = await update.message.reply_text(
-        f"📢 Broadcasting to {total} user(s)... please wait."
-    )
-
-    for row in users:
-        tid = row["telegram_id"]
-        try:
-            # copy() preserves all message types: text, photo, video, audio,
-            # document, voice, sticker, animation, and forwarded content.
-            await update.message.copy(chat_id=tid)
-            sent += 1
-        except Exception:
-            failed += 1
-            failed_ids.append(tid)
-
-    # Delete the "please wait" progress message
-    try:
-        await progress_msg.delete()
-    except Exception:
-        pass
-
-    # ── Summary report ──
-    summary = (
-        f"📢 Broadcast complete!\n\n"
-        f"✅ Successfully sent: {sent}\n"
-        f"❌ Failed: {failed}\n"
-        f"👥 Total users: {total}"
-    )
-    await update.message.reply_text(summary)
-
-    # ── Send failed IDs as .txt file if any ──
-    if failed_ids:
-        lines         = "\n".join(str(tid) for tid in failed_ids)
-        header        = "Broadcast Failed - Telegram User IDs\n"
-        header       += f"Total failed: {failed}\n"
-        header       += "=" * 40 + "\n"
-        content_bytes = (header + lines + "\n").encode("utf-8")
-        bio       = BytesIO(content_bytes)
-        bio.name  = "broadcast_failed_ids.txt"
-        await ctx.bot.send_document(
-            chat_id=chat_id,
-            document=bio,
-            filename="broadcast_failed_ids.txt",
-            caption=f"⚠️ {failed} user(s) could not be reached. Their Telegram IDs are listed above.",
-        )
-
-
-async def admin_import_file_recv(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Receive the .bvadmin file in admin group during /import flow."""
-    if not _is_admin_msg(update):
-        return
-    chat_id = update.effective_chat.id
-    state   = _admin_import_pending.get(chat_id, {})
-    if state.get("step") != "wait_file":
-        return
-    if not update.message.document:
-        msg = await update.message.reply_text("⚠️ Please send a .bvadmin file.")
-        asyncio.create_task(auto_delete_msg(msg, delay=60))
-        return
-    asyncio.create_task(auto_delete_msg(update.message, delay=60))
-    bio = BytesIO()
-    f   = await update.message.document.get_file()
-    await f.download_to_memory(bio)
-    _admin_import_pending[chat_id] = {"step": "wait_password", "payload": bio.getvalue()}
-    msg = await update.message.reply_text(
-        "🔒 File received. Now send the encryption password."
-    )
-    asyncio.create_task(auto_delete_msg(msg, delay=60))
-
-async def admin_import_password(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Handle all admin group text flows (import, user info, limit changes)."""
     if not _is_admin_msg(update):
         return
     chat_id = update.effective_chat.id
     state   = _admin_import_pending.get(chat_id, {})
     step    = state.get("step", "")
 
+    # ── Broadcast: any message type ──────────────────────────────────────
+    if step == "adm_broadcast_wait":
+        _admin_import_pending.pop(chat_id, None)
+        asyncio.create_task(auto_delete_msg(update.message, delay=10))
+        with get_db() as c:
+            users = c.execute("SELECT telegram_id FROM users").fetchall()
+        total    = len(users)
+        sent     = 0
+        failed   = 0
+        failed_ids: list[int] = []
+        progress_msg = await update.message.reply_text(
+            f"📢 Broadcasting to {total} user(s)... please wait."
+        )
+        for row in users:
+            tid = row["telegram_id"]
+            try:
+                await update.message.copy(chat_id=tid)
+                sent += 1
+            except Exception:
+                failed += 1
+                failed_ids.append(tid)
+        try:
+            await progress_msg.delete()
+        except Exception:
+            pass
+        summary = (
+            f"📢 Broadcast complete!\n\n"
+            f"✅ Successfully sent: {sent}\n"
+            f"❌ Failed: {failed}\n"
+            f"👥 Total users: {total}"
+        )
+        await update.message.reply_text(summary)
+        if failed_ids:
+            lines_txt     = "\n".join(str(tid) for tid in failed_ids)
+            header        = "Broadcast Failed - Telegram User IDs\n"
+            header       += f"Total failed: {failed}\n"
+            header       += "=" * 40 + "\n"
+            content_bytes = (header + lines_txt + "\n").encode("utf-8")
+            bio           = BytesIO(content_bytes)
+            bio.name      = "broadcast_failed_ids.txt"
+            await ctx.bot.send_document(
+                chat_id=chat_id,
+                document=bio,
+                filename="broadcast_failed_ids.txt",
+                caption=f"⚠️ {failed} user(s) could not be reached. Their Telegram IDs are listed above.",
+            )
+        return
+
+    # ── Import: wait for .bvadmin file ───────────────────────────────────
+    if step == "wait_file":
+        if not update.message.document:
+            msg = await update.message.reply_text("⚠️ Please send a .bvadmin file.")
+            asyncio.create_task(auto_delete_msg(msg, delay=60))
+            return
+        asyncio.create_task(auto_delete_msg(update.message, delay=60))
+        bio = BytesIO()
+        f   = await update.message.document.get_file()
+        await f.download_to_memory(bio)
+        _admin_import_pending[chat_id] = {"step": "wait_password", "payload": bio.getvalue()}
+        msg = await update.message.reply_text("🔒 File received. Now send the encryption password.")
+        asyncio.create_task(auto_delete_msg(msg, delay=60))
+        return
+
+    # ── All text-only steps below ─────────────────────────────────────────
+    # For non-text messages with no matching step, silently ignore
+    raw = (update.message.text or "").strip()
+    if not raw and step not in ("adm_broadcast_wait", "wait_file"):
+        return
+
     if step == "adm_user_info_wait":
         _admin_import_pending.pop(chat_id, None)
-        raw = (update.message.text or "").strip()
         asyncio.create_task(auto_delete_msg(update.message, delay=5))
         u = _resolve_user(raw)
         if not u:
@@ -4877,16 +4985,39 @@ async def admin_import_password(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         asyncio.create_task(auto_delete_msg(msg, delay=120))
         return
 
+    if step == "adm_account_wait":
+        _admin_import_pending.pop(chat_id, None)
+        asyncio.create_task(auto_delete_msg(update.message, delay=5))
+        u = _resolve_user(raw)
+        if not u:
+            msg = await update.message.reply_text(f"User not found: {raw}")
+            asyncio.create_task(auto_delete_msg(msg, delay=60))
+            return
+        vault_id = u["vault_id"]
+        disabled = bool(u["account_disabled"]) if "account_disabled" in u.keys() else False
+        status   = "DISABLED" if disabled else "ENABLED"
+        action_label  = "✅ Enable Account"  if disabled else "🚫 Disable Account"
+        action_data   = f"adm_account_enable:{vault_id}" if disabled else f"adm_account_disable:{vault_id}"
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton(action_label, callback_data=action_data)],
+            [InlineKeyboardButton("⬅️ Back",    callback_data="adm_back")],
+        ])
+        info_text = _fmt_user_info(u)
+        msg = await update.message.reply_text(
+            f"🔐 User Account\n\n{info_text}\n\nCurrent status: {status}",
+            reply_markup=kb,
+        )
+        asyncio.create_task(auto_delete_msg(msg, delay=300))
+        return
+
     if step == "adm_vault_limit_wait":
         _admin_import_pending.pop(chat_id, None)
-        raw = (update.message.text or "").strip()
         asyncio.create_task(auto_delete_msg(update.message, delay=5))
         if not raw.isdigit() or int(raw) < 1:
             msg = await update.message.reply_text("Invalid. Send a positive integer.")
             asyncio.create_task(auto_delete_msg(msg, delay=60))
             return
         globals()["MAX_TOTP_PER_VAULT"] = int(raw)
-        # Count how many vaults have a custom override (they won't be affected)
         with get_db() as _c:
             custom_count = _c.execute(
                 "SELECT COUNT(*) AS n FROM vault_custom_limits WHERE max_per_vault IS NOT NULL"
@@ -4900,7 +5031,6 @@ async def admin_import_password(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if step == "adm_min_limit_wait":
         _admin_import_pending.pop(chat_id, None)
-        raw = (update.message.text or "").strip()
         asyncio.create_task(auto_delete_msg(update.message, delay=5))
         if not raw.isdigit() or int(raw) < 1:
             msg = await update.message.reply_text("Invalid. Send a positive integer.")
@@ -4918,23 +5048,17 @@ async def admin_import_password(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         asyncio.create_task(auto_delete_msg(msg, delay=60))
         return
 
-    # ── Step: admin entered user ID/username to find vault for specific max limit ──
     if step == "adm_specific_vault_max_id":
         _admin_import_pending.pop(chat_id, None)
-        raw = (update.message.text or "").strip()
         asyncio.create_task(auto_delete_msg(update.message, delay=5))
         u = _resolve_user(raw)
         if not u:
             msg = await update.message.reply_text(f"User not found: {raw}")
             asyncio.create_task(auto_delete_msg(msg, delay=60))
             return
-        vault_id = u["vault_id"]
+        vault_id  = u["vault_id"]
         cur_limit = get_effective_vault_max(vault_id)
-        # Store resolved vault_id so next message knows which vault to update
-        _admin_import_pending[chat_id] = {
-            "step":     "adm_specific_vault_max_wait",
-            "vault_id": vault_id,
-        }
+        _admin_import_pending[chat_id] = {"step": "adm_specific_vault_max_wait", "vault_id": vault_id}
         msg = await update.message.reply_text(
             f"Set Maximum TOTP Limit for This Vault\n\n"
             f"Current default: {cur_limit} TOTP entries for this Vault.\n\n"
@@ -4944,11 +5068,9 @@ async def admin_import_password(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         asyncio.create_task(auto_delete_msg(msg, delay=120))
         return
 
-    # ── Step: admin entered new number for specific vault max limit ──
     if step == "adm_specific_vault_max_wait":
         vault_id = state.get("vault_id", "")
         _admin_import_pending.pop(chat_id, None)
-        raw = (update.message.text or "").strip()
         asyncio.create_task(auto_delete_msg(update.message, delay=5))
         if not raw.isdigit() or int(raw) < 1:
             msg = await update.message.reply_text("Invalid. Send a positive integer.")
@@ -4961,22 +5083,17 @@ async def admin_import_password(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         asyncio.create_task(auto_delete_msg(msg, delay=60))
         return
 
-    # ── Step: admin entered user ID/username to find vault for specific per-min limit ──
     if step == "adm_specific_vault_min_id":
         _admin_import_pending.pop(chat_id, None)
-        raw = (update.message.text or "").strip()
         asyncio.create_task(auto_delete_msg(update.message, delay=5))
         u = _resolve_user(raw)
         if not u:
             msg = await update.message.reply_text(f"User not found: {raw}")
             asyncio.create_task(auto_delete_msg(msg, delay=60))
             return
-        vault_id = u["vault_id"]
+        vault_id  = u["vault_id"]
         cur_limit = get_effective_per_min_limit(vault_id)
-        _admin_import_pending[chat_id] = {
-            "step":     "adm_specific_vault_min_wait",
-            "vault_id": vault_id,
-        }
+        _admin_import_pending[chat_id] = {"step": "adm_specific_vault_min_wait", "vault_id": vault_id}
         msg = await update.message.reply_text(
             f"Set Maximum Per minute TOTP Limit for This Vault\n\n"
             f"Current default: {cur_limit} TOTP/Min entries for this Vault.\n\n"
@@ -4986,11 +5103,9 @@ async def admin_import_password(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         asyncio.create_task(auto_delete_msg(msg, delay=120))
         return
 
-    # ── Step: admin entered new number for specific vault per-min limit ──
     if step == "adm_specific_vault_min_wait":
         vault_id = state.get("vault_id", "")
         _admin_import_pending.pop(chat_id, None)
-        raw = (update.message.text or "").strip()
         asyncio.create_task(auto_delete_msg(update.message, delay=5))
         if not raw.isdigit() or int(raw) < 1:
             msg = await update.message.reply_text("Invalid. Send a positive integer.")
@@ -5005,8 +5120,7 @@ async def admin_import_password(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if step != "wait_password":
         return
-    password = update.message.text.strip()
-    # Delete the password message immediately
+    password = raw
     try:
         await update.message.delete()
     except Exception:
@@ -5020,23 +5134,30 @@ async def admin_import_password(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         _admin_import_pending.pop(chat_id, None)
         return
     _admin_import_pending.pop(chat_id, None)
-    tables = list(dump.keys())
+    tables = [
+        "users", "totp_accounts", "sessions", "reset_otps",
+        "reset_attempts", "login_alerts", "share_links",
+        "login_attempts", "backup_reminders", "bot_settings",
+        "auto_backup_settings",
+    ]
     with get_db() as c:
-        for tbl, rows in dump.items():
-            for row in rows:
-                if not rows:
-                    continue
-                cols  = ", ".join(row.keys())
-                phs   = ", ".join("?" for _ in row)
-                try:
-                    c.execute(
-                        f"INSERT OR REPLACE INTO {tbl} ({cols}) VALUES ({phs})",
-                        list(row.values()),
-                    )
-                except Exception as e:
-                    logger.warning(f"Admin import row into {tbl}: {e}")
+        for tbl in tables:
+            if tbl not in dump:
+                continue
+            try:
+                c.execute(f"DELETE FROM {tbl}")
+                rows = dump[tbl]
+                if rows:
+                    cols = ", ".join(rows[0].keys())
+                    placeholders = ", ".join("?" for _ in rows[0])
+                    for row in rows:
+                        c.execute(
+                            f"INSERT OR REPLACE INTO {tbl} ({cols}) VALUES ({placeholders})",
+                            list(row.values()),
+                        )
+            except Exception as e:
+                logger.warning(f"Admin import table {tbl}: {e}")
         c.commit()
-    # Reload bot settings from DB
     _load_bot_settings()
     await ctx.bot.send_message(
         chat_id=chat_id,
@@ -5751,9 +5872,15 @@ def main():
             return _guarded
 
         app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_noop_cb),                  pattern="^adm_noop$"))
-        app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_broadcast_cb),            pattern="^adm_broadcast$"))
         app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_maintenance_view_cb),    pattern="^adm_maintenance$"))
         app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_maintenance_toggle_cb),  pattern="^adm_maintenance_toggle$"))
+        app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_signup_cb),              pattern="^adm_signup$"))
+        app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_signup_toggle_cb),       pattern="^adm_signup_toggle$"))
+        app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_login_cb),               pattern="^adm_login$"))
+        app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_login_toggle_cb),        pattern="^adm_login_toggle$"))
+        app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_account_cb),             pattern="^adm_account$"))
+        app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_account_action_cb),      pattern="^adm_account_(disable|enable):.+$"))
+        app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_broadcast_cb),           pattern="^adm_broadcast$"))
         app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_user_info_cb),           pattern="^adm_user_info$"))
         app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_totp_limit_cb),        pattern="^adm_totp_limit$"))
         app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_vault_limit_cb),       pattern="^adm_vault_limit$"))
@@ -5761,16 +5888,10 @@ def main():
         app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_specific_vault_max_cb),pattern="^adm_specific_vault_max$"))
         app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_specific_vault_min_cb),pattern="^adm_specific_vault_min$"))
         app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_back_cb),              pattern="^adm_back$"))
-        # Admin broadcast: catches ANY message type when broadcast step is active
+        # Admin group message handler: handles ALL non-command messages (text, media, docs)
+        # Dispatches internally based on _admin_import_pending step.
         app.add_handler(MessageHandler(
-            admin_filter & ~filters.COMMAND, admin_broadcast_recv
-        ))
-        # Admin import: receive file and password in group
-        app.add_handler(MessageHandler(
-            admin_filter & filters.Document.ALL, admin_import_file_recv
-        ))
-        app.add_handler(MessageHandler(
-            admin_filter & filters.TEXT & ~filters.COMMAND, admin_import_password
+            admin_filter & ~filters.COMMAND, admin_group_message_handler
         ))
 
     # ── Job queue: daily backup reminders + hourly auto-backup ──
