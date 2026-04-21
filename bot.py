@@ -222,9 +222,53 @@ def record_vault_login(telegram_id: int, vault_id: str):
         )
         c.commit()
 
+def get_vault_custom_limits(vault_id: str):
+    """Return (max_per_vault, max_per_min) for a vault.
+    Returns None for each field if no custom limit is set (fall back to global)."""
+    with get_db() as c:
+        row = c.execute(
+            "SELECT max_per_vault, max_per_min FROM vault_custom_limits WHERE vault_id=?",
+            (vault_id,)
+        ).fetchone()
+    if not row:
+        return None, None
+    return row["max_per_vault"], row["max_per_min"]
+
+def get_effective_vault_max(vault_id: str) -> int:
+    """Return the effective max TOTP per vault for this vault (custom or global)."""
+    custom, _ = get_vault_custom_limits(vault_id)
+    return custom if custom is not None else MAX_TOTP_PER_VAULT
+
+def get_effective_per_min_limit(vault_id: str) -> int:
+    """Return the effective per-minute TOTP limit for this vault (custom or global)."""
+    _, custom = get_vault_custom_limits(vault_id)
+    return custom if custom is not None else MAX_TOTP_PER_MINUTE
+
+def set_vault_max_limit(vault_id: str, limit: int):
+    """Set a custom max TOTP per vault limit for a specific vault."""
+    with get_db() as c:
+        c.execute(
+            "INSERT INTO vault_custom_limits (vault_id, max_per_vault) VALUES (?,?) "
+            "ON CONFLICT(vault_id) DO UPDATE SET max_per_vault=excluded.max_per_vault",
+            (vault_id, limit)
+        )
+        c.commit()
+
+def set_vault_per_min_limit(vault_id: str, limit: int):
+    """Set a custom per-minute TOTP limit for a specific vault."""
+    with get_db() as c:
+        c.execute(
+            "INSERT INTO vault_custom_limits (vault_id, max_per_min) VALUES (?,?) "
+            "ON CONFLICT(vault_id) DO UPDATE SET max_per_min=excluded.max_per_min",
+            (vault_id, limit)
+        )
+        c.commit()
+
 def check_totp_add_rate(vault_id: str) -> bool:
-    """Returns True if vault has NOT exceeded MAX_TOTP_PER_MINUTE in the last 60 seconds."""
-    now = int(time.time())
+    """Returns True if vault has NOT exceeded per-minute limit in the last 60 seconds.
+    Uses per-vault custom limit if set, otherwise falls back to global MAX_TOTP_PER_MINUTE."""
+    now       = int(time.time())
+    eff_limit = get_effective_per_min_limit(vault_id)
     with get_db() as c:
         row = c.execute(
             "SELECT count, window_start FROM totp_add_rate WHERE vault_id=?",
@@ -232,7 +276,7 @@ def check_totp_add_rate(vault_id: str) -> bool:
         ).fetchone()
     if not row or now - row["window_start"] >= 60:
         return True   # window expired or no record
-    return row["count"] < MAX_TOTP_PER_MINUTE
+    return row["count"] < eff_limit
 
 def record_totp_add(vault_id: str):
     """Increment the per-minute TOTP add counter for a vault."""
@@ -420,6 +464,12 @@ def init_db():
             vault_id     TEXT    PRIMARY KEY,
             count        INTEGER DEFAULT 0,
             window_start INTEGER DEFAULT 0)""")
+
+        # Per-vault custom limits (overrides global MAX_TOTP_PER_VAULT / MAX_TOTP_PER_MINUTE)
+        c.execute("""CREATE TABLE IF NOT EXISTS vault_custom_limits (
+            vault_id      TEXT    PRIMARY KEY,
+            max_per_vault INTEGER DEFAULT NULL,
+            max_per_min   INTEGER DEFAULT NULL)""")
 
         # Migrations
         for col, defval in [("tg_name", "''"), ("timezone", "'UTC'"), ("tg_username", "''")]:
@@ -2698,18 +2748,20 @@ async def _do_save_totp(update, vault, data, pw):
         _vcnt = _lc.execute(
             "SELECT COUNT(*) AS n FROM totp_accounts WHERE vault_id=?", (vault,)
         ).fetchone()["n"]
-    if _vcnt >= MAX_TOTP_PER_VAULT:
+    _eff_vault_max = get_effective_vault_max(vault)
+    if _vcnt >= _eff_vault_max:
         await update.message.reply_text(
-            f"Vault full! Maximum {MAX_TOTP_PER_VAULT} TOTP accounts per vault. "
+            f"Vault full! Maximum {_eff_vault_max} TOTP accounts per vault. "
             "Please delete some before adding new ones."
         )
         return TOTP_MENU
 
-    # Per-minute rate limit: max 20 TOTP additions per minute
+    # Per-minute rate limit: uses per-vault custom limit if set, else global
     if not check_totp_add_rate(vault):
+        _eff_per_min = get_effective_per_min_limit(vault)
         await update.message.reply_text(
             f"⚠️ *Too many accounts added\\.*\n\n"
-            f"Maximum *{MAX_TOTP_PER_MINUTE}* TOTP accounts can be added per minute\\.\n"
+            f"Maximum *{_eff_per_min}* TOTP accounts can be added per minute\\.\n"
             "Please wait a moment and try again\\.",
             parse_mode="MarkdownV2",
             reply_markup=kb_main(),
@@ -4063,9 +4115,10 @@ async def global_auto_detect(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if raw_name and secret:
             # Rate limit check
             if not check_totp_add_rate(vault):
+                _eff_per_min2 = get_effective_per_min_limit(vault)
                 await update.message.reply_text(
                     f"⚠️ *Too many accounts added\\.*\n\n"
-                    f"Maximum *{MAX_TOTP_PER_MINUTE}* TOTP accounts can be added per minute\\.",
+                    f"Maximum *{_eff_per_min2}* TOTP accounts can be added per minute\\.",
                     parse_mode="MarkdownV2",
                     reply_markup=kb_main(),
                 )
@@ -4282,13 +4335,16 @@ async def adm_user_info_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def adm_totp_limit_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
     kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔢 Vault Max Limit",  callback_data="adm_vault_limit")],
-        [InlineKeyboardButton("⏱ Per Minute Limit",    callback_data="adm_min_limit")],
-        [InlineKeyboardButton("⬅️ Back",          callback_data="adm_back")],
+        [InlineKeyboardButton("🔢 Vault Max Limit",              callback_data="adm_vault_limit")],
+        [InlineKeyboardButton("⏱ Per Minute Limit",              callback_data="adm_min_limit")],
+        [InlineKeyboardButton("👤 Specific User Vault Max Limit",callback_data="adm_specific_vault_max")],
+        [InlineKeyboardButton("⏱ Specific User Vault Per Minute Limit", callback_data="adm_specific_vault_min")],
+        [InlineKeyboardButton("⬅️ Back",                         callback_data="adm_back")],
     ])
     await q.message.reply_text(
-        f"TOTP Limit Settings\n\nVault Max: {MAX_TOTP_PER_VAULT} per vault\n"
-        f"Per-Minute: {MAX_TOTP_PER_MINUTE} per vault/min",
+        f"TOTP Limit Settings\n\nGlobal Vault Max: {MAX_TOTP_PER_VAULT} per vault\n"
+        f"Global Per-Minute: {MAX_TOTP_PER_MINUTE} per vault/min\n\n"
+        f"Use Specific User buttons to override limits for individual vaults.",
         reply_markup=kb,
     )
 
@@ -4311,6 +4367,28 @@ async def adm_min_limit_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "Set maximum TOTP limit per minute per vault. Enter a number.\n\n"
         "Default: 20 TOTP/min per user\n\n"
         "To change the rate limit, send the new maximum number of TOTP entries allowed per minute per user."
+    )
+    asyncio.create_task(auto_delete_msg(msg, delay=120))
+
+
+async def adm_specific_vault_max_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Ask admin to identify which vault they want to set a custom max limit for."""
+    q = update.callback_query; await q.answer()
+    _admin_import_pending[update.effective_chat.id] = {"step": "adm_specific_vault_max_id"}
+    msg = await q.message.reply_text(
+        "Enter the User ID, @Username, or Vault ID of the specific user "
+        "to change their TOTP Vault Max limit."
+    )
+    asyncio.create_task(auto_delete_msg(msg, delay=120))
+
+
+async def adm_specific_vault_min_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Ask admin to identify which vault they want to set a custom per-min limit for."""
+    q = update.callback_query; await q.answer()
+    _admin_import_pending[update.effective_chat.id] = {"step": "adm_specific_vault_min_id"}
+    msg = await q.message.reply_text(
+        "Enter the User ID, @Username, or Vault ID of the specific user "
+        "to change their TOTP Vault per minute limit."
     )
     asyncio.create_task(auto_delete_msg(msg, delay=120))
 
@@ -4732,8 +4810,14 @@ async def admin_import_password(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             asyncio.create_task(auto_delete_msg(msg, delay=60))
             return
         globals()["MAX_TOTP_PER_VAULT"] = int(raw)
+        # Count how many vaults have a custom override (they won't be affected)
+        with get_db() as _c:
+            custom_count = _c.execute(
+                "SELECT COUNT(*) AS n FROM vault_custom_limits WHERE max_per_vault IS NOT NULL"
+            ).fetchone()["n"]
+        note = f" ({custom_count} vault(s) with custom limit are not affected.)" if custom_count else ""
         msg = await update.message.reply_text(
-            "Vault max TOTP limit updated to " + raw + " per vault."
+            f"Global vault max TOTP limit updated to {raw} per vault.{note}"
         )
         asyncio.create_task(auto_delete_msg(msg, delay=60))
         return
@@ -4747,8 +4831,98 @@ async def admin_import_password(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             asyncio.create_task(auto_delete_msg(msg, delay=60))
             return
         globals()["MAX_TOTP_PER_MINUTE"] = int(raw)
+        with get_db() as _c:
+            custom_count = _c.execute(
+                "SELECT COUNT(*) AS n FROM vault_custom_limits WHERE max_per_min IS NOT NULL"
+            ).fetchone()["n"]
+        note = f" ({custom_count} vault(s) with custom per-minute limit are not affected.)" if custom_count else ""
         msg = await update.message.reply_text(
-            "Per-minute TOTP limit updated to " + raw + " per vault/min."
+            f"Global per-minute TOTP limit updated to {raw} per vault/min.{note}"
+        )
+        asyncio.create_task(auto_delete_msg(msg, delay=60))
+        return
+
+    # ── Step: admin entered user ID/username to find vault for specific max limit ──
+    if step == "adm_specific_vault_max_id":
+        _admin_import_pending.pop(chat_id, None)
+        raw = (update.message.text or "").strip()
+        asyncio.create_task(auto_delete_msg(update.message, delay=5))
+        u = _resolve_user(raw)
+        if not u:
+            msg = await update.message.reply_text(f"User not found: {raw}")
+            asyncio.create_task(auto_delete_msg(msg, delay=60))
+            return
+        vault_id = u["vault_id"]
+        cur_limit = get_effective_vault_max(vault_id)
+        # Store resolved vault_id so next message knows which vault to update
+        _admin_import_pending[chat_id] = {
+            "step":     "adm_specific_vault_max_wait",
+            "vault_id": vault_id,
+        }
+        msg = await update.message.reply_text(
+            f"Set Maximum TOTP Limit for This Vault\n\n"
+            f"Current default: {cur_limit} TOTP entries for this Vault.\n\n"
+            f"To update the limit, enter a new number. This will be the maximum "
+            f"TOTP entries allowed for this user."
+        )
+        asyncio.create_task(auto_delete_msg(msg, delay=120))
+        return
+
+    # ── Step: admin entered new number for specific vault max limit ──
+    if step == "adm_specific_vault_max_wait":
+        vault_id = state.get("vault_id", "")
+        _admin_import_pending.pop(chat_id, None)
+        raw = (update.message.text or "").strip()
+        asyncio.create_task(auto_delete_msg(update.message, delay=5))
+        if not raw.isdigit() or int(raw) < 1:
+            msg = await update.message.reply_text("Invalid. Send a positive integer.")
+            asyncio.create_task(auto_delete_msg(msg, delay=60))
+            return
+        set_vault_max_limit(vault_id, int(raw))
+        msg = await update.message.reply_text(
+            f"Custom vault max limit set to {raw} TOTP entries for vault {vault_id}."
+        )
+        asyncio.create_task(auto_delete_msg(msg, delay=60))
+        return
+
+    # ── Step: admin entered user ID/username to find vault for specific per-min limit ──
+    if step == "adm_specific_vault_min_id":
+        _admin_import_pending.pop(chat_id, None)
+        raw = (update.message.text or "").strip()
+        asyncio.create_task(auto_delete_msg(update.message, delay=5))
+        u = _resolve_user(raw)
+        if not u:
+            msg = await update.message.reply_text(f"User not found: {raw}")
+            asyncio.create_task(auto_delete_msg(msg, delay=60))
+            return
+        vault_id = u["vault_id"]
+        cur_limit = get_effective_per_min_limit(vault_id)
+        _admin_import_pending[chat_id] = {
+            "step":     "adm_specific_vault_min_wait",
+            "vault_id": vault_id,
+        }
+        msg = await update.message.reply_text(
+            f"Set Maximum Per minute TOTP Limit for This Vault\n\n"
+            f"Current default: {cur_limit} TOTP/Min entries for this Vault.\n\n"
+            f"To update the limit, enter a new number. This will be the maximum "
+            f"per minute TOTP entries allowed for this user."
+        )
+        asyncio.create_task(auto_delete_msg(msg, delay=120))
+        return
+
+    # ── Step: admin entered new number for specific vault per-min limit ──
+    if step == "adm_specific_vault_min_wait":
+        vault_id = state.get("vault_id", "")
+        _admin_import_pending.pop(chat_id, None)
+        raw = (update.message.text or "").strip()
+        asyncio.create_task(auto_delete_msg(update.message, delay=5))
+        if not raw.isdigit() or int(raw) < 1:
+            msg = await update.message.reply_text("Invalid. Send a positive integer.")
+            asyncio.create_task(auto_delete_msg(msg, delay=60))
+            return
+        set_vault_per_min_limit(vault_id, int(raw))
+        msg = await update.message.reply_text(
+            f"Custom per-minute limit set to {raw} TOTP/min for vault {vault_id}."
         )
         asyncio.create_task(auto_delete_msg(msg, delay=60))
         return
@@ -5502,12 +5676,14 @@ def main():
                 await handler_fn(update, ctx)
             return _guarded
 
-        app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_noop_cb),       pattern="^adm_noop$"))
-        app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_user_info_cb),  pattern="^adm_user_info$"))
-        app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_totp_limit_cb), pattern="^adm_totp_limit$"))
-        app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_vault_limit_cb),pattern="^adm_vault_limit$"))
-        app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_min_limit_cb),  pattern="^adm_min_limit$"))
-        app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_back_cb),       pattern="^adm_back$"))
+        app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_noop_cb),              pattern="^adm_noop$"))
+        app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_user_info_cb),         pattern="^adm_user_info$"))
+        app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_totp_limit_cb),        pattern="^adm_totp_limit$"))
+        app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_vault_limit_cb),       pattern="^adm_vault_limit$"))
+        app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_min_limit_cb),         pattern="^adm_min_limit$"))
+        app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_specific_vault_max_cb),pattern="^adm_specific_vault_max$"))
+        app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_specific_vault_min_cb),pattern="^adm_specific_vault_min$"))
+        app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_back_cb),              pattern="^adm_back$"))
         # Admin import: receive file and password in group
         app.add_handler(MessageHandler(
             admin_filter & filters.Document.ALL, admin_import_file_recv
