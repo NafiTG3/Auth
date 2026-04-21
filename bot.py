@@ -4296,10 +4296,10 @@ def _adm_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("👤 User Info",      callback_data="adm_user_info"),
          InlineKeyboardButton("🔐 User Account",   callback_data="adm_noop")],
-        [InlineKeyboardButton("🔧 Maintenance",    callback_data="adm_noop"),
+        [InlineKeyboardButton("🔧 Maintenance",    callback_data="adm_maintenance"),
          InlineKeyboardButton("📝 Signup Control", callback_data="adm_noop")],
         [InlineKeyboardButton("🔑 Login Control",  callback_data="adm_noop"),
-         InlineKeyboardButton("📢 Broadcast",      callback_data="adm_noop")],
+         InlineKeyboardButton("📢 Broadcast",      callback_data="adm_broadcast")],
         [InlineKeyboardButton("💾 Backup",         callback_data="adm_noop"),
          InlineKeyboardButton("📋 Log",            callback_data="adm_noop")],
         [InlineKeyboardButton("📊 Statistics",     callback_data="adm_noop"),
@@ -4315,6 +4315,47 @@ async def admin_group_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "👋 *Welcome to Dashboard*",
         parse_mode="MarkdownV2", reply_markup=_adm_kb(),
     )
+    asyncio.create_task(auto_delete_msg(msg, delay=300))
+
+
+async def adm_maintenance_view_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Show current maintenance status with toggle button (entry point from dashboard)."""
+    q = update.callback_query; await q.answer()
+    currently_on = is_maintenance()
+
+    if currently_on:
+        status_text  = "🔧 *Maintenance Mode: ON*\\n\\nUsers are currently blocked\\."
+        toggle_label = "🟢 Turn OFF Maintenance"
+    else:
+        status_text  = "✅ *Maintenance Mode: OFF*\\n\\nBot is live for users\\."
+        toggle_label = "🔴 Turn ON Maintenance"
+
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton(toggle_label, callback_data="adm_maintenance_toggle")],
+        [InlineKeyboardButton("⬅️ Back",    callback_data="adm_back")],
+    ])
+    msg = await q.message.reply_text(status_text, parse_mode="MarkdownV2", reply_markup=kb)
+    asyncio.create_task(auto_delete_msg(msg, delay=300))
+
+
+async def adm_maintenance_toggle_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Actually toggle the maintenance state when the toggle button is pressed."""
+    q = update.callback_query; await q.answer()
+    new_state = not is_maintenance()
+    _save_setting("maintenance", new_state)
+
+    if new_state:
+        status_text  = "🔧 *Maintenance Mode: ON*\\n\\nUsers are currently blocked\\."
+        toggle_label = "🟢 Turn OFF Maintenance"
+    else:
+        status_text  = "✅ *Maintenance Mode: OFF*\\n\\nBot is live for users\\."
+        toggle_label = "🔴 Turn ON Maintenance"
+
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton(toggle_label, callback_data="adm_maintenance_toggle")],
+        [InlineKeyboardButton("⬅️ Back",    callback_data="adm_back")],
+    ])
+    msg = await q.message.reply_text(status_text, parse_mode="MarkdownV2", reply_markup=kb)
     asyncio.create_task(auto_delete_msg(msg, delay=300))
 
 
@@ -4391,6 +4432,15 @@ async def adm_specific_vault_min_cb(update: Update, ctx: ContextTypes.DEFAULT_TY
         "to change their TOTP Vault per minute limit."
     )
     asyncio.create_task(auto_delete_msg(msg, delay=120))
+
+
+async def adm_broadcast_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Entry point: admin clicked Broadcast from dashboard."""
+    q = update.callback_query; await q.answer()
+    chat_id = update.effective_chat.id
+    _admin_import_pending[chat_id] = {"step": "adm_broadcast_wait"}
+    msg = await q.message.reply_text("Send your broadcast message here.")
+    asyncio.create_task(auto_delete_msg(msg, delay=300))
 
 
 async def adm_back_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -4521,30 +4571,8 @@ def _fmt_user_info(u) -> str:
         return f"[Error building user info: {e}]"
 
 # ── ADMIN COMMANDS ──────────────────────────────────────────
-async def admin_maintenance(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """
-    /maintenance on   -- enable maintenance mode
-    /maintenance off  -- disable maintenance mode
-    """
-    if not _is_admin_msg(update):
-        return
-    # Strip bot @mention from group commands: "/maintenance@Bot on" -> state="on"
-    raw_text     = (update.message.text or "").strip()
-    command_part = raw_text.split()[0] if raw_text else ""
-    state        = raw_text[len(command_part):].strip().lower()
-    if state == "on":
-        _save_setting("maintenance", True)
-        msg = await update.message.reply_text("🔧 Maintenance mode ON. Users are blocked.")
-    elif state == "off":
-        _save_setting("maintenance", False)
-        msg = await update.message.reply_text("✅ Maintenance mode OFF. Bot is live.")
-    else:
-        cur = "ON" if is_maintenance() else "OFF"
-        msg = await update.message.reply_text(
-            f"Usage: /maintenance on|off\nCurrent: {cur}"
-        )
-    asyncio.create_task(auto_delete_msg(msg, delay=60))
-    asyncio.create_task(auto_delete_msg(update.message, delay=60))
+# admin_maintenance command removed - maintenance is now controlled via
+# the Dashboard button (adm_maintenance_view_cb / adm_maintenance_toggle_cb).
 
 async def admin_signup_toggle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """/signup on|off"""
@@ -4673,32 +4701,8 @@ async def admin_account_disable(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.warning(f"Could not notify user {u['telegram_id']}: {e}")
 
-async def admin_broadcast(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """/broadcast <message>  OR  reply to a message with /broadcast"""
-    if not _is_admin_msg(update):
-        return
-    asyncio.create_task(auto_delete_msg(update.message, delay=60))
-    with get_db() as c:
-        users = c.execute("SELECT telegram_id FROM users").fetchall()
-    reply_to = update.message.reply_to_message
-    text_msg  = " ".join(ctx.args) if ctx.args else None
-    sent = 0; failed = 0
-    for row in users:
-        tid = row["telegram_id"]
-        try:
-            if reply_to:
-                await reply_to.copy(chat_id=tid)
-            elif text_msg:
-                await ctx.bot.send_message(chat_id=tid, text=text_msg)
-            else:
-                continue
-            sent += 1
-        except Exception:
-            failed += 1
-    msg = await update.message.reply_text(
-        f"📢 Broadcast complete.\nSent: {sent}  |  Failed: {failed}"
-    )
-    asyncio.create_task(auto_delete_msg(msg, delay=60))
+# admin_broadcast command removed - broadcast is now controlled via
+# the Dashboard Broadcast button (adm_broadcast_cb / admin_broadcast_recv).
 
 async def admin_export(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """
@@ -4758,6 +4762,78 @@ async def admin_import(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "📥 Admin Import\n\nSend the .bvadmin backup file now."
     )
     asyncio.create_task(auto_delete_msg(msg, delay=60))
+
+async def admin_broadcast_recv(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Handle the broadcast message sent by admin after clicking Broadcast button.
+    Supports: text, photo, video, audio, document, voice, sticker, animation, forwarded messages.
+    Sends a summary + failed-IDs .txt file at the end.
+    """
+    if not _is_admin_msg(update):
+        return
+    chat_id = update.effective_chat.id
+    state   = _admin_import_pending.get(chat_id, {})
+    if state.get("step") != "adm_broadcast_wait":
+        return
+
+    # Clear the pending state immediately so no duplicate triggers
+    _admin_import_pending.pop(chat_id, None)
+    asyncio.create_task(auto_delete_msg(update.message, delay=10))
+
+    # Fetch all registered telegram_ids
+    with get_db() as c:
+        users = c.execute("SELECT telegram_id FROM users").fetchall()
+
+    total    = len(users)
+    sent     = 0
+    failed   = 0
+    failed_ids: list[int] = []
+
+    progress_msg = await update.message.reply_text(
+        f"📢 Broadcasting to {total} user(s)... please wait."
+    )
+
+    for row in users:
+        tid = row["telegram_id"]
+        try:
+            # copy() preserves all message types: text, photo, video, audio,
+            # document, voice, sticker, animation, and forwarded content.
+            await update.message.copy(chat_id=tid)
+            sent += 1
+        except Exception:
+            failed += 1
+            failed_ids.append(tid)
+
+    # Delete the "please wait" progress message
+    try:
+        await progress_msg.delete()
+    except Exception:
+        pass
+
+    # ── Summary report ──
+    summary = (
+        f"📢 Broadcast complete!\n\n"
+        f"✅ Successfully sent: {sent}\n"
+        f"❌ Failed: {failed}\n"
+        f"👥 Total users: {total}"
+    )
+    await update.message.reply_text(summary)
+
+    # ── Send failed IDs as .txt file if any ──
+    if failed_ids:
+        lines         = "\n".join(str(tid) for tid in failed_ids)
+        header        = "Broadcast Failed - Telegram User IDs\n"
+        header       += f"Total failed: {failed}\n"
+        header       += "=" * 40 + "\n"
+        content_bytes = (header + lines + "\n").encode("utf-8")
+        bio       = BytesIO(content_bytes)
+        bio.name  = "broadcast_failed_ids.txt"
+        await ctx.bot.send_document(
+            chat_id=chat_id,
+            document=bio,
+            filename="broadcast_failed_ids.txt",
+            caption=f"⚠️ {failed} user(s) could not be reached. Their Telegram IDs are listed above.",
+        )
+
 
 async def admin_import_file_recv(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Receive the .bvadmin file in admin group during /import flow."""
@@ -5656,11 +5732,9 @@ def main():
     if ADMIN_GROUP_ID != 0:
         admin_filter = filters.Chat(chat_id=ADMIN_GROUP_ID)
         app.add_handler(CommandHandler("start",        admin_group_start,     filters=admin_filter))
-        app.add_handler(CommandHandler("maintenance",  admin_maintenance,     filters=admin_filter))
         app.add_handler(CommandHandler("signup",       admin_signup_toggle,   filters=admin_filter))
         app.add_handler(CommandHandler("login",        admin_login_toggle,    filters=admin_filter))
         app.add_handler(CommandHandler("account",      admin_account_disable, filters=admin_filter))
-        app.add_handler(CommandHandler("broadcast",    admin_broadcast,       filters=admin_filter))
         app.add_handler(CommandHandler("export",       admin_export,          filters=admin_filter))
         app.add_handler(CommandHandler("import",       admin_import,          filters=admin_filter))
         app.add_handler(CommandHandler("userall",      admin_userall_export,  filters=admin_filter))
@@ -5676,14 +5750,21 @@ def main():
                 await handler_fn(update, ctx)
             return _guarded
 
-        app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_noop_cb),              pattern="^adm_noop$"))
-        app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_user_info_cb),         pattern="^adm_user_info$"))
+        app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_noop_cb),                  pattern="^adm_noop$"))
+        app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_broadcast_cb),            pattern="^adm_broadcast$"))
+        app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_maintenance_view_cb),    pattern="^adm_maintenance$"))
+        app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_maintenance_toggle_cb),  pattern="^adm_maintenance_toggle$"))
+        app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_user_info_cb),           pattern="^adm_user_info$"))
         app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_totp_limit_cb),        pattern="^adm_totp_limit$"))
         app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_vault_limit_cb),       pattern="^adm_vault_limit$"))
         app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_min_limit_cb),         pattern="^adm_min_limit$"))
         app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_specific_vault_max_cb),pattern="^adm_specific_vault_max$"))
         app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_specific_vault_min_cb),pattern="^adm_specific_vault_min$"))
         app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_back_cb),              pattern="^adm_back$"))
+        # Admin broadcast: catches ANY message type when broadcast step is active
+        app.add_handler(MessageHandler(
+            admin_filter & ~filters.COMMAND, admin_broadcast_recv
+        ))
         # Admin import: receive file and password in group
         app.add_handler(MessageHandler(
             admin_filter & filters.Document.ALL, admin_import_file_recv
