@@ -1,4 +1,5 @@
 import os, re, hmac, time, json, struct, base64, hashlib, sqlite3, logging, datetime, secrets, string, asyncio
+import pytz as _pytz
 from io import BytesIO
 from urllib.parse import urlparse, parse_qs, unquote
 
@@ -252,6 +253,108 @@ def get_all_signup_disabled_users() -> list:
             "SELECT telegram_id FROM user_signup_disabled ORDER BY disabled_at DESC"
         ).fetchall()
     return [r["telegram_id"] for r in rows]
+
+
+# ── Statistics helpers ─────────────────────────────────────────────────────
+_BDT = _pytz.timezone("Asia/Dhaka")
+
+def _bdt_day_start(days_ago: int = 0) -> int:
+    """Return Unix timestamp of BDT midnight N days ago."""
+    now_bdt = _dt.datetime.now(_BDT)
+    day     = (now_bdt - _dt.timedelta(days=days_ago)).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
+    return int(day.timestamp())
+
+def _bdt_week_start() -> int:
+    """Return Unix timestamp of last Saturday BDT 00:00 (Bangladesh week starts Sat)."""
+    now_bdt  = _dt.datetime.now(_BDT)
+    # weekday(): Mon=0 ... Sat=5, Sun=6
+    # Days since last Saturday
+    days_since_sat = (now_bdt.weekday() - 5) % 7
+    sat = (now_bdt - _dt.timedelta(days=days_since_sat)).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
+    return int(sat.timestamp())
+
+def _bdt_month_start() -> int:
+    """Return Unix timestamp of 1st day of current month BDT 00:00."""
+    now_bdt = _dt.datetime.now(_BDT)
+    first   = now_bdt.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    return int(first.timestamp())
+
+def record_stat(event_type: str, telegram_id: int = 0, vault_id: str = ""):
+    """Insert one event row into stats_events."""
+    try:
+        with get_db() as c:
+            c.execute(
+                "INSERT INTO stats_events (event_type, telegram_id, vault_id) VALUES (?,?,?)",
+                (event_type, telegram_id, vault_id)
+            )
+            c.commit()
+    except Exception as e:
+        logger.warning(f"record_stat({event_type}): {e}")
+
+def _count_stat(event_type: str, since_ts: int) -> int:
+    """Count events of a given type since a Unix timestamp."""
+    with get_db() as c:
+        row = c.execute(
+            "SELECT COUNT(*) AS n FROM stats_events WHERE event_type=? AND ts>=?",
+            (event_type, since_ts)
+        ).fetchone()
+    return row["n"] if row else 0
+
+def _count_disabled_net(since_ts: int) -> int:
+    """Count accounts that are STILL disabled (not re-enabled) in a period."""
+    with get_db() as c:
+        row = c.execute(
+            "SELECT COUNT(*) AS n FROM stats_events WHERE event_type='account_disabled' AND ts>=?",
+            (since_ts,)
+        ).fetchone()
+        disabled = row["n"] if row else 0
+        row2 = c.execute(
+            "SELECT COUNT(*) AS n FROM stats_events WHERE event_type='account_enabled' AND ts>=?",
+            (since_ts,)
+        ).fetchone()
+        enabled = row2["n"] if row2 else 0
+    return max(0, disabled - enabled)
+
+def _count_active(since_ts: int) -> int:
+    """Count distinct users who had any session (vault active) since since_ts."""
+    with get_db() as c:
+        row = c.execute(
+            "SELECT COUNT(DISTINCT telegram_id) AS n FROM stats_events "
+            "WHERE event_type='user_active' AND ts>=?",
+            (since_ts,)
+        ).fetchone()
+    return row["n"] if row else 0
+
+def _build_stats_text(label: str, since_ts: int, include_active: bool = True) -> str:
+    """Build a formatted statistics message for the given time window."""
+    new_join  = _count_stat("signup",              since_ts)
+    active    = _count_active(since_ts) if include_active else None
+    disabled  = _count_disabled_net(since_ts)
+    deleted   = _count_stat("account_deleted",     since_ts)
+    totp_add  = _count_stat("totp_added",          since_ts)
+    login_ok  = _count_stat("login_success",       since_ts)
+    login_fail= _count_stat("login_fail",          since_ts)
+    reset_ok  = _count_stat("reset_success",       since_ts)
+    reset_skip= _count_stat("reset_success_skip",  since_ts)
+    reset_fail= _count_stat("reset_fail",          since_ts)
+
+    lines = [f"📊 *{label} Statistics*"]
+    lines.append(f"👥 New Joined       : {new_join} User")
+    if include_active:
+        lines.append(f"🟢 Active Users     : {active} User")
+    lines.append(f"🔒 Disabled Accts   : {disabled} Account")
+    lines.append(f"🗑 Deleted Accts    : {deleted} Account")
+    lines.append(f"🔐 TOTP Added       : {totp_add} TOTP")
+    lines.append(f"✅ Login Success    : {login_ok} Success")
+    lines.append(f"❌ Login Failed     : {login_fail} Failed")
+    lines.append(f"✅ Reset Success    : {reset_ok} Success")
+    lines.append(f"⏭ Reset w/ Skip    : {reset_skip} Success")
+    lines.append(f"❌ Reset Failed     : {reset_fail} Failed")
+    return "\n".join(lines)
 
 
 def is_user_login_disabled(telegram_id: int) -> bool:
@@ -546,6 +649,19 @@ def init_db():
         c.execute("""CREATE TABLE IF NOT EXISTS user_login_disabled (
             telegram_id   INTEGER PRIMARY KEY,
             disabled_at   INTEGER DEFAULT (strftime('%s','now')))""")
+
+        # Statistics event log - records all key events with BDT-aligned timestamps
+        c.execute("""CREATE TABLE IF NOT EXISTS stats_events (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_type  TEXT    NOT NULL,
+            telegram_id INTEGER DEFAULT 0,
+            vault_id    TEXT    DEFAULT '',
+            ts          INTEGER DEFAULT (strftime('%s','now')))""")
+        try:
+            c.execute("CREATE INDEX IF NOT EXISTS idx_stats_ts ON stats_events (ts)")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_stats_type ON stats_events (event_type, ts)")
+        except Exception:
+            pass
 
         # Migrations
         for col, defval in [("tg_name", "''"), ("timezone", "'UTC'"), ("tg_username", "''")]:
@@ -1565,6 +1681,7 @@ async def signup_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     _session_pw_cache[vid] = pw             # RAM cache for auto-backup
     _oab_store_password(uid, vid, pw)       # DB encrypted store for auto-backup
     record_weekly_signup(uid)               # track weekly signup count
+    record_stat("signup", telegram_id=uid, vault_id=vid)  # stats tracking
     record_vault_login(uid, vid)            # track lifetime vault access
 
     sk_display = " ".join(secure_key[i:i+8] for i in range(0, len(secure_key), 8))
@@ -1779,6 +1896,7 @@ async def login_pw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not hmac.compare_digest(hash_pw(pw, bytes(u["pw_salt"]), u["kdf_type"] or "pbkdf2"), bytes(u["password_hash"])):
         # Record failed attempt and check freeze
         frozen = record_login_failure(vid)
+        record_stat("login_fail", telegram_id=uid, vault_id=vid)
         if frozen:
             remaining, _ = get_login_freeze_remaining(vid)
             h, m = remaining // 3600, (remaining % 3600) // 60
@@ -1830,6 +1948,8 @@ async def login_pw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # Record this login
     record_daily_login(uid)
     record_vault_login(uid, vid)
+    record_stat("login_success", telegram_id=uid, vault_id=vid)
+    record_stat("user_active",   telegram_id=uid, vault_id=vid)
 
     # ── Auto-upgrade legacy users to Argon2id + Master Key ──────
     kdf_type = u["kdf_type"] or "pbkdf2"
@@ -2001,6 +2121,10 @@ async def reset_otp_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     vid = ctx.user_data.get("reset_vid")
     if not verify_otp(vid, otp):
         frozen = record_reset_attempt(vid)
+        # Resolve telegram_id for stats
+        _u_rst = get_user(vid)
+        _tid_rst = _u_rst["telegram_id"] if _u_rst else 0
+        record_stat("reset_fail", telegram_id=_tid_rst, vault_id=vid)
         if frozen:
             h, m = get_freeze_remaining(vid) // 3600, (get_freeze_remaining(vid) % 3600) // 60
             await update.message.reply_text(
@@ -2241,7 +2365,12 @@ async def reset_new_pw_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if u_owner:
         _oab_store_password(u_owner["telegram_id"], vid, new_pw)
 
+    # Resolve owner for stats
+    _u_rst_ok = get_user(vid)
+    _tid_rst_ok = _u_rst_ok["telegram_id"] if _u_rst_ok else 0
+
     if sk_skipped or deleted_cnt > 0:
+        record_stat("reset_success_skip", telegram_id=_tid_rst_ok, vault_id=vid)
         result_msg = (
             "✅ *Password reset successful\\!*\n\n"
             f"⚠️ _All {em(str(deleted_cnt))} TOTP accounts were permanently deleted \\(Secure Key not provided\\)\\._\n\n"
@@ -2250,6 +2379,7 @@ async def reset_new_pw_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "Login with your new password\\."
         )
     elif reenc_fail > 0:
+        record_stat("reset_success", telegram_id=_tid_rst_ok, vault_id=vid)
         result_msg = (
             "✅ *Password reset successful\\!*\n\n"
             f"🔒 _{reenc_ok} TOTP secret\\(s\\) restored successfully\\._\n"
@@ -2257,6 +2387,7 @@ async def reset_new_pw_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "Login with your new password\\."
         )
     else:
+        record_stat("reset_success", telegram_id=_tid_rst_ok, vault_id=vid)
         result_msg = (
             "✅ *Password reset successful\\!*\n\n"
             f"🔒 _All {reenc_ok} TOTP secret\\(s\\) restored with your Secure Key\\._\n\n"
@@ -2879,6 +3010,7 @@ async def _do_save_totp(update, vault, data, pw):
         c.commit()
 
     record_totp_add(vault)
+    record_stat("totp_added", vault_id=vault)
 
     # Show different name if it was auto-suffixed
     display_name = final_name
@@ -4099,6 +4231,7 @@ async def delete_account_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
             c.execute("DELETE FROM share_links WHERE vault_id=?",    (vault,))
             c.execute("DELETE FROM users WHERE vault_id=?",          (vault,))
             c.commit()
+        record_stat("account_deleted", telegram_id=uid, vault_id=vault)
     clear_session(uid)
     ctx.user_data.clear()
     if owner_id:
@@ -4242,6 +4375,7 @@ async def global_auto_detect(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 )
                 c.commit()
             record_totp_add(vault)
+            record_stat("totp_added", vault_id=vault)
             try:
                 code, remain, _ = generate_code(secret)
             except Exception:
@@ -4393,7 +4527,7 @@ def _adm_kb() -> InlineKeyboardMarkup:
          InlineKeyboardButton("🔢 TOTP Limit",     callback_data="adm_totp_limit")],
         [InlineKeyboardButton("💾 Backup",         callback_data="adm_noop"),
          InlineKeyboardButton("📋 Log",            callback_data="adm_noop")],
-        [InlineKeyboardButton("📊 Statistics",     callback_data="adm_noop")],
+        [InlineKeyboardButton("📊 Statistics",     callback_data="adm_statistics")],
     ])
 
 
@@ -4446,6 +4580,95 @@ async def adm_maintenance_toggle_cb(update: Update, ctx: ContextTypes.DEFAULT_TY
         [InlineKeyboardButton("⬅️ Back",    callback_data="adm_back")],
     ])
     msg = await q.message.reply_text(status_text, parse_mode="MarkdownV2", reply_markup=kb)
+    asyncio.create_task(auto_delete_msg(msg, delay=300))
+
+
+async def adm_statistics_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Show Statistics sub-menu: Today / Weekly / Monthly / Lifetime / Back."""
+    q = update.callback_query; await q.answer()
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("📅 Today",    callback_data="adm_stats_today")],
+        [InlineKeyboardButton("📆 Weekly",   callback_data="adm_stats_weekly")],
+        [InlineKeyboardButton("🗓 Monthly",  callback_data="adm_stats_monthly")],
+        [InlineKeyboardButton("♾ Lifetime", callback_data="adm_stats_lifetime")],
+        [InlineKeyboardButton("⬅️ Back",     callback_data="adm_back")],
+    ])
+    msg = await q.message.reply_text(
+        "📊 Statistics\n\nSelect a time period to view stats.",
+        reply_markup=kb,
+    )
+    asyncio.create_task(auto_delete_msg(msg, delay=300))
+
+
+async def adm_stats_today_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Show today's statistics (BDT 00:00 to now)."""
+    q = update.callback_query; await q.answer()
+    since   = _bdt_day_start(0)
+    text    = _build_stats_text("Today", since, include_active=True)
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="adm_statistics")]])
+    msg = await q.message.reply_text(text, reply_markup=kb)
+    asyncio.create_task(auto_delete_msg(msg, delay=300))
+
+
+async def adm_stats_weekly_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Show weekly statistics (last Saturday BDT 00:00 to now)."""
+    q = update.callback_query; await q.answer()
+    since   = _bdt_week_start()
+    text    = _build_stats_text("Weekly", since, include_active=True)
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="adm_statistics")]])
+    msg = await q.message.reply_text(text, reply_markup=kb)
+    asyncio.create_task(auto_delete_msg(msg, delay=300))
+
+
+async def adm_stats_monthly_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Show monthly statistics (1st of current month BDT 00:00 to now)."""
+    q = update.callback_query; await q.answer()
+    since   = _bdt_month_start()
+    text    = _build_stats_text("Monthly", since, include_active=True)
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="adm_statistics")]])
+    msg = await q.message.reply_text(text, reply_markup=kb)
+    asyncio.create_task(auto_delete_msg(msg, delay=300))
+
+
+async def adm_stats_lifetime_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Show lifetime statistics (all time, no active user count)."""
+    q = update.callback_query; await q.answer()
+    since = 0  # all time
+    # Lifetime active = distinct users who ever had a session
+    with get_db() as c:
+        row = c.execute(
+            "SELECT COUNT(DISTINCT telegram_id) AS n FROM vault_login_history"
+        ).fetchone()
+    lifetime_active = row["n"] if row else 0
+
+    new_join   = _count_stat("signup",             since)
+    disabled   = _count_stat("account_disabled",   since)
+    enabled    = _count_stat("account_enabled",    since)
+    net_dis    = max(0, disabled - enabled)
+    deleted    = _count_stat("account_deleted",    since)
+    totp_add   = _count_stat("totp_added",         since)
+    login_ok   = _count_stat("login_success",      since)
+    login_fail = _count_stat("login_fail",         since)
+    reset_ok   = _count_stat("reset_success",      since)
+    reset_skip = _count_stat("reset_success_skip", since)
+    reset_fail = _count_stat("reset_fail",         since)
+
+    lines = [
+        "📊 *Lifetime Statistics*\n",
+        f"👥 Total Users Joined  : {new_join} User",
+        f"🟢 Active Users (ever) : {lifetime_active} User",
+        f"🔒 Disabled Accounts   : {net_dis} Account",
+        f"🗑 Deleted Accounts    : {deleted} Account",
+        f"🔐 Total TOTP Added    : {totp_add} TOTP",
+        f"✅ Login Success       : {login_ok} Success",
+        f"❌ Login Failed        : {login_fail} Failed",
+        f"✅ Reset Success       : {reset_ok} Success",
+        f"⏭ Reset w/ Skip       : {reset_skip} Success",
+        f"❌ Reset Failed        : {reset_fail} Failed",
+    ]
+    text = "\n".join(lines)
+    kb   = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="adm_statistics")]])
+    msg  = await q.message.reply_text(text, reply_markup=kb)
     asyncio.create_task(auto_delete_msg(msg, delay=300))
 
 
@@ -4778,6 +5001,10 @@ async def adm_account_action_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         c.commit()
     if flag:
         _session_pw_cache.pop(vault_id, None)
+    # Record stats event
+    _tid_acct = u["telegram_id"] if u else 0
+    record_stat("account_disabled" if flag else "account_enabled",
+                telegram_id=_tid_acct, vault_id=vault_id)
     word = "DISABLED" if flag else "ENABLED"
     note = " All active sessions cleared." if flag else ""
     resp = await q.message.reply_text(
@@ -6128,6 +6355,11 @@ def main():
             return _guarded
 
         app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_noop_cb),                  pattern="^adm_noop$"))
+        app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_statistics_cb),          pattern="^adm_statistics$"))
+        app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_stats_today_cb),         pattern="^adm_stats_today$"))
+        app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_stats_weekly_cb),        pattern="^adm_stats_weekly$"))
+        app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_stats_monthly_cb),       pattern="^adm_stats_monthly$"))
+        app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_stats_lifetime_cb),      pattern="^adm_stats_lifetime$"))
         app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_maintenance_view_cb),    pattern="^adm_maintenance$"))
         app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_maintenance_toggle_cb),  pattern="^adm_maintenance_toggle$"))
         app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_signup_cb),                    pattern="^adm_signup$"))
