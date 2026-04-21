@@ -5491,12 +5491,12 @@ def main():
         app.add_handler(CommandHandler("import",       admin_import,          filters=admin_filter))
         app.add_handler(CommandHandler("userall",      admin_userall_export,  filters=admin_filter))
         # Dashboard callback handlers
-app.add_handler(CallbackQueryHandler(adm_noop_cb,       pattern="^adm_noop$"))
-app.add_handler(CallbackQueryHandler(adm_user_info_cb,  pattern="^adm_user_info$"))
-app.add_handler(CallbackQueryHandler(adm_totp_limit_cb, pattern="^adm_totp_limit$"))
-app.add_handler(CallbackQueryHandler(adm_vault_limit_cb,pattern="^adm_vault_limit$"))
-app.add_handler(CallbackQueryHandler(adm_min_limit_cb,  pattern="^adm_min_limit$"))
-app.add_handler(CallbackQueryHandler(adm_back_cb,       pattern="^adm_back$"))
+        app.add_handler(CallbackQueryHandler(adm_noop_cb,       pattern="^adm_noop$",       filters=admin_filter))
+        app.add_handler(CallbackQueryHandler(adm_user_info_cb,  pattern="^adm_user_info$",  filters=admin_filter))
+        app.add_handler(CallbackQueryHandler(adm_totp_limit_cb, pattern="^adm_totp_limit$", filters=admin_filter))
+        app.add_handler(CallbackQueryHandler(adm_vault_limit_cb,pattern="^adm_vault_limit$",filters=admin_filter))
+        app.add_handler(CallbackQueryHandler(adm_min_limit_cb,  pattern="^adm_min_limit$",  filters=admin_filter))
+        app.add_handler(CallbackQueryHandler(adm_back_cb,       pattern="^adm_back$",       filters=admin_filter))
         # Admin import: receive file and password in group
         app.add_handler(MessageHandler(
             admin_filter & filters.Document.ALL, admin_import_file_recv
