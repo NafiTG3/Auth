@@ -254,6 +254,38 @@ def get_all_signup_disabled_users() -> list:
     return [r["telegram_id"] for r in rows]
 
 
+def is_user_login_disabled(telegram_id: int) -> bool:
+    """Returns True if this specific Telegram ID has been individually blocked from login."""
+    with get_db() as c:
+        row = c.execute(
+            "SELECT 1 FROM user_login_disabled WHERE telegram_id=?", (telegram_id,)
+        ).fetchone()
+    return row is not None
+
+def set_user_login_disabled(telegram_id: int, disabled: bool):
+    """Enable or disable login for a specific Telegram ID."""
+    with get_db() as c:
+        if disabled:
+            c.execute(
+                "INSERT OR IGNORE INTO user_login_disabled (telegram_id) VALUES (?)",
+                (telegram_id,)
+            )
+        else:
+            c.execute(
+                "DELETE FROM user_login_disabled WHERE telegram_id=?",
+                (telegram_id,)
+            )
+        c.commit()
+
+def get_all_login_disabled_users() -> list:
+    """Return list of all telegram_ids with login individually disabled."""
+    with get_db() as c:
+        rows = c.execute(
+            "SELECT telegram_id FROM user_login_disabled ORDER BY disabled_at DESC"
+        ).fetchall()
+    return [r["telegram_id"] for r in rows]
+
+
 def get_vault_custom_limits(vault_id: str):
     """Return (max_per_vault, max_per_min) for a vault.
     Returns None for each field if no custom limit is set (fall back to global)."""
@@ -506,6 +538,12 @@ def init_db():
         # Per-user specific signup disable (blocks signup for specific Telegram IDs
         # regardless of global public signup toggle)
         c.execute("""CREATE TABLE IF NOT EXISTS user_signup_disabled (
+            telegram_id   INTEGER PRIMARY KEY,
+            disabled_at   INTEGER DEFAULT (strftime('%s','now')))""")
+
+        # Per-user specific login disable (blocks login for specific Telegram IDs
+        # regardless of global public login toggle)
+        c.execute("""CREATE TABLE IF NOT EXISTS user_login_disabled (
             telegram_id   INTEGER PRIMARY KEY,
             disabled_at   INTEGER DEFAULT (strftime('%s','now')))""")
 
@@ -1570,6 +1608,14 @@ async def login_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_login_enabled():
         await q.edit_message_text(
             "⚠️ *Login is currently disabled\\.* Please try again later\\.",
+            parse_mode="MarkdownV2", reply_markup=kb_auth()
+        )
+        return AUTH_MENU
+    # Per-user specific login block (overrides global toggle)
+    uid = update.effective_user.id
+    if is_user_login_disabled(uid):
+        await q.edit_message_text(
+            "⚠️ *Login is not available for your account\\.* Please contact support\\.",
             parse_mode="MarkdownV2", reply_markup=kb_auth()
         )
         return AUTH_MENU
@@ -4590,40 +4636,113 @@ async def adm_signup_off_list_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
 
 
 async def adm_login_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Show login toggle status with ON/OFF button."""
+    """Show Login Control menu with 4 buttons."""
     q = update.callback_query; await q.answer()
-    enabled = is_login_enabled()
-    if enabled:
-        status_text  = "🔑 *Login Control*\n\nCurrent status: *ENABLED*\n\nUsers can log in."
-        toggle_label = "🚫 Disable Login"
-    else:
-        status_text  = "🔑 *Login Control*\n\nCurrent status: *DISABLED*\n\nLogins are blocked."
-        toggle_label = "✅ Enable Login"
+    pub_status = "ON" if is_login_enabled() else "OFF"
     kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton(toggle_label, callback_data="adm_login_toggle")],
-        [InlineKeyboardButton("⬅️ Back",    callback_data="adm_back")],
+        [InlineKeyboardButton(f"🌐 Public Login  (currently {pub_status})", callback_data="adm_login_public_toggle")],
+        [InlineKeyboardButton("👤 Specific Login",                          callback_data="adm_specific_login")],
+        [InlineKeyboardButton("📋 Specific Login Off User List",            callback_data="adm_login_off_list")],
+        [InlineKeyboardButton("⬅️ Back",                                    callback_data="adm_back")],
     ])
-    msg = await q.message.reply_text(status_text, parse_mode="MarkdownV2", reply_markup=kb)
+    msg = await q.message.reply_text(
+        f"🔑 Login Control\n\nPublic Login: {pub_status}\n"
+        "Use the buttons below to manage login settings.",
+        reply_markup=kb,
+    )
     asyncio.create_task(auto_delete_msg(msg, delay=300))
 
 
-async def adm_login_toggle_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Toggle login enabled/disabled."""
+async def adm_login_public_toggle_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Toggle global public login on/off."""
     q = update.callback_query; await q.answer()
     new_state = not is_login_enabled()
     _save_setting("login_enabled", new_state)
-    if new_state:
-        status_text  = "🔑 *Login Control*\n\nCurrent status: *ENABLED*\n\nUsers can log in."
-        toggle_label = "🚫 Disable Login"
-    else:
-        status_text  = "🔑 *Login Control*\n\nCurrent status: *DISABLED*\n\nLogins are blocked."
-        toggle_label = "✅ Enable Login"
+    pub_status = "ON" if new_state else "OFF"
     kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton(toggle_label, callback_data="adm_login_toggle")],
-        [InlineKeyboardButton("⬅️ Back",    callback_data="adm_back")],
+        [InlineKeyboardButton(f"🌐 Public Login  (currently {pub_status})", callback_data="adm_login_public_toggle")],
+        [InlineKeyboardButton("👤 Specific Login",                          callback_data="adm_specific_login")],
+        [InlineKeyboardButton("📋 Specific Login Off User List",            callback_data="adm_login_off_list")],
+        [InlineKeyboardButton("⬅️ Back",                                    callback_data="adm_back")],
     ])
-    msg = await q.message.reply_text(status_text, parse_mode="MarkdownV2", reply_markup=kb)
+    action_word = "enabled" if new_state else "disabled"
+    msg = await q.message.reply_text(
+        f"✅ Public Login has been {action_word}.\n\nPublic Login: {pub_status}",
+        reply_markup=kb,
+    )
     asyncio.create_task(auto_delete_msg(msg, delay=300))
+
+
+async def adm_specific_login_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Show Specific Login sub-menu: Enable / Disable / Back."""
+    q = update.callback_query; await q.answer()
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Login Enable",  callback_data="adm_specific_login_enable")],
+        [InlineKeyboardButton("🚫 Login Disable", callback_data="adm_specific_login_disable")],
+        [InlineKeyboardButton("⬅️ Back",          callback_data="adm_login")],
+    ])
+    msg = await q.message.reply_text(
+        "👤 Specific Login Control\n\n"
+        "Enable or disable login for a specific user by Telegram ID or @username.",
+        reply_markup=kb,
+    )
+    asyncio.create_task(auto_delete_msg(msg, delay=300))
+
+
+async def adm_specific_login_enable_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Ask for Telegram ID/@username to enable login."""
+    q = update.callback_query; await q.answer()
+    _admin_import_pending[update.effective_chat.id] = {"step": "adm_specific_login_enable_wait"}
+    msg = await q.message.reply_text(
+        "Enter the Telegram ID or @username to Enable login for that user."
+    )
+    asyncio.create_task(auto_delete_msg(msg, delay=120))
+
+
+async def adm_specific_login_disable_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Ask for Telegram ID/@username to disable login."""
+    q = update.callback_query; await q.answer()
+    _admin_import_pending[update.effective_chat.id] = {"step": "adm_specific_login_disable_wait"}
+    msg = await q.message.reply_text(
+        "Enter the Telegram ID or @username to disable login for that user."
+    )
+    asyncio.create_task(auto_delete_msg(msg, delay=120))
+
+
+async def adm_login_off_list_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Send a .txt file listing all users with specific login disabled."""
+    q = update.callback_query; await q.answer()
+    chat_id      = update.effective_chat.id
+    disabled_ids = get_all_login_disabled_users()
+    if not disabled_ids:
+        msg = await q.message.reply_text("No users with specific login disabled.")
+        asyncio.create_task(auto_delete_msg(msg, delay=60))
+        return
+    lines_out = []
+    with get_db() as c:
+        for tid in disabled_ids:
+            row = c.execute(
+                "SELECT tg_username, telegram_id FROM users WHERE telegram_id=?", (tid,)
+            ).fetchone()
+            if row:
+                uname = f"@{row['tg_username']}" if row["tg_username"] else "(no username)"
+                lines_out.append(f"{row['telegram_id']}  {uname}")
+            else:
+                lines_out.append(f"{tid}  (not registered)")
+    content_bytes = (
+        "Specific Login Disabled Users\n"
+        f"Total: {len(disabled_ids)}\n"
+        + "=" * 40 + "\n"
+        + "\n".join(lines_out) + "\n"
+    ).encode("utf-8")
+    bio      = BytesIO(content_bytes)
+    bio.name = "login_disabled_users.txt"
+    await ctx.bot.send_document(
+        chat_id=chat_id,
+        document=bio,
+        filename="login_disabled_users.txt",
+        caption=f"📋 {len(disabled_ids)} user(s) with specific login disabled.",
+    )
 
 
 async def adm_account_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -4825,25 +4944,7 @@ def _fmt_user_info(u) -> str:
 
 # admin_signup_toggle command removed - signup is now managed via Dashboard Signup Control button.
 
-async def admin_login_toggle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """/login on|off"""
-    if not _is_admin_msg(update):
-        return
-    # Strip bot @mention from group command text
-    raw_text     = (update.message.text or "").strip()
-    command_part = raw_text.split()[0] if raw_text else ""
-    state        = raw_text[len(command_part):].strip().lower()
-    if state == "on":
-        _save_setting("login_enabled", True)
-        msg = await update.message.reply_text("✅ Login ENABLED.")
-    elif state == "off":
-        _save_setting("login_enabled", False)
-        msg = await update.message.reply_text("🚫 Login DISABLED.")
-    else:
-        cur = "ON" if is_login_enabled() else "OFF"
-        msg = await update.message.reply_text(f"Usage: /login on|off\nCurrent: {cur}")
-    asyncio.create_task(auto_delete_msg(msg, delay=60))
-    asyncio.create_task(auto_delete_msg(update.message, delay=60))
+# admin_login_toggle command removed - login is now managed via Dashboard Login Control button.
 
 async def admin_user_info(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """/user <vault_id|telegram_id|@username>"""
@@ -5055,6 +5156,60 @@ async def admin_group_message_handler(update: Update, ctx: ContextTypes.DEFAULT_
             reply_markup=kb,
         )
         asyncio.create_task(auto_delete_msg(msg, delay=300))
+        return
+
+    if step == "adm_specific_login_enable_wait":
+        _admin_import_pending.pop(chat_id, None)
+        asyncio.create_task(auto_delete_msg(update.message, delay=5))
+        raw_strip    = raw.lstrip("@")
+        tid_resolved = None
+        if raw.isdigit():
+            tid_resolved = int(raw)
+        else:
+            with get_db() as c:
+                row = c.execute(
+                    "SELECT telegram_id FROM users WHERE tg_username=?", (raw_strip,)
+                ).fetchone()
+            if row:
+                tid_resolved = row["telegram_id"]
+        if not tid_resolved:
+            msg = await update.message.reply_text(
+                f"User not found: {raw}\nOnly registered users can be looked up by @username."
+            )
+            asyncio.create_task(auto_delete_msg(msg, delay=60))
+            return
+        set_user_login_disabled(tid_resolved, False)
+        msg = await update.message.reply_text(
+            f"✅ Login enabled for Telegram ID {tid_resolved}."
+        )
+        asyncio.create_task(auto_delete_msg(msg, delay=60))
+        return
+
+    if step == "adm_specific_login_disable_wait":
+        _admin_import_pending.pop(chat_id, None)
+        asyncio.create_task(auto_delete_msg(update.message, delay=5))
+        raw_strip    = raw.lstrip("@")
+        tid_resolved = None
+        if raw.isdigit():
+            tid_resolved = int(raw)
+        else:
+            with get_db() as c:
+                row = c.execute(
+                    "SELECT telegram_id FROM users WHERE tg_username=?", (raw_strip,)
+                ).fetchone()
+            if row:
+                tid_resolved = row["telegram_id"]
+        if not tid_resolved:
+            msg = await update.message.reply_text(
+                f"User not found: {raw}\nOnly registered users can be looked up by @username."
+            )
+            asyncio.create_task(auto_delete_msg(msg, delay=60))
+            return
+        set_user_login_disabled(tid_resolved, True)
+        msg = await update.message.reply_text(
+            f"🚫 Login disabled for Telegram ID {tid_resolved}."
+        )
+        asyncio.create_task(auto_delete_msg(msg, delay=60))
         return
 
     if step == "adm_specific_signup_enable_wait":
@@ -5956,7 +6111,7 @@ def main():
     if ADMIN_GROUP_ID != 0:
         admin_filter = filters.Chat(chat_id=ADMIN_GROUP_ID)
         app.add_handler(CommandHandler("start",        admin_group_start,     filters=admin_filter))
-        app.add_handler(CommandHandler("login",        admin_login_toggle,    filters=admin_filter))
+        # /login command removed - login is now managed via Dashboard Login Control button.
         app.add_handler(CommandHandler("export",       admin_export,          filters=admin_filter))
         app.add_handler(CommandHandler("import",       admin_import,          filters=admin_filter))
         app.add_handler(CommandHandler("userall",      admin_userall_export,  filters=admin_filter))
@@ -5982,7 +6137,11 @@ def main():
         app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_specific_signup_disable_cb),  pattern="^adm_specific_signup_disable$"))
         app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_signup_off_list_cb),          pattern="^adm_signup_off_list$"))
         app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_login_cb),                    pattern="^adm_login$"))
-        app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_login_toggle_cb),             pattern="^adm_login_toggle$"))
+        app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_login_public_toggle_cb),      pattern="^adm_login_public_toggle$"))
+        app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_specific_login_cb),           pattern="^adm_specific_login$"))
+        app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_specific_login_enable_cb),    pattern="^adm_specific_login_enable$"))
+        app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_specific_login_disable_cb),   pattern="^adm_specific_login_disable$"))
+        app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_login_off_list_cb),           pattern="^adm_login_off_list$"))
         app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_account_action_cb),           pattern="^adm_account_(disable|enable):.+$"))
         app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_broadcast_cb),           pattern="^adm_broadcast$"))
         app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_user_info_cb),           pattern="^adm_user_info$"))
