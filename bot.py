@@ -4,6 +4,12 @@ from urllib.parse import urlparse, parse_qs, unquote
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
+import os, re, hmac, time, json, struct, base64, hashlib, sqlite3, logging, datetime, secrets, string, asyncio
+from io import BytesIO
+from urllib.parse import urlparse, parse_qs, unquote
+
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
     ApplicationBuilder, CommandHandler, CallbackQueryHandler,
     MessageHandler, ConversationHandler, ContextTypes, filters
 )
@@ -1065,14 +1071,9 @@ def kb_reset_secure_key():
 
 
 def build_share_selection_kb(
-    rows: list, selected: set,
-    page: int = 0, total_pages: int = 1
+    rows: list, selected: set, page: int = 0, total_pages: int = 1
 ) -> InlineKeyboardMarkup:
-    """
-    Paginated checkbox-style keyboard for Share Codes folder.
-    rows: the CURRENT PAGE subset (5 items).
-    selected: set of ALL selected totp account IDs (across pages).
-    """
+    """Paginated checkbox keyboard for Share Codes (5 items per page)."""
     buttons = []
     for row in rows:
         tid   = row["id"]
@@ -1081,14 +1082,13 @@ def build_share_selection_kb(
             f"{check}{row['name']}",
             callback_data=f"share_toggle_{tid}",
         )])
-    # Pagination nav
     if total_pages > 1:
         nav = []
         if page > 0:
-            nav.append(InlineKeyboardButton("⬅️", callback_data=f"share_page_{page-1}"))
+            nav.append(InlineKeyboardButton("⬅️", callback_data=f"share_pg_{page-1}"))
         nav.append(InlineKeyboardButton(f"{page+1}/{total_pages}", callback_data="list_noop"))
         if page < total_pages - 1:
-            nav.append(InlineKeyboardButton("➡️", callback_data=f"share_page_{page+1}"))
+            nav.append(InlineKeyboardButton("➡️", callback_data=f"share_pg_{page+1}"))
         buttons.append(nav)
     action_row = []
     if selected:
@@ -2394,39 +2394,30 @@ async def logout(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     return AUTH_MENU
 
 # ── SETTINGS MENU ───────────────────────────────────────────
-# ── DONATE / SUPPORT ───────────────────────────────────────
 DONATE_ADDRESS = "0xfE88De8A32A56ca157725305cB71074cE3A07034"
 DONATE_LINK    = "https://nowpayments.io/donation/antonysrm"
 
+
 async def show_donate(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """
-    Donation page.
-    - Uses HTML parse mode (Bengali text + dashes + dots are safe without escaping)
-    - "Pay With NowPayments" is a clickable inline link, placed below the address
-    - Address shown in <code> tag (tap to copy in Telegram)
-    - Only a Home button; no extra action buttons
-    """
+    """Donate/support page. HTML mode for Bengali + dashes."""
     q = update.callback_query
     await q.answer()
-    msg = (
-        "\u2615 <b>Support BV Authenticator</b>\n\n"
-        "\u0986\u09aa\u09a8\u09bf \u099a\u09be\u0987\u09b2\u09c7 "
-        "\u09af\u09c7\u0995\u09cb\u09a8\u09cb chain-\u098f\u09b0 "
-        "\u09af\u09c7\u0995\u09cb\u09a8\u09cb token NowPayments-\u098f\u09b0 "
-        "\u09ae\u09be\u09a7\u09cd\u09af\u09ae\u09c7 crypto \u09a6\u09bf\u09df\u09c7 "
-        "easily donate \u0995\u09b0\u09a4\u09c7 \u09aa\u09be\u09b0\u09c7\u09a8, "
-        "\u0985\u09a5\u09ac\u09be \u09a8\u09bf\u099a\u09c7\u09b0 EVM address-\u098f "
-        "EVM Chain Supported coin donate \u0995\u09b0\u09a4\u09c7 \u09aa\u09be\u09b0\u09c7\u09a8.\n\n"
-        "\U0001f4b3 <b>EVM Wallet Address:</b>\n"
+    body = (
+        "☕ <b>Support BV Authenticator</b>\n\n"
+        "আপনি চাইলে যেকোনো chain-এর যেকোনো token "
+        "NowPayments-এর মাধ্যমে crypto দিয়ে easily donate করতে পারেন, "
+        "অথবা নিচের EVM address-এ "
+        "EVM Chain Supported coin donate করতে পারেন.\n\n"
+        "💳 <b>EVM Wallet Address:</b>\n"
         f"<code>{DONATE_ADDRESS}</code>\n\n"
         f'<a href="{DONATE_LINK}">Pay With NowPayments</a>\n\n'
         "<i>Supports: ETH, BNB, MATIC, USDT, USDC and any EVM token</i>"
     )
     await q.edit_message_text(
-        msg,
+        body,
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("\U0001f3e0 Home", callback_data="main_menu")],
+            [InlineKeyboardButton("🏠 Home", callback_data="main_menu")],
         ]),
     )
     return TOTP_MENU
@@ -2708,25 +2699,22 @@ async def _do_save_totp(update, vault, data, pw):
     hotp_ctr = 0
     note     = (data.get("note", "") or "")[:NOTE_MAX_LEN]
 
-    # Vault TOTP limit: max 200 per vault
-    with get_db() as _c:
-        _cnt = _c.execute(
+    # Vault TOTP limit
+    with get_db() as _lc:
+        _vcnt = _lc.execute(
             "SELECT COUNT(*) AS n FROM totp_accounts WHERE vault_id=?", (vault,)
         ).fetchone()["n"]
-    if _cnt >= MAX_TOTP_PER_VAULT:
+    if _vcnt >= MAX_TOTP_PER_VAULT:
         await update.message.reply_text(
-            "⚠️ *Vault full\\!*\n\n"
-            f"Maximum *{MAX_TOTP_PER_VAULT}* TOTP accounts allowed per vault\\.\n"
-            "Please delete some accounts before adding new ones\\.",
-            parse_mode="MarkdownV2",
-            reply_markup=kb_main(),
+            f"Vault full! Maximum {MAX_TOTP_PER_VAULT} TOTP accounts per vault. "
+            "Please delete some before adding new ones."
         )
         return TOTP_MENU
 
     # Per-minute rate limit: max 20 TOTP additions per minute
     if not check_totp_add_rate(vault):
         await update.message.reply_text(
-            f"\u26a0\ufe0f *Too many accounts added\\.*\n\n"
+            f"⚠️ *Too many accounts added\\.*\n\n"
             f"Maximum *{MAX_TOTP_PER_MINUTE}* TOTP accounts can be added per minute\\.\n"
             "Please wait a moment and try again\\.",
             parse_mode="MarkdownV2",
@@ -3022,78 +3010,10 @@ async def _render_list_page(q_or_msg, vault: str, pw: str, page: int, is_edit: b
     else:
         await q_or_msg.reply_text(text, parse_mode="MarkdownV2", reply_markup=kb)
 
-async def _auto_update_list(
-    bot, chat_id: int, message_id: int,
-    vault: str, pw: str, page: int,
-    uid: int, stop_after: int = 300
-):
-    """
-    Auto-update TOTP list every second for up to stop_after seconds (default 5 min).
-    Stops if:
-      - Time limit reached
-      - User navigated away (session cleared)
-      - Message edit fails (user deleted or bot kicked)
-    Uses asyncio.sleep(1) so it does not block other handlers.
-    """
-    from telegram import Bot
-    elapsed = 0
-    while elapsed < stop_after:
-        await asyncio.sleep(1)
-        elapsed += 1
-        # Stop if user logged out or switched vault
-        current_vault = get_session(uid)
-        if current_vault != vault:
-            break
-        # Rebuild the page content
-        with get_db() as _c:
-            rows = _c.execute(
-                "SELECT id, name, issuer, secret_enc, salt, iv, note, account_type, hotp_counter "
-                "FROM totp_accounts WHERE vault_id=? ORDER BY name",
-                (vault,)
-            ).fetchall()
-        total = len(rows)
-        if total == 0:
-            break
-        total_pages = max(1, (total + TOTP_PER_PAGE - 1) // TOTP_PER_PAGE)
-        pg          = max(0, min(page, total_pages - 1))
-        chunk       = rows[pg * TOTP_PER_PAGE : (pg + 1) * TOTP_PER_PAGE]
-        entries = []
-        for i, row in enumerate(chunk, start=pg * TOTP_PER_PAGE + 1):
-            try:
-                secret = decrypt(row["secret_enc"], row["salt"], row["iv"], _get_vault_key(vault, pw), vault)
-                code, remain, next_code = generate_code(secret)
-                note      = (row["note"] or "").strip()
-                name_line = f"*{i}\\. {em(row['name'])}*"
-                if row["issuer"]:
-                    name_line += f" \\| _{em(row['issuer'])}_"
-                block = [name_line, f"Current Code: `{code}` {bar(remain)} {remain}s"]
-                if next_code:
-                    block.append(f"Next code: `{next_code}`")
-                if note:
-                    block.append(f"Note: {em(note)}")
-                entries.append("\n".join(block))
-            except Exception:
-                entries.append(f"*{i}\\. {em(row['name'])}*\n_\\[Decrypt error\\]_")
-        header = f"📋 *Your TOTP Codes* \\({pg+1}/{total_pages}\\)\n\n"
-        text   = header + "\n\n".join(entries)
-        kb     = build_list_page_kb(pg, total_pages)
-        try:
-            await bot.edit_message_text(
-                chat_id=chat_id,
-                message_id=message_id,
-                text=text,
-                parse_mode="MarkdownV2",
-                reply_markup=kb,
-            )
-        except Exception:
-            # Message deleted, user navigated away, or no change — stop
-            break
-
-
 async def list_totp(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q   = update.callback_query
     await q.answer()
-    uid   = update.effective_user.id
+    uid = update.effective_user.id
     vault = get_session(uid)
     pw    = ctx.user_data.get("password")
     if not vault or not pw:
@@ -3101,12 +3021,6 @@ async def list_totp(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return AUTH_MENU
     page = ctx.user_data.get("list_page", 0)
     await _render_list_page(q, vault, pw, page)
-    # Start auto-update task (runs in background, updates every second for 5 min)
-    chat_id    = update.effective_chat.id
-    message_id = q.message.message_id
-    asyncio.create_task(
-        _auto_update_list(q.get_bot(), chat_id, message_id, vault, pw, page, uid)
-    )
     return TOTP_MENU
 
 async def list_page_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -3152,15 +3066,8 @@ async def share_codes_open(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")]]),
         )
         return TOTP_MENU
-    all_rows = [{"id": r["id"], "name": r["name"]} for r in rows]
-    per_page  = 5
-    total_pg  = max(1, (len(all_rows) + per_page - 1) // per_page)
-    page      = 0
-    ctx.user_data["share_all_rows"]  = all_rows
-    ctx.user_data["share_rows"]      = all_rows[:per_page]   # current page subset
-    ctx.user_data["share_selected"]  = set()
-    ctx.user_data["share_page"]      = page
-    ctx.user_data["share_total_pg"]  = total_pg
+    ctx.user_data["share_rows"]     = [{"id": r["id"], "name": r["name"]} for r in rows]
+    ctx.user_data["share_selected"] = set()
     await q.edit_message_text(
         "📁 *Share Codes*\n\n"
         "Select the accounts you want to share\\.\n"
@@ -3168,11 +3075,7 @@ async def share_codes_open(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "_The generated link is valid for *10 minutes*\\.\n"
         "Only the TOTP code is visible \\(no secret keys\\)\\._",
         parse_mode="MarkdownV2",
-        reply_markup=build_share_selection_kb(
-            ctx.user_data["share_rows"],
-            ctx.user_data["share_selected"],
-            page=page, total_pages=total_pg,
-        ),
+        reply_markup=build_share_selection_kb(ctx.user_data["share_rows"], ctx.user_data["share_selected"]),
     )
     return TOTP_MENU
 
@@ -3191,35 +3094,35 @@ async def share_toggle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     else:
         selected.add(totp_id)
     ctx.user_data["share_selected"] = selected
-    page     = ctx.user_data.get("share_page", 0)
-    total_pg = ctx.user_data.get("share_total_pg", 1)
+    _pg  = ctx.user_data.get("share_pg", 0)
+    _tpg = ctx.user_data.get("share_tpg", 1)
     try:
         await q.edit_message_reply_markup(
-            reply_markup=build_share_selection_kb(rows, selected, page=page, total_pages=total_pg),
+            reply_markup=build_share_selection_kb(rows, selected, page=_pg, total_pages=_tpg),
         )
     except Exception:
         pass
     return TOTP_MENU
 
-async def share_page_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Navigate pages in share selection."""
+async def share_pg_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Page navigation for share selection."""
     q = update.callback_query
     await q.answer()
     try:
-        page = int(q.data.split("_")[-1])
+        pg = int(q.data.split("_")[-1])
     except (IndexError, ValueError):
-        page = 0
-    all_rows = ctx.user_data.get("share_all_rows", [])
-    per_page = 5
-    total_pg = ctx.user_data.get("share_total_pg", 1)
-    page     = max(0, min(page, total_pg - 1))
-    chunk    = all_rows[page * per_page : (page + 1) * per_page]
+        pg = 0
+    all_rows = ctx.user_data.get("share_all", [])
+    per_pg   = 5
+    tpg      = ctx.user_data.get("share_tpg", 1)
+    pg       = max(0, min(pg, tpg - 1))
+    chunk    = all_rows[pg * per_pg:(pg + 1) * per_pg]
     ctx.user_data["share_rows"] = chunk
-    ctx.user_data["share_page"] = page
+    ctx.user_data["share_pg"]   = pg
     selected = ctx.user_data.get("share_selected", set())
     try:
         await q.edit_message_reply_markup(
-            reply_markup=build_share_selection_kb(chunk, selected, page=page, total_pages=total_pg),
+            reply_markup=build_share_selection_kb(chunk, selected, page=pg, total_pages=tpg),
         )
     except Exception:
         pass
@@ -3373,23 +3276,20 @@ async def edit_totp_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if not rows:
             await q.edit_message_text("No TOTP accounts found\\.", parse_mode="MarkdownV2", reply_markup=kb_main())
             return TOTP_MENU
-        # Paginated edit list: 5 per page
-        page       = ctx.user_data.get("edit_list_page", 0)
-        total      = len(rows)
-        per_page   = 5
-        total_pg   = max(1, (total + per_page - 1) // per_page)
-        page       = max(0, min(page, total_pg - 1))
-        chunk      = rows[page * per_page : (page + 1) * per_page]
-        kb = []
-        for r in chunk:
-            kb.append([InlineKeyboardButton(r["name"], callback_data=f"editpick_{r['id']}")])
-        nav = []
-        if page > 0:
-            nav.append(InlineKeyboardButton("⬅️", callback_data=f"edit_list_page_{page-1}"))
-        nav.append(InlineKeyboardButton(f"{page+1}/{total_pg}", callback_data="list_noop"))
-        if page < total_pg - 1:
-            nav.append(InlineKeyboardButton("➡️", callback_data=f"edit_list_page_{page+1}"))
-        if len(nav) > 1:
+        page     = ctx.user_data.get("edit_pg", 0)
+        per_pg   = 5
+        total    = len(rows)
+        total_pg = max(1, (total + per_pg - 1) // per_pg)
+        page     = max(0, min(page, total_pg - 1))
+        chunk    = rows[page * per_pg:(page + 1) * per_pg]
+        kb = [[InlineKeyboardButton(r['name'], callback_data=f"editpick_{r['id']}")] for r in chunk]
+        if total_pg > 1:
+            nav = []
+            if page > 0:
+                nav.append(InlineKeyboardButton("⬅️", callback_data=f"edit_pg_{page-1}"))
+            nav.append(InlineKeyboardButton(f"{page+1}/{total_pg}", callback_data="list_noop"))
+            if page < total_pg - 1:
+                nav.append(InlineKeyboardButton("➡️", callback_data=f"edit_pg_{page+1}"))
             kb.append(nav)
         kb.append([InlineKeyboardButton("❌ Cancel", callback_data="main_menu")])
         await q.edit_message_text(
@@ -3407,39 +3307,36 @@ async def edit_totp_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         return TOTP_MENU
 
-async def edit_list_page_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Handle page navigation in the edit TOTP list."""
+async def edit_pg_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Page navigation for edit TOTP list."""
     q = update.callback_query
     await q.answer()
     try:
         page = int(q.data.split("_")[-1])
     except (IndexError, ValueError):
         page = 0
-    ctx.user_data["edit_list_page"] = page
+    ctx.user_data["edit_pg"] = page
     uid   = update.effective_user.id
     vault = get_session(uid)
     if not vault:
-        await q.edit_message_text("Session expired\\. /start", parse_mode="MarkdownV2", reply_markup=kb_auth())
+        await q.edit_message_text("Session expired. /start", reply_markup=kb_auth())
         return AUTH_MENU
     with get_db() as c:
         rows = c.execute(
             "SELECT id, name FROM totp_accounts WHERE vault_id=? ORDER BY name", (vault,)
         ).fetchall()
-    total    = len(rows)
-    per_page = 5
-    total_pg = max(1, (total + per_page - 1) // per_page)
+    per_pg   = 5
+    total_pg = max(1, (len(rows) + per_pg - 1) // per_pg)
     page     = max(0, min(page, total_pg - 1))
-    chunk    = rows[page * per_page : (page + 1) * per_page]
-    kb = []
-    for r in chunk:
-        kb.append([InlineKeyboardButton(r["name"], callback_data=f"editpick_{r['id']}")])
-    nav = []
-    if page > 0:
-        nav.append(InlineKeyboardButton("⬅️", callback_data=f"edit_list_page_{page-1}"))
-    nav.append(InlineKeyboardButton(f"{page+1}/{total_pg}", callback_data="list_noop"))
-    if page < total_pg - 1:
-        nav.append(InlineKeyboardButton("➡️", callback_data=f"edit_list_page_{page+1}"))
-    if len(nav) > 1:
+    chunk    = rows[page * per_pg:(page + 1) * per_pg]
+    kb = [[InlineKeyboardButton(r['name'], callback_data=f"editpick_{r['id']}")] for r in chunk]
+    if total_pg > 1:
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton("⬅️", callback_data=f"edit_pg_{page-1}"))
+        nav.append(InlineKeyboardButton(f"{page+1}/{total_pg}", callback_data="list_noop"))
+        if page < total_pg - 1:
+            nav.append(InlineKeyboardButton("➡️", callback_data=f"edit_pg_{page+1}"))
         kb.append(nav)
     kb.append([InlineKeyboardButton("❌ Cancel", callback_data="main_menu")])
     await q.edit_message_text(
@@ -4348,13 +4245,9 @@ def _is_admin_msg(update: Update) -> bool:
         and update.effective_chat.id == ADMIN_GROUP_ID
     )
 
-async def admin_group_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Handle /start in the admin group — show dashboard welcome message."""
-    if not _is_admin_msg(update):
-        return
-    asyncio.create_task(auto_delete_msg(update.message, delay=30))
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("👤 User Info",      callback_data="adm_noop"),
+def _adm_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("👤 User Info",      callback_data="adm_user_info"),
          InlineKeyboardButton("🔐 User Account",   callback_data="adm_noop")],
         [InlineKeyboardButton("🔧 Maintenance",    callback_data="adm_noop"),
          InlineKeyboardButton("📝 Signup Control", callback_data="adm_noop")],
@@ -4363,14 +4256,78 @@ async def admin_group_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("💾 Backup",         callback_data="adm_noop"),
          InlineKeyboardButton("📋 Log",            callback_data="adm_noop")],
         [InlineKeyboardButton("📊 Statistics",     callback_data="adm_noop"),
-         InlineKeyboardButton("🔢 TOTP Limit",     callback_data="adm_noop")],
+         InlineKeyboardButton("🔢 TOTP Limit",     callback_data="adm_totp_limit")],
     ])
+
+
+async def admin_group_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not _is_admin_msg(update): return
+    asyncio.create_task(auto_delete_msg(update.message, delay=30))
+    _admin_import_pending.pop(update.effective_chat.id, None)
     msg = await update.message.reply_text(
         "👋 *Welcome to Dashboard*",
-        parse_mode="MarkdownV2",
-        reply_markup=kb,
+        parse_mode="MarkdownV2", reply_markup=_adm_kb(),
     )
     asyncio.create_task(auto_delete_msg(msg, delay=300))
+
+
+async def adm_noop_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.callback_query.answer("Coming soon!", show_alert=False)
+
+
+async def adm_user_info_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query; await q.answer()
+    chat_id = update.effective_chat.id
+    _admin_import_pending[chat_id] = {"step": "adm_user_info_wait"}
+    msg = await q.message.reply_text(
+        "Send User Vault ID, Telegram User ID or @Username to fetch user details."
+    )
+    asyncio.create_task(auto_delete_msg(msg, delay=120))
+
+
+async def adm_totp_limit_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query; await q.answer()
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔢 Vault Max Limit",  callback_data="adm_vault_limit")],
+        [InlineKeyboardButton("⏱ Per Minute Limit",    callback_data="adm_min_limit")],
+        [InlineKeyboardButton("⬅️ Back",          callback_data="adm_back")],
+    ])
+    await q.message.reply_text(
+        f"TOTP Limit Settings\n\nVault Max: {MAX_TOTP_PER_VAULT} per vault\n"
+        f"Per-Minute: {MAX_TOTP_PER_MINUTE} per vault/min",
+        reply_markup=kb,
+    )
+
+
+async def adm_vault_limit_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query; await q.answer()
+    _admin_import_pending[update.effective_chat.id] = {"step": "adm_vault_limit_wait"}
+    msg = await q.message.reply_text(
+        "Set maximum TOTP limit per vault. Enter a number.\n\n"
+        "Default: 200 TOTP per user\n\n"
+        "To change the limit, send the new maximum number of TOTP entries allowed per user."
+    )
+    asyncio.create_task(auto_delete_msg(msg, delay=120))
+
+
+async def adm_min_limit_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query; await q.answer()
+    _admin_import_pending[update.effective_chat.id] = {"step": "adm_min_limit_wait"}
+    msg = await q.message.reply_text(
+        "Set maximum TOTP limit per minute per vault. Enter a number.\n\n"
+        "Default: 20 TOTP/min per user\n\n"
+        "To change the rate limit, send the new maximum number of TOTP entries allowed per minute per user."
+    )
+    asyncio.create_task(auto_delete_msg(msg, delay=120))
+
+
+async def adm_back_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query; await q.answer()
+    _admin_import_pending.pop(update.effective_chat.id, None)
+    await q.message.reply_text(
+        "👋 *Welcome to Dashboard*",
+        parse_mode="MarkdownV2", reply_markup=_adm_kb(),
+    )
 
 
 def _admin_full_export_key(password: str, salt: bytes) -> bytes:
@@ -4753,12 +4710,56 @@ async def admin_import_file_recv(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
     asyncio.create_task(auto_delete_msg(msg, delay=60))
 
 async def admin_import_password(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Receive the decryption password for admin import."""
+    """Handle all admin group text flows (import, user info, limit changes)."""
     if not _is_admin_msg(update):
         return
     chat_id = update.effective_chat.id
     state   = _admin_import_pending.get(chat_id, {})
-    if state.get("step") != "wait_password":
+    step    = state.get("step", "")
+
+    if step == "adm_user_info_wait":
+        _admin_import_pending.pop(chat_id, None)
+        raw = (update.message.text or "").strip()
+        asyncio.create_task(auto_delete_msg(update.message, delay=5))
+        u = _resolve_user(raw)
+        if not u:
+            msg = await update.message.reply_text(f"User not found: {raw}")
+        else:
+            msg = await update.message.reply_text(f"User Info\n\n{_fmt_user_info(u)}")
+        asyncio.create_task(auto_delete_msg(msg, delay=120))
+        return
+
+    if step == "adm_vault_limit_wait":
+        _admin_import_pending.pop(chat_id, None)
+        raw = (update.message.text or "").strip()
+        asyncio.create_task(auto_delete_msg(update.message, delay=5))
+        if not raw.isdigit() or int(raw) < 1:
+            msg = await update.message.reply_text("Invalid. Send a positive integer.")
+            asyncio.create_task(auto_delete_msg(msg, delay=60))
+            return
+        globals()["MAX_TOTP_PER_VAULT"] = int(raw)
+        msg = await update.message.reply_text(
+            "Vault max TOTP limit updated to " + raw + " per vault."
+        )
+        asyncio.create_task(auto_delete_msg(msg, delay=60))
+        return
+
+    if step == "adm_min_limit_wait":
+        _admin_import_pending.pop(chat_id, None)
+        raw = (update.message.text or "").strip()
+        asyncio.create_task(auto_delete_msg(update.message, delay=5))
+        if not raw.isdigit() or int(raw) < 1:
+            msg = await update.message.reply_text("Invalid. Send a positive integer.")
+            asyncio.create_task(auto_delete_msg(msg, delay=60))
+            return
+        globals()["MAX_TOTP_PER_MINUTE"] = int(raw)
+        msg = await update.message.reply_text(
+            "Per-minute TOTP limit updated to " + raw + " per vault/min."
+        )
+        asyncio.create_task(auto_delete_msg(msg, delay=60))
+        return
+
+    if step != "wait_password":
         return
     password = update.message.text.strip()
     # Delete the password message immediately
@@ -5342,9 +5343,9 @@ def main():
                 CallbackQueryHandler(logout,                pattern="^logout$"),
                 CallbackQueryHandler(main_menu_cb,          pattern="^main_menu$"),
                 CallbackQueryHandler(show_donate,           pattern="^donate$"),
+                CallbackQueryHandler(share_pg_cb,           pattern=r"^share_pg_\d+$"),
+                CallbackQueryHandler(edit_pg_cb,            pattern=r"^edit_pg_\d+$"),
                 CallbackQueryHandler(change_tz_start,       pattern="^change_tz$"),
-                CallbackQueryHandler(share_page_cb,         pattern=r"^share_page_\d+$"),
-                CallbackQueryHandler(edit_list_page_cb,     pattern=r"^edit_list_page_\d+$"),
                 CallbackQueryHandler(edit_pick,             pattern=r"^editpick_\d+$"),
                 CallbackQueryHandler(edit_action,           pattern=r"^edit_action_(rename|delete|showsecret|note)$"),
                 CallbackQueryHandler(edit_delete_confirm,   pattern="^edit_action_delete_confirm$"),
@@ -5384,10 +5385,10 @@ def main():
                 CallbackQueryHandler(cancel_to_menu, pattern="^cancel_to_menu$"),
             ],
             EDIT_PICK: [
-                CallbackQueryHandler(edit_pick,          pattern=r"^editpick_\d+$"),
-                CallbackQueryHandler(edit_list_page_cb,  pattern=r"^edit_list_page_\d+$"),
-                CallbackQueryHandler(list_page_cb,       pattern="^list_noop$"),
-                CallbackQueryHandler(main_menu_cb,       pattern="^main_menu$"),
+                CallbackQueryHandler(edit_pick,    pattern=r"^editpick_\d+$"),
+                CallbackQueryHandler(edit_pg_cb,   pattern=r"^edit_pg_\d+$"),
+                CallbackQueryHandler(list_page_cb, pattern="^list_noop$"),
+                CallbackQueryHandler(main_menu_cb, pattern="^main_menu$"),
             ],
             EDIT_ACTION: [
                 CallbackQueryHandler(edit_action,         pattern=r"^edit_action_(rename|delete|showsecret|note)$"),
@@ -5490,12 +5491,18 @@ def main():
         app.add_handler(CommandHandler("maintenance",  admin_maintenance,     filters=admin_filter))
         app.add_handler(CommandHandler("signup",       admin_signup_toggle,   filters=admin_filter))
         app.add_handler(CommandHandler("login",        admin_login_toggle,    filters=admin_filter))
-        app.add_handler(CommandHandler("user",         admin_user_info,       filters=admin_filter))
         app.add_handler(CommandHandler("account",      admin_account_disable, filters=admin_filter))
         app.add_handler(CommandHandler("broadcast",    admin_broadcast,       filters=admin_filter))
         app.add_handler(CommandHandler("export",       admin_export,          filters=admin_filter))
         app.add_handler(CommandHandler("import",       admin_import,          filters=admin_filter))
         app.add_handler(CommandHandler("userall",      admin_userall_export,  filters=admin_filter))
+        # Dashboard callback handlers
+        app.add_handler(CallbackQueryHandler(adm_noop_cb,       pattern="^adm_noop$",       filters=admin_filter))
+        app.add_handler(CallbackQueryHandler(adm_user_info_cb,  pattern="^adm_user_info$",  filters=admin_filter))
+        app.add_handler(CallbackQueryHandler(adm_totp_limit_cb, pattern="^adm_totp_limit$", filters=admin_filter))
+        app.add_handler(CallbackQueryHandler(adm_vault_limit_cb,pattern="^adm_vault_limit$",filters=admin_filter))
+        app.add_handler(CallbackQueryHandler(adm_min_limit_cb,  pattern="^adm_min_limit$",  filters=admin_filter))
+        app.add_handler(CallbackQueryHandler(adm_back_cb,       pattern="^adm_back$",       filters=admin_filter))
         # Admin import: receive file and password in group
         app.add_handler(MessageHandler(
             admin_filter & filters.Document.ALL, admin_import_file_recv
