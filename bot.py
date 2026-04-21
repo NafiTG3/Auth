@@ -1,5 +1,5 @@
 import os, re, hmac, time, json, struct, base64, hashlib, sqlite3, logging, datetime, secrets, string, asyncio
-import pytz as _pytz
+from zoneinfo import ZoneInfo as _ZoneInfo
 from io import BytesIO
 from urllib.parse import urlparse, parse_qs, unquote
 
@@ -256,7 +256,7 @@ def get_all_signup_disabled_users() -> list:
 
 
 # ── Statistics helpers ─────────────────────────────────────────────────────
-_BDT = _pytz.timezone("Asia/Dhaka")
+_BDT = _ZoneInfo("Asia/Dhaka")
 
 def _bdt_day_start(days_ago: int = 0) -> int:
     """Return Unix timestamp of BDT midnight N days ago."""
