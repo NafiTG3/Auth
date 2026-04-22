@@ -1,4 +1,5 @@
 import os, re, hmac, time, json, struct, base64, hashlib, sqlite3, logging, datetime, secrets, string, asyncio
+import datetime as _dt
 from zoneinfo import ZoneInfo as _ZoneInfo
 from io import BytesIO
 from urllib.parse import urlparse, parse_qs, unquote
@@ -259,28 +260,36 @@ def get_all_signup_disabled_users() -> list:
 _BDT = _ZoneInfo("Asia/Dhaka")
 
 def _bdt_day_start(days_ago: int = 0) -> int:
-    """Return Unix timestamp of BDT midnight N days ago."""
-    now_bdt = _dt.datetime.now(_BDT)
-    day     = (now_bdt - _dt.timedelta(days=days_ago)).replace(
-        hour=0, minute=0, second=0, microsecond=0
-    )
-    return int(day.timestamp())
+    """Return Unix timestamp of BDT midnight N days ago.
+    Uses explicit datetime construction to avoid zoneinfo DST/fold issues with replace().
+    """
+    now_bdt  = _dt.datetime.now(_BDT)
+    target   = now_bdt.date() - _dt.timedelta(days=days_ago)
+    midnight = _dt.datetime(target.year, target.month, target.day,
+                            0, 0, 0, tzinfo=_BDT)
+    return int(midnight.timestamp())
 
 def _bdt_week_start() -> int:
-    """Return Unix timestamp of last Saturday BDT 00:00 (Bangladesh week starts Sat)."""
-    now_bdt  = _dt.datetime.now(_BDT)
-    # weekday(): Mon=0 ... Sat=5, Sun=6
-    # Days since last Saturday
+    """Return Unix timestamp of last Saturday BDT 00:00.
+    weekday(): Mon=0, Tue=1, Wed=2, Thu=3, Fri=4, Sat=5, Sun=6
+    days_since_sat = (weekday - 5) % 7
+      Sat=5 -> 0  (today is Saturday)
+      Sun=6 -> 1  (yesterday was Saturday)
+      Mon=0 -> 2  (2 days ago was Saturday)
+      ...
+    """
+    now_bdt        = _dt.datetime.now(_BDT)
     days_since_sat = (now_bdt.weekday() - 5) % 7
-    sat = (now_bdt - _dt.timedelta(days=days_since_sat)).replace(
-        hour=0, minute=0, second=0, microsecond=0
-    )
-    return int(sat.timestamp())
+    sat_date       = now_bdt.date() - _dt.timedelta(days=days_since_sat)
+    sat_midnight   = _dt.datetime(sat_date.year, sat_date.month, sat_date.day,
+                                  0, 0, 0, tzinfo=_BDT)
+    return int(sat_midnight.timestamp())
 
 def _bdt_month_start() -> int:
-    """Return Unix timestamp of 1st day of current month BDT 00:00."""
-    now_bdt = _dt.datetime.now(_BDT)
-    first   = now_bdt.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    """Return Unix timestamp of 1st day of current BDT month at 00:00."""
+    now_bdt  = _dt.datetime.now(_BDT)
+    first    = _dt.datetime(now_bdt.year, now_bdt.month, 1,
+                            0, 0, 0, tzinfo=_BDT)
     return int(first.timestamp())
 
 def record_stat(event_type: str, telegram_id: int = 0, vault_id: str = ""):
