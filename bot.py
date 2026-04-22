@@ -256,6 +256,39 @@ def get_all_signup_disabled_users() -> list:
     return [r["telegram_id"] for r in rows]
 
 
+# ── Telegram Ban helpers ───────────────────────────────────────────────────
+
+def is_telegram_banned(telegram_id: int) -> bool:
+    """Returns True if this Telegram ID is banned from using the bot."""
+    with get_db() as c:
+        row = c.execute(
+            "SELECT 1 FROM telegram_banned WHERE telegram_id=?", (telegram_id,)
+        ).fetchone()
+    return row is not None
+
+def set_telegram_ban(telegram_id: int, username: str, banned: bool):
+    """Ban or unban a Telegram ID."""
+    with get_db() as c:
+        if banned:
+            c.execute(
+                "INSERT OR REPLACE INTO telegram_banned (telegram_id, tg_username) VALUES (?,?)",
+                (telegram_id, username or "")
+            )
+        else:
+            c.execute(
+                "DELETE FROM telegram_banned WHERE telegram_id=?", (telegram_id,)
+            )
+        c.commit()
+
+def get_all_banned_users() -> list:
+    """Return all banned telegram entries as list of dicts."""
+    with get_db() as c:
+        rows = c.execute(
+            "SELECT telegram_id, tg_username, banned_at FROM telegram_banned ORDER BY banned_at DESC"
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
 # ── Statistics helpers ─────────────────────────────────────────────────────
 _BDT = _ZoneInfo("Asia/Dhaka")
 
@@ -658,6 +691,12 @@ def init_db():
         c.execute("""CREATE TABLE IF NOT EXISTS user_login_disabled (
             telegram_id   INTEGER PRIMARY KEY,
             disabled_at   INTEGER DEFAULT (strftime('%s','now')))""")
+
+        # Telegram-level ban (blocks all bot interaction except broadcast)
+        c.execute("""CREATE TABLE IF NOT EXISTS telegram_banned (
+            telegram_id   INTEGER PRIMARY KEY,
+            tg_username   TEXT    DEFAULT '',
+            banned_at     INTEGER DEFAULT (strftime('%s','now')))""")
 
         # Statistics event log - records all key events with BDT-aligned timestamps
         c.execute("""CREATE TABLE IF NOT EXISTS stats_events (
@@ -1477,6 +1516,13 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not update.message:
         return
     uid  = update.effective_user.id
+    # Ban check: silently ignore all banned users (no response)
+    if is_telegram_banned(uid):
+        try:
+            await update.message.delete()
+        except Exception:
+            pass
+        return AUTH_MENU
     # Auto-delete the /start command message
     asyncio.create_task(auto_delete_msg(update.message, delay=3))
     # Update last_seen for any active user
@@ -4274,6 +4320,13 @@ async def global_auto_detect(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not update.message:
         return
     uid   = update.effective_user.id
+    # Silently ignore banned users
+    if is_telegram_banned(uid):
+        try:
+            await update.message.delete()
+        except Exception:
+            pass
+        return
     vault = get_session(uid)
     pw    = ctx.user_data.get("password")
     # Auto-delete the incoming message after 30s regardless of content
@@ -4534,9 +4587,10 @@ def _adm_kb() -> InlineKeyboardMarkup:
          InlineKeyboardButton("🔑 Login Control",  callback_data="adm_login")],
         [InlineKeyboardButton("📢 Broadcast",      callback_data="adm_broadcast"),
          InlineKeyboardButton("🔢 TOTP Limit",     callback_data="adm_totp_limit")],
+        [InlineKeyboardButton("🛡 User Control",   callback_data="adm_user_control"),
+         InlineKeyboardButton("📊 Statistics",     callback_data="adm_statistics")],
         [InlineKeyboardButton("💾 Backup",         callback_data="adm_noop"),
          InlineKeyboardButton("📋 Log",            callback_data="adm_noop")],
-        [InlineKeyboardButton("📊 Statistics",     callback_data="adm_statistics")],
     ])
 
 
@@ -4679,6 +4733,109 @@ async def adm_stats_lifetime_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     kb   = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="adm_statistics")]])
     msg  = await q.message.reply_text(text, reply_markup=kb)
     asyncio.create_task(auto_delete_msg(msg, delay=300))
+
+
+async def adm_user_control_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Show User Control sub-menu with 7 buttons."""
+    q = update.callback_query; await q.answer()
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Account Enable",          callback_data="adm_uc_enable")],
+        [InlineKeyboardButton("🚫 Account Disable",         callback_data="adm_uc_disable")],
+        [InlineKeyboardButton("📋 Disabled ID List",        callback_data="adm_uc_disabled_list")],
+        [InlineKeyboardButton("🔨 Telegram ID Ban",         callback_data="adm_uc_ban")],
+        [InlineKeyboardButton("✅ Telegram ID Unban",       callback_data="adm_uc_unban")],
+        [InlineKeyboardButton("📋 Telegram Ban ID List",    callback_data="adm_uc_ban_list")],
+        [InlineKeyboardButton("⬅️ Back",                    callback_data="adm_back")],
+    ])
+    msg = await q.message.reply_text("🛡 User Control\n\nManage accounts and bans.", reply_markup=kb)
+    asyncio.create_task(auto_delete_msg(msg, delay=300))
+
+
+async def adm_uc_enable_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Ask for identifier to enable an account."""
+    q = update.callback_query; await q.answer()
+    _admin_import_pending[update.effective_chat.id] = {"step": "adm_uc_enable_wait"}
+    msg = await q.message.reply_text(
+        "Please provide the Vault ID, Telegram ID or Username of the ID you want to enable."
+    )
+    asyncio.create_task(auto_delete_msg(msg, delay=120))
+
+
+async def adm_uc_disable_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Ask for identifier to disable an account."""
+    q = update.callback_query; await q.answer()
+    _admin_import_pending[update.effective_chat.id] = {"step": "adm_uc_disable_wait"}
+    msg = await q.message.reply_text(
+        "Please provide the Vault ID, Telegram ID or Username of the ID you want to Disable."
+    )
+    asyncio.create_task(auto_delete_msg(msg, delay=120))
+
+
+async def adm_uc_disabled_list_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Export list of disabled accounts as txt file."""
+    q = update.callback_query; await q.answer()
+    chat_id = update.effective_chat.id
+    with get_db() as c:
+        rows = c.execute(
+            "SELECT vault_id, telegram_id, tg_username, account_disabled FROM users "
+            "WHERE account_disabled=1 ORDER BY vault_id"
+        ).fetchall()
+    if not rows:
+        msg = await q.message.reply_text("No disabled accounts found.")
+        asyncio.create_task(auto_delete_msg(msg, delay=60))
+        return
+    lines = ["Disabled Accounts List", f"Total: {len(rows)}", "=" * 40]
+    for r in rows:
+        uname = f"@{r['tg_username']}" if r["tg_username"] else "(no username)"
+        lines.append(f"Vault: {r['vault_id']}  |  TG: {r['telegram_id']}  |  {uname}")
+    bio = BytesIO("\n".join(lines).encode("utf-8"))
+    bio.name = "disabled_accounts.txt"
+    await ctx.bot.send_document(
+        chat_id=chat_id, document=bio, filename="disabled_accounts.txt",
+        caption=f"📋 {len(rows)} disabled account(s)."
+    )
+
+
+async def adm_uc_ban_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Ask for Telegram ID or username to ban."""
+    q = update.callback_query; await q.answer()
+    _admin_import_pending[update.effective_chat.id] = {"step": "adm_uc_ban_wait"}
+    msg = await q.message.reply_text(
+        "Please provide the username or user ID of the Telegram ID you want to ban."
+    )
+    asyncio.create_task(auto_delete_msg(msg, delay=120))
+
+
+async def adm_uc_unban_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Ask for Telegram ID or username to unban."""
+    q = update.callback_query; await q.answer()
+    _admin_import_pending[update.effective_chat.id] = {"step": "adm_uc_unban_wait"}
+    msg = await q.message.reply_text(
+        "Please provide the username or user ID of the Telegram ID you want to unban."
+    )
+    asyncio.create_task(auto_delete_msg(msg, delay=120))
+
+
+async def adm_uc_ban_list_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Export list of banned Telegram IDs as txt file."""
+    q = update.callback_query; await q.answer()
+    chat_id  = update.effective_chat.id
+    banned   = get_all_banned_users()
+    if not banned:
+        msg = await q.message.reply_text("No banned users found.")
+        asyncio.create_task(auto_delete_msg(msg, delay=60))
+        return
+    lines = ["Telegram Banned ID List", f"Total: {len(banned)}", "=" * 40]
+    for b in banned:
+        uname    = f"@{b['tg_username']}" if b["tg_username"] else "(no username)"
+        ban_date = datetime.datetime.fromtimestamp(b["banned_at"]).strftime("%Y-%m-%d %H:%M UTC")
+        lines.append(f"TG: {b['telegram_id']}  |  {uname}  |  Banned: {ban_date}")
+    bio = BytesIO("\n".join(lines).encode("utf-8"))
+    bio.name = "banned_users.txt"
+    await ctx.bot.send_document(
+        chat_id=chat_id, document=bio, filename="banned_users.txt",
+        caption=f"📋 {len(banned)} banned user(s)."
+    )
 
 
 async def adm_noop_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -5392,6 +5549,169 @@ async def admin_group_message_handler(update: Update, ctx: ContextTypes.DEFAULT_
             reply_markup=kb,
         )
         asyncio.create_task(auto_delete_msg(msg, delay=300))
+        return
+
+    if step == "adm_uc_enable_wait":
+        _admin_import_pending.pop(chat_id, None)
+        asyncio.create_task(auto_delete_msg(update.message, delay=5))
+        u = _resolve_user(raw)
+        if not u:
+            msg = await update.message.reply_text(f"User not found: {raw}")
+            asyncio.create_task(auto_delete_msg(msg, delay=60))
+            return
+        vault_id = u["vault_id"]
+        if not u["account_disabled"]:
+            msg = await update.message.reply_text(
+                f"Account {vault_id} is already enabled."
+            )
+            asyncio.create_task(auto_delete_msg(msg, delay=60))
+            return
+        with get_db() as c:
+            c.execute("UPDATE users SET account_disabled=0 WHERE vault_id=?", (vault_id,))
+            c.commit()
+        record_stat("account_enabled", telegram_id=u["telegram_id"], vault_id=vault_id)
+        try:
+            await ctx.bot.send_message(
+                chat_id=u["telegram_id"],
+                text="✅ *Your account has been re\\-enabled\\. You can log in again\\.*",
+                parse_mode="MarkdownV2",
+            )
+        except Exception:
+            pass
+        msg = await update.message.reply_text(
+            f"✅ Account {vault_id} ({u['tg_username'] or u['telegram_id']}) has been ENABLED."
+        )
+        asyncio.create_task(auto_delete_msg(msg, delay=60))
+        return
+
+    if step == "adm_uc_disable_wait":
+        _admin_import_pending.pop(chat_id, None)
+        asyncio.create_task(auto_delete_msg(update.message, delay=5))
+        u = _resolve_user(raw)
+        if not u:
+            msg = await update.message.reply_text(f"User not found: {raw}")
+            asyncio.create_task(auto_delete_msg(msg, delay=60))
+            return
+        vault_id = u["vault_id"]
+        if u["account_disabled"]:
+            msg = await update.message.reply_text(
+                f"Account {vault_id} is already disabled."
+            )
+            asyncio.create_task(auto_delete_msg(msg, delay=60))
+            return
+        with get_db() as c:
+            c.execute("UPDATE users SET account_disabled=1 WHERE vault_id=?", (vault_id,))
+            c.execute("DELETE FROM sessions WHERE vault_id=?", (vault_id,))
+            c.commit()
+        _session_pw_cache.pop(vault_id, None)
+        record_stat("account_disabled", telegram_id=u["telegram_id"], vault_id=vault_id)
+        try:
+            await ctx.bot.send_message(
+                chat_id=u["telegram_id"],
+                text="🚫 *Your account has been disabled by an administrator\\.*\\n\\n"
+                     "_Your data is safe and has not been deleted\\._",
+                parse_mode="MarkdownV2",
+            )
+        except Exception:
+            pass
+        msg = await update.message.reply_text(
+            f"🚫 Account {vault_id} ({u['tg_username'] or u['telegram_id']}) has been DISABLED."
+        )
+        asyncio.create_task(auto_delete_msg(msg, delay=60))
+        return
+
+    if step == "adm_uc_ban_wait":
+        _admin_import_pending.pop(chat_id, None)
+        asyncio.create_task(auto_delete_msg(update.message, delay=5))
+        raw_strip = raw.lstrip("@")
+        tid_resolved = None
+        uname_resolved = ""
+        if raw.isdigit():
+            tid_resolved = int(raw)
+            # try to get username from users table
+            with get_db() as c:
+                row = c.execute(
+                    "SELECT tg_username FROM users WHERE telegram_id=?", (tid_resolved,)
+                ).fetchone()
+            uname_resolved = row["tg_username"] if row else ""
+        else:
+            with get_db() as c:
+                row = c.execute(
+                    "SELECT telegram_id, tg_username FROM users WHERE tg_username=?", (raw_strip,)
+                ).fetchone()
+            if row:
+                tid_resolved   = row["telegram_id"]
+                uname_resolved = row["tg_username"]
+        if not tid_resolved:
+            msg = await update.message.reply_text(
+                f"User not found: {raw}\nOnly registered users can be looked up by @username."
+            )
+            asyncio.create_task(auto_delete_msg(msg, delay=60))
+            return
+        if is_telegram_banned(tid_resolved):
+            msg = await update.message.reply_text(
+                f"Telegram ID {tid_resolved} is already banned."
+            )
+            asyncio.create_task(auto_delete_msg(msg, delay=60))
+            return
+        set_telegram_ban(tid_resolved, uname_resolved, True)
+        # Notify the user
+        try:
+            await ctx.bot.send_message(
+                chat_id=tid_resolved,
+                text="🚫 Your Telegram ID has been banned from this bot."
+            )
+        except Exception:
+            pass
+        uname_str = f"@{uname_resolved}" if uname_resolved else str(tid_resolved)
+        msg = await update.message.reply_text(
+            f"🔨 Telegram ID {tid_resolved} ({uname_str}) has been BANNED."
+        )
+        asyncio.create_task(auto_delete_msg(msg, delay=60))
+        return
+
+    if step == "adm_uc_unban_wait":
+        _admin_import_pending.pop(chat_id, None)
+        asyncio.create_task(auto_delete_msg(update.message, delay=5))
+        raw_strip    = raw.lstrip("@")
+        tid_resolved = None
+        uname_resolved = ""
+        if raw.isdigit():
+            tid_resolved = int(raw)
+        else:
+            with get_db() as c:
+                row = c.execute(
+                    "SELECT telegram_id, tg_username FROM users WHERE tg_username=?", (raw_strip,)
+                ).fetchone()
+            if row:
+                tid_resolved   = row["telegram_id"]
+                uname_resolved = row["tg_username"]
+            else:
+                # also check banned table directly
+                with get_db() as c:
+                    row = c.execute(
+                        "SELECT telegram_id, tg_username FROM telegram_banned WHERE tg_username=?",
+                        (raw_strip,)
+                    ).fetchone()
+                if row:
+                    tid_resolved   = row["telegram_id"]
+                    uname_resolved = row["tg_username"]
+        if not tid_resolved:
+            msg = await update.message.reply_text(f"User not found: {raw}")
+            asyncio.create_task(auto_delete_msg(msg, delay=60))
+            return
+        if not is_telegram_banned(tid_resolved):
+            msg = await update.message.reply_text(
+                f"Telegram ID {tid_resolved} is not currently banned."
+            )
+            asyncio.create_task(auto_delete_msg(msg, delay=60))
+            return
+        set_telegram_ban(tid_resolved, uname_resolved, False)
+        uname_str = f"@{uname_resolved}" if uname_resolved else str(tid_resolved)
+        msg = await update.message.reply_text(
+            f"✅ Telegram ID {tid_resolved} ({uname_str}) has been UNBANNED."
+        )
+        asyncio.create_task(auto_delete_msg(msg, delay=60))
         return
 
     if step == "adm_specific_login_enable_wait":
@@ -6364,6 +6684,13 @@ def main():
             return _guarded
 
         app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_noop_cb),                  pattern="^adm_noop$"))
+        app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_user_control_cb),        pattern="^adm_user_control$"))
+        app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_uc_enable_cb),           pattern="^adm_uc_enable$"))
+        app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_uc_disable_cb),          pattern="^adm_uc_disable$"))
+        app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_uc_disabled_list_cb),    pattern="^adm_uc_disabled_list$"))
+        app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_uc_ban_cb),              pattern="^adm_uc_ban$"))
+        app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_uc_unban_cb),            pattern="^adm_uc_unban$"))
+        app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_uc_ban_list_cb),         pattern="^adm_uc_ban_list$"))
         app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_statistics_cb),          pattern="^adm_statistics$"))
         app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_stats_today_cb),         pattern="^adm_stats_today$"))
         app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_stats_weekly_cb),        pattern="^adm_stats_weekly$"))
