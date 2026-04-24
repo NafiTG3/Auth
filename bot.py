@@ -527,13 +527,42 @@ def _auto_suffix_name(vault_id: str, requested_name: str) -> str:
     return base  # fallback (should never happen)
 
 # ── DB ─────────────────────────────────────────────────────
+import threading as _threading
+
+_db_local = _threading.local()   # one persistent connection per thread
+
+def _get_thread_conn() -> sqlite3.Connection:
+    """Return a long-lived, WAL-enabled SQLite connection for the current thread.
+    Opens once per thread, reuses afterwards — eliminates per-call connect overhead.
+    check_same_thread=False is safe here because we use thread-local storage.
+    """
+    conn = getattr(_db_local, "conn", None)
+    if conn is None:
+        conn = sqlite3.connect(
+            DB_PATH,
+            timeout=30.0,
+            check_same_thread=False,   # safe: one conn per thread via _db_local
+        )
+        conn.row_factory = sqlite3.Row
+        # WAL mode: readers never block writers, writers never block readers
+        conn.execute("PRAGMA journal_mode=WAL")
+        # Larger cache = fewer disk reads
+        conn.execute("PRAGMA cache_size=-8000")   # 8 MB per thread
+        # Sync less aggressively (WAL already protects durability)
+        conn.execute("PRAGMA synchronous=NORMAL")
+        _db_local.conn = conn
+    return conn
+
+
 class _DB:
-    """SQLite connection context manager that commits AND closes on exit."""
-    def __init__(self):
-        self._conn = sqlite3.connect(DB_PATH, timeout=10.0, check_same_thread=True)
-        self._conn.row_factory = sqlite3.Row
-    def __enter__(self):
+    """Context manager that wraps the thread-local connection.
+    Commits on clean exit, rolls back on exception, never closes the connection
+    (it stays alive for the thread lifetime for performance).
+    """
+    def __enter__(self) -> sqlite3.Connection:
+        self._conn = _get_thread_conn()
         return self._conn
+
     def __exit__(self, exc_type, exc_val, exc_tb):
         if exc_type is None:
             try:
@@ -545,23 +574,27 @@ class _DB:
                 self._conn.rollback()
             except Exception:
                 pass
-        try:
-            self._conn.close()
-        except Exception:
-            pass
-        return False
+        return False   # do NOT suppress exceptions
+
+    # Allow using _DB instance directly (legacy callers do `with get_db() as c: c.execute(...)`)
     def execute(self, *a, **kw):
-        return self._conn.execute(*a, **kw)
-    def close(self):
-        try:
-            self._conn.close()
-        except Exception:
-            pass
+        return _get_thread_conn().execute(*a, **kw)
+
+    def commit(self):
+        _get_thread_conn().commit()
+
 
 def get_db() -> "_DB":
     return _DB()
 
 def init_db():
+    # Enable WAL mode at startup (persists in DB file, applies to all future connections)
+    _startup_conn = sqlite3.connect(DB_PATH, timeout=30.0)
+    _startup_conn.execute("PRAGMA journal_mode=WAL")
+    _startup_conn.execute("PRAGMA synchronous=NORMAL")
+    _startup_conn.commit()
+    _startup_conn.close()
+
     with get_db() as c:
         c.execute("""CREATE TABLE IF NOT EXISTS users (
             id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -6443,7 +6476,18 @@ def main():
     init_db()
     purge_expired_share_links()
     token   = os.environ["BOT_TOKEN"]
-    app     = ApplicationBuilder().token(token).build()
+    app = (
+        ApplicationBuilder()
+        .token(token)
+        # Allow multiple updates to be processed concurrently (different users don't block each other)
+        .concurrent_updates(True)
+        # More worker threads for concurrent handler execution
+        .pool_timeout(30.0)
+        .connect_timeout(30.0)
+        .read_timeout(30.0)
+        .write_timeout(30.0)
+        .build()
+    )
     private = filters.ChatType.PRIVATE
     group   = filters.ChatType.GROUPS
 
