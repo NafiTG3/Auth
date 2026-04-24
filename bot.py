@@ -4622,7 +4622,7 @@ def _adm_kb() -> InlineKeyboardMarkup:
          InlineKeyboardButton("🔢 TOTP Limit",     callback_data="adm_totp_limit")],
         [InlineKeyboardButton("🛡 User Control",   callback_data="adm_user_control"),
          InlineKeyboardButton("📊 Statistics",     callback_data="adm_statistics")],
-        [InlineKeyboardButton("💾 Backup",         callback_data="adm_noop"),
+        [InlineKeyboardButton("💾 Backup",         callback_data="adm_backup"),
          InlineKeyboardButton("📋 Log",            callback_data="adm_noop")],
     ])
 
@@ -4869,6 +4869,50 @@ async def adm_uc_ban_list_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         chat_id=chat_id, document=bio, filename="banned_users.txt",
         caption=f"📋 {len(banned)} banned user(s)."
     )
+
+
+async def adm_backup_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Show Backup sub-menu with 5 buttons."""
+    q = update.callback_query; await q.answer()
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("💾 Backup All Data",          callback_data="adm_backup_all")],
+        [InlineKeyboardButton("📥 Restore All Data",         callback_data="adm_backup_restore")],
+        [InlineKeyboardButton("👤 Backup Specific User Data",callback_data="adm_backup_specific")],
+        [InlineKeyboardButton("🔧 User Backup Control",      callback_data="adm_noop")],
+        [InlineKeyboardButton("⬅️ Back",                     callback_data="adm_back")],
+    ])
+    msg = await q.message.reply_text(
+        "💾 Backup & Restore\n\nChoose an option below.", reply_markup=kb
+    )
+    asyncio.create_task(auto_delete_msg(msg, delay=300))
+
+
+async def adm_backup_all_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Ask admin for encryption password to backup all data."""
+    q = update.callback_query; await q.answer()
+    _admin_import_pending[update.effective_chat.id] = {"step": "adm_backup_pw_wait"}
+    msg = await q.message.reply_text(
+        "Enter the password you want to use for file encryption."
+    )
+    asyncio.create_task(auto_delete_msg(msg, delay=120))
+
+
+async def adm_backup_restore_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Ask admin to send the encrypted backup file."""
+    q = update.callback_query; await q.answer()
+    _admin_import_pending[update.effective_chat.id] = {"step": "adm_backup_restore_file"}
+    msg = await q.message.reply_text("Send your encrypted data file here.")
+    asyncio.create_task(auto_delete_msg(msg, delay=120))
+
+
+async def adm_backup_specific_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Ask for Vault ID or Telegram ID to export specific user data."""
+    q = update.callback_query; await q.answer()
+    _admin_import_pending[update.effective_chat.id] = {"step": "adm_backup_specific_wait"}
+    msg = await q.message.reply_text(
+        "Provide the Telegram user ID or vault ID of the user whose vault you want to export."
+    )
+    asyncio.create_task(auto_delete_msg(msg, delay=120))
 
 
 async def adm_noop_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -5409,64 +5453,11 @@ async def admin_user_info(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # admin_broadcast command removed - broadcast is now controlled via
 # the Dashboard Broadcast button (adm_broadcast_cb / admin_broadcast_recv).
 
-async def admin_export(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """
-    /export <password>
-    Exports the entire DB as an encrypted .bvadmin file to the admin group.
-    """
-    if not _is_admin_msg(update):
-        return
-    asyncio.create_task(auto_delete_msg(update.message, delay=60))
-    if not ctx.args:
-        msg = await update.message.reply_text("Usage: /export <encryption_password>")
-        asyncio.create_task(auto_delete_msg(msg, delay=60))
-        return
-    password = ctx.args[0]
-    tables = [
-        "users", "totp_accounts", "sessions", "reset_otps",
-        "reset_attempts", "login_alerts", "share_links",
-        "login_attempts", "backup_reminders", "bot_settings",
-        "auto_backup_settings",
-    ]
-    dump = {}
-    with get_db() as c:
-        for tbl in tables:
-            try:
-                rows = c.execute(f"SELECT * FROM {tbl}").fetchall()
-                dump[tbl] = [dict(r) for r in rows]
-            except Exception as e:
-                logger.warning(f"Admin export table {tbl}: {e}")
-    plain   = json.dumps(dump, ensure_ascii=False, default=str).encode()
-    payload = _admin_encrypt(plain, password)
-    ts_str  = datetime.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-    fname   = f"bv_admin_export_{ts_str}.bvadmin"
-    bio     = BytesIO(payload)
-    bio.name = fname
-    await update.message.reply_document(
-        document=bio,
-        filename=fname,
-        caption=(
-            f"🔒 BV Authenticator -- Full DB Export\n"
-            f"📅 {ts_str}\n"
-            f"🔑 Encrypted with the password you provided.\n\n"
-            f"Use /import to restore."
-        ),
-    )
+# admin_export and admin_import commands removed - backup/restore is now
+# managed via the Dashboard Backup button (adm_backup_cb and sub-callbacks).
 
-# Admin import state: waiting for the .bvadmin file
-_admin_import_pending: dict = {}   # chat_id → {"password": str}
-
-async def admin_import(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """/import  -- starts the import process in the admin group."""
-    if not _is_admin_msg(update):
-        return
-    asyncio.create_task(auto_delete_msg(update.message, delay=60))
-    chat_id = update.effective_chat.id
-    _admin_import_pending[chat_id] = {"step": "wait_file"}
-    msg = await update.message.reply_text(
-        "📥 Admin Import\n\nSend the .bvadmin backup file now."
-    )
-    asyncio.create_task(auto_delete_msg(msg, delay=60))
+# Admin pending state dict (kept here for reference by all step handlers)
+_admin_import_pending: dict = {}   # chat_id -> {step: str, ...}
 
 async def admin_group_message_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Unified handler for ALL non-command messages in the admin group.
@@ -5525,6 +5516,166 @@ async def admin_group_message_handler(update: Update, ctx: ContextTypes.DEFAULT_
                 filename="broadcast_failed_ids.txt",
                 caption=f"⚠️ {failed} user(s) could not be reached. Their Telegram IDs are listed above.",
             )
+        return
+
+    # ── Backup All: admin typed the encryption password ─────────────────
+    if step == "adm_backup_pw_wait":
+        _admin_import_pending.pop(chat_id, None)
+        asyncio.create_task(auto_delete_msg(update.message, delay=5))
+        if len(raw) > 150:
+            msg = await update.message.reply_text(
+                "Password must be 150 characters or less. Please try again."
+            )
+            asyncio.create_task(auto_delete_msg(msg, delay=60))
+            return
+        if not raw:
+            msg = await update.message.reply_text("Password cannot be empty.")
+            asyncio.create_task(auto_delete_msg(msg, delay=60))
+            return
+        progress = await update.message.reply_text("⏳ Creating backup, please wait...")
+        _backup_tables = [
+            "users", "totp_accounts", "sessions", "reset_otps",
+            "reset_attempts", "login_alerts", "share_links",
+            "login_attempts", "backup_reminders", "bot_settings",
+            "auto_backup_settings",
+        ]
+        dump = {}
+        with get_db() as c:
+            for tbl in _backup_tables:
+                try:
+                    rows = c.execute(f"SELECT * FROM {tbl}").fetchall()
+                    dump[tbl] = [dict(r) for r in rows]
+                except Exception as e:
+                    logger.warning(f"Backup table {tbl}: {e}")
+        plain   = json.dumps(dump, ensure_ascii=False, default=str).encode()
+        payload = _admin_encrypt(plain, raw)
+        ts_str  = datetime.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        fname   = f"bv_backup_{ts_str}.bvadmin"
+        bio     = BytesIO(payload); bio.name = fname
+        try:
+            await progress.delete()
+        except Exception:
+            pass
+        await ctx.bot.send_document(
+            chat_id=chat_id, document=bio, filename=fname,
+            caption=(
+                f"💾 Full DB Backup\n"
+                f"📅 {ts_str} UTC\n"
+                f"🔑 Encrypted with your provided password.\n\n"
+                f"Use the Restore button to import."
+            ),
+        )
+        return
+
+    # ── Restore: admin sent the encrypted backup file ─────────────────────
+    if step == "adm_backup_restore_file":
+        if not update.message.document:
+            msg = await update.message.reply_text("⚠️ Please send a .bvadmin backup file.")
+            asyncio.create_task(auto_delete_msg(msg, delay=60))
+            return
+        asyncio.create_task(auto_delete_msg(update.message, delay=60))
+        bio = BytesIO()
+        f   = await update.message.document.get_file()
+        await f.download_to_memory(bio)
+        _admin_import_pending[chat_id] = {"step": "adm_backup_restore_pw", "payload": bio.getvalue()}
+        msg = await update.message.reply_text(
+            "🔒 File received. Now send the encryption password."
+        )
+        asyncio.create_task(auto_delete_msg(msg, delay=120))
+        return
+
+    # ── Restore: admin typed decryption password ──────────────────────────
+    if step == "adm_backup_restore_pw":
+        payload = state.get("payload", b"")
+        _admin_import_pending.pop(chat_id, None)
+        asyncio.create_task(auto_delete_msg(update.message, delay=5))
+        try:
+            plain = _admin_decrypt(payload, raw)
+            dump  = json.loads(plain.decode())
+        except Exception:
+            msg = await update.message.reply_text(
+                "❌ Wrong password or corrupted file. Restore cancelled."
+            )
+            asyncio.create_task(auto_delete_msg(msg, delay=60))
+            return
+        progress = await update.message.reply_text("⏳ Restoring data, please wait...")
+        _restore_tables = [
+            "users", "totp_accounts", "sessions", "reset_otps",
+            "reset_attempts", "login_alerts", "share_links",
+            "login_attempts", "backup_reminders", "bot_settings",
+            "auto_backup_settings",
+        ]
+        restored = []
+        with get_db() as c:
+            for tbl in _restore_tables:
+                if tbl not in dump:
+                    continue
+                try:
+                    c.execute(f"DELETE FROM {tbl}")
+                    rows = dump[tbl]
+                    if rows:
+                        cols = ", ".join(rows[0].keys())
+                        placeholders = ", ".join("?" for _ in rows[0])
+                        for row in rows:
+                            c.execute(
+                                f"INSERT OR REPLACE INTO {tbl} ({cols}) VALUES ({placeholders})",
+                                list(row.values()),
+                            )
+                    restored.append(tbl)
+                except Exception as e:
+                    logger.warning(f"Restore table {tbl}: {e}")
+            c.commit()
+        _load_bot_settings()
+        try:
+            await progress.delete()
+        except Exception:
+            pass
+        await ctx.bot.send_message(
+            chat_id=chat_id,
+            text=f"✅ Restore complete. Tables restored: {', '.join(restored)}",
+        )
+        return
+
+    # ── Backup Specific User: admin typed vault id or telegram id ─────────
+    if step == "adm_backup_specific_wait":
+        _admin_import_pending.pop(chat_id, None)
+        asyncio.create_task(auto_delete_msg(update.message, delay=5))
+        u = _resolve_user(raw)
+        if not u:
+            msg = await update.message.reply_text(f"User not found: {raw}")
+            asyncio.create_task(auto_delete_msg(msg, delay=60))
+            return
+        vault_id = u["vault_id"]
+        # Export this user's rows from all relevant tables
+        with get_db() as c:
+            user_row   = dict(c.execute("SELECT * FROM users WHERE vault_id=?", (vault_id,)).fetchone() or {})
+            totp_rows  = [dict(r) for r in c.execute("SELECT * FROM totp_accounts WHERE vault_id=?", (vault_id,)).fetchall()]
+            sess_rows  = [dict(r) for r in c.execute("SELECT * FROM sessions WHERE vault_id=?", (vault_id,)).fetchall()]
+            alert_rows = [dict(r) for r in c.execute("SELECT * FROM login_alerts WHERE vault_id=?", (vault_id,)).fetchall()]
+        dump = {
+            "vault_id":  vault_id,
+            "user":      user_row,
+            "totp_accounts": totp_rows,
+            "sessions":  sess_rows,
+            "login_alerts": alert_rows,
+        }
+        plain   = json.dumps(dump, ensure_ascii=False, default=str).encode()
+        # Encrypt with vault_id as password (admin can share it separately)
+        payload = _admin_encrypt(plain, vault_id)
+        ts_str  = datetime.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        fname   = f"bv_user_{vault_id[:8]}_{ts_str}.bvadmin"
+        bio     = BytesIO(payload); bio.name = fname
+        uname   = f"@{u['tg_username']}" if u["tg_username"] else str(u["telegram_id"])
+        await ctx.bot.send_document(
+            chat_id=chat_id, document=bio, filename=fname,
+            caption=(
+                f"👤 User Vault Export\n"
+                f"Vault: {vault_id}\n"
+                f"User: {uname}\n"
+                f"TOTP entries: {len(totp_rows)}\n"
+                f"🔑 Encrypted with vault ID as password."
+            ),
+        )
         return
 
     # ── Import: wait for .bvadmin file ───────────────────────────────────
@@ -6712,8 +6863,6 @@ def main():
         admin_filter = filters.Chat(chat_id=ADMIN_GROUP_ID)
         app.add_handler(CommandHandler("start",        admin_group_start,     filters=admin_filter))
         # /login command removed - login is now managed via Dashboard Login Control button.
-        app.add_handler(CommandHandler("export",       admin_export,          filters=admin_filter))
-        app.add_handler(CommandHandler("import",       admin_import,          filters=admin_filter))
         app.add_handler(CommandHandler("userall",      admin_userall_export,  filters=admin_filter))
         # Dashboard callback handlers
         # NOTE: CallbackQueryHandler does NOT support a 'filters' kwarg in PTB v20+.
@@ -6728,6 +6877,10 @@ def main():
             return _guarded
 
         app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_noop_cb),                  pattern="^adm_noop$"))
+        app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_backup_cb),              pattern="^adm_backup$"))
+        app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_backup_all_cb),          pattern="^adm_backup_all$"))
+        app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_backup_restore_cb),      pattern="^adm_backup_restore$"))
+        app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_backup_specific_cb),     pattern="^adm_backup_specific$"))
         app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_user_control_cb),        pattern="^adm_user_control$"))
         app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_uc_enable_cb),           pattern="^adm_uc_enable$"))
         app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_uc_disable_cb),          pattern="^adm_uc_disable$"))
