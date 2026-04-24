@@ -58,6 +58,7 @@ MAX_LOGIN_ATTEMPTS  = 5     # max failed logins before freeze
 LOGIN_FREEZE_HOURS  = 18    # freeze duration
 TOTP_PER_PAGE       = 5     # TOTP entries per page in list view
 MAX_TOTP_PER_VAULT  = 200   # max TOTP accounts per vault
+MAX_TOTP_DUPLICATE  = 15    # max duplicate TOTP entries allowed per vault
 NOTE_MAX_LEN        = 10    # max note characters
 BACKUP_REMINDER_WEEKLY  = "weekly"
 BACKUP_REMINDER_MONTHLY = "monthly"
@@ -1981,7 +1982,9 @@ async def login_pw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         return AUTH_MENU
 
-    if not hmac.compare_digest(hash_pw(pw, bytes(u["pw_salt"]), u["kdf_type"] or "pbkdf2"), bytes(u["password_hash"])):
+    kdf_type = u["kdf_type"] or "pbkdf2"
+    computed = await asyncio.to_thread(hash_pw, pw, bytes(u["pw_salt"]), kdf_type)
+    if not hmac.compare_digest(computed, bytes(u["password_hash"])):
         # Record failed attempt and check freeze
         frozen = record_login_failure(vid)
         record_stat("login_fail", telegram_id=uid, vault_id=vid)
@@ -3943,7 +3946,16 @@ async def export_pw1_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid   = update.effective_user.id
     vault = get_session(uid)
     u     = get_user(vault)
-    if not u or not hmac.compare_digest(hash_pw(pw, bytes(u["pw_salt"]), u["kdf_type"] or "pbkdf2"), bytes(u["password_hash"])):
+    if not u:
+        await update.message.reply_text(
+            "❌ Wrong account password\\.",
+            parse_mode="MarkdownV2",
+            reply_markup=kb_cancel(),
+        )
+        return EXPORT_PW1_INPUT
+    kdf_e   = u["kdf_type"] or "pbkdf2"
+    computed_e = await asyncio.to_thread(hash_pw, pw, bytes(u["pw_salt"]), kdf_e)
+    if not hmac.compare_digest(computed_e, bytes(u["password_hash"])):
         await update.message.reply_text(
             "❌ Wrong account password\\.",
             parse_mode="MarkdownV2",
@@ -3986,15 +3998,25 @@ async def export_pw2_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             reply_markup=kb_main(),
         )
         return TOTP_MENU
-    entries = []
-    for row in rows:
-        try:
-            secret = decrypt(row["secret_enc"], row["salt"], row["iv"], _get_vault_key(vault, pw), vault)
-            entries.append({"name": row["name"], "issuer": row["issuer"] or "", "secret": secret})
-        except Exception as e:
-            logger.error(f"Export decrypt: {e}")
-    plain   = json.dumps({"version": 3, "vault_id": vault, "accounts": entries}, ensure_ascii=False).encode()
-    payload = export_encrypt(plain, file_pw)
+    processing_msg = await update.message.reply_text("⏳ Preparing export...")
+
+    def _build_export():
+        vault_key = _get_vault_key(vault, pw)   # expensive once, reused for all entries
+        _entries = []
+        for row in rows:
+            try:
+                secret = decrypt(row["secret_enc"], row["salt"], row["iv"], vault_key, vault)
+                _entries.append({"name": row["name"], "issuer": row["issuer"] or "", "secret": secret})
+            except Exception as e:
+                logger.error(f"Export decrypt: {e}")
+        _plain = json.dumps({"version": 3, "vault_id": vault, "accounts": _entries}, ensure_ascii=False).encode()
+        return export_encrypt(_plain, file_pw), _entries
+
+    payload, entries = await asyncio.to_thread(_build_export)
+    try:
+        await processing_msg.delete()
+    except Exception:
+        pass
     # Timestamped filename: bv_backup_YYYYMMDD_HHMMSS.bvault
     ts_str   = datetime.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
     filename = f"bv_backup_{ts_str}.bvault"
@@ -4085,11 +4107,16 @@ async def import_pw_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             reply_markup=kb_cancel(),
         )
         return IMPORT_FILE_WAIT
+    processing_msg = await update.message.reply_text("⏳ Decrypting file...")
     try:
-        plain    = export_decrypt(payload, file_pw)
+        plain = await asyncio.to_thread(export_decrypt, payload, file_pw)
         data     = json.loads(plain.decode())
         accounts = data.get("accounts", [])
     except Exception:
+        try:
+            await processing_msg.delete()
+        except Exception:
+            pass
         await update.message.reply_text(
             "❌ *Wrong password or corrupted file\\.*",
             parse_mode="MarkdownV2",
@@ -4097,6 +4124,10 @@ async def import_pw_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         ctx.user_data["import_payload"] = payload
         return IMPORT_PW_INPUT
+    try:
+        await processing_msg.delete()
+    except Exception:
+        pass
     if not accounts:
         await update.message.reply_text(
             "⚠️ No accounts found in backup file\\.",
@@ -4152,81 +4183,85 @@ async def _do_import(update_or_cb, ctx, vault: str, accounts: list, mode: str = 
     mode = "skip"    → keep existing, skip duplicates
     mode = "replace" → overwrite existing with imported version
     """
-    pw       = ctx.user_data.get("password", "")
+    pw = ctx.user_data.get("password", "")
+
+    # Compute expensive keys ONCE outside the loop (Argon2 / PBKDF2)
+    vault_key = await asyncio.to_thread(_get_vault_key, vault, pw)
+    sk        = await asyncio.to_thread(load_user_secure_key, vault, pw)
+
     imported = 0
     skipped  = 0
     replaced = 0
-    with get_db() as c:
-        # Build duplicate lookup: {(name, secret_sha256_hex): id}
-        # This correctly handles same-name different-secret and same-secret different-name
-        existing_rows = c.execute(
-            "SELECT id, name, secret_enc, salt, iv FROM totp_accounts WHERE vault_id=?", (vault,)
-        ).fetchall()
-        # For duplicate detection, decrypt existing secrets and hash them
-        existing_by_name   = {r["name"]: r["id"] for r in existing_rows}  # name -> id (for replace)
-        existing_secrets   = set()    # sha256(secret) set
-        # Track which entries had decrypt failures - these are protected from overwrite
-        undecryptable_names = set()
-        for r in existing_rows:
-            try:
-                plain = decrypt(r["secret_enc"], r["salt"], r["iv"], _get_vault_key(vault, pw), vault)
-                existing_secrets.add(hashlib.sha256(plain.encode()).hexdigest())
-            except Exception as e:
-                logger.warning(f"Import duplicate check: decrypt failed for '{r['name']}': {e}")
-                # Cannot read this entry - protect it from being overwritten
-                undecryptable_names.add(r["name"])
 
-        sk = load_user_secure_key(vault, pw)
-        for acc in accounts:
-            try:
-                ok, secret = validate_secret(acc.get("secret", ""))
-                if not ok:
-                    skipped += 1
-                    continue
-                note     = (acc.get("note", "") or "")[:NOTE_MAX_LEN]
-                totp_now(secret)   # sanity check
-                secret_hash = hashlib.sha256(secret.encode()).hexdigest()
-                vault_key = _get_vault_key(vault, pw)
-                ct, s, iv = encrypt(secret, vault_key, vault)
-                sk_ct = sk_s = sk_iv = None
-                if sk:
-                    sk_ct, sk_s, sk_iv = sk_encrypt_totp(secret.encode(), sk, vault)
+    def _do_all_crypto():
+        nonlocal imported, skipped, replaced
+        with get_db() as c:
+            existing_rows = c.execute(
+                "SELECT id, name, secret_enc, salt, iv FROM totp_accounts WHERE vault_id=?", (vault,)
+            ).fetchall()
+            existing_by_name    = {r["name"]: r["id"] for r in existing_rows}
+            existing_secrets    = set()
+            undecryptable_names = set()
+            for r in existing_rows:
+                try:
+                    plain = decrypt(r["secret_enc"], r["salt"], r["iv"], vault_key, vault)
+                    existing_secrets.add(hashlib.sha256(plain.encode()).hexdigest())
+                except Exception as e:
+                    logger.warning(f"Import dup check: decrypt failed for '{r['name']}': {e}")
+                    undecryptable_names.add(r["name"])
 
-                # Duplicate = same name AND same secret
-                name_exists   = acc["name"] in existing_by_name
-                secret_exists = secret_hash in existing_secrets
-
-                if name_exists and acc["name"] in undecryptable_names:
-                    # Existing entry could not be decrypted — never overwrite it, skip safely
-                    skipped += 1
-                elif name_exists and secret_exists:
-                    # True duplicate: same name + same secret
-                    if mode == "replace":
-                        c.execute(
-                            "UPDATE totp_accounts SET issuer=?, secret_enc=?, salt=?, iv=?, "
-                            "sk_enc=?, sk_salt=?, sk_iv=?, note=?, account_type='totp', hotp_counter=0 "
-                            "WHERE id=?",
-                            (acc.get("issuer", ""), ct, s, iv, sk_ct, sk_s, sk_iv,
-                             note, existing_by_name[acc["name"]]),
-                        )
-                        replaced += 1
+            for acc in accounts:
+                try:
+                    ok, secret = validate_secret(acc.get("secret", ""))
+                    if not ok:
+                        nonlocal_skip()
+                        continue
+                    note        = (acc.get("note", "") or "")[:NOTE_MAX_LEN]
+                    totp_now(secret)
+                    secret_hash = hashlib.sha256(secret.encode()).hexdigest()
+                    ct, s, iv   = encrypt(secret, vault_key, vault)
+                    sk_ct = sk_s = sk_iv = None
+                    if sk:
+                        sk_ct, sk_s, sk_iv = sk_encrypt_totp(secret.encode(), sk, vault)
+                    name_exists   = acc["name"] in existing_by_name
+                    secret_exists = secret_hash in existing_secrets
+                    if name_exists and acc["name"] in undecryptable_names:
+                        nonlocal_skip()
+                    elif name_exists and secret_exists:
+                        if mode == "replace":
+                            c.execute(
+                                "UPDATE totp_accounts SET issuer=?, secret_enc=?, salt=?, iv=?, "
+                                "sk_enc=?, sk_salt=?, sk_iv=?, note=?, account_type='totp', hotp_counter=0 "
+                                "WHERE id=?",
+                                (acc.get("issuer", ""), ct, s, iv, sk_ct, sk_s, sk_iv,
+                                 note, existing_by_name[acc["name"]]),
+                            )
+                            nonlocal_replace()
+                        else:
+                            nonlocal_skip()
                     else:
-                        skipped += 1
-                else:
-                    # Not a true duplicate: add as new entry
-                    c.execute(
-                        "INSERT INTO totp_accounts "
-                        "(vault_id, name, issuer, secret_enc, salt, iv, sk_enc, sk_salt, sk_iv, "
-                        "note, account_type, hotp_counter) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-                        (vault, acc["name"], acc.get("issuer", ""), ct, s, iv,
-                         sk_ct, sk_s, sk_iv, note, "totp", 0),
-                    )
-                    existing_secrets.add(secret_hash)
-                    imported += 1
-            except Exception as e:
-                logger.error(f"Import entry '{acc.get('name','?')}': {e}")
-                skipped += 1
-        c.commit()
+                        c.execute(
+                            "INSERT INTO totp_accounts "
+                            "(vault_id, name, issuer, secret_enc, salt, iv, sk_enc, sk_salt, sk_iv, "
+                            "note, account_type, hotp_counter) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                            (vault, acc["name"], acc.get("issuer", ""), ct, s, iv,
+                             sk_ct, sk_s, sk_iv, note, "totp", 0),
+                        )
+                        existing_secrets.add(secret_hash)
+                        nonlocal_import()
+                except Exception as e:
+                    logger.error(f"Import entry '{acc.get('name','?')}': {e}")
+                    nonlocal_skip()
+            c.commit()
+
+    # nonlocal helpers (closures can't assign to outer nonlocal in nested def easily)
+    _counts = [0, 0, 0]  # [imported, skipped, replaced]
+    def nonlocal_import():  _counts[0] += 1
+    def nonlocal_skip():    _counts[1] += 1
+    def nonlocal_replace(): _counts[2] += 1
+
+    await asyncio.to_thread(_do_all_crypto)
+    imported, skipped, replaced = _counts
     lines = [f"✅ *Import complete\\!*\n"]
     if imported:
         lines.append(f"Added: *{imported}*")
@@ -4273,7 +4308,9 @@ async def delete_account_password(update: Update, ctx: ContextTypes.DEFAULT_TYPE
     if not u:
         await update.message.reply_text("User not found\\.", parse_mode="MarkdownV2", reply_markup=kb_main())
         return TOTP_MENU
-    if not hmac.compare_digest(hash_pw(pw, bytes(u["pw_salt"]), u["kdf_type"] or "pbkdf2"), bytes(u["password_hash"])):
+    kdf_del  = u["kdf_type"] or "pbkdf2"
+    computed_del = await asyncio.to_thread(hash_pw, pw, bytes(u["pw_salt"]), kdf_del)
+    if not hmac.compare_digest(computed_del, bytes(u["password_hash"])):
         await update.message.reply_text(
             "❌ *Wrong password\\.* Account deletion cancelled\\.",
             parse_mode="MarkdownV2",
@@ -4936,14 +4973,27 @@ async def adm_totp_limit_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("⏱ Per Minute Limit",              callback_data="adm_min_limit")],
         [InlineKeyboardButton("👤 Specific User Vault Max Limit",callback_data="adm_specific_vault_max")],
         [InlineKeyboardButton("⏱ Specific User Vault Per Minute Limit", callback_data="adm_specific_vault_min")],
+        [InlineKeyboardButton(f"🔁 TOTP Duplicate Limit  (currently {MAX_TOTP_DUPLICATE})", callback_data="adm_totp_dup_limit")],
         [InlineKeyboardButton("⬅️ Back",                         callback_data="adm_back")],
     ])
     await q.message.reply_text(
         f"TOTP Limit Settings\n\nGlobal Vault Max: {MAX_TOTP_PER_VAULT} per vault\n"
-        f"Global Per-Minute: {MAX_TOTP_PER_MINUTE} per vault/min\n\n"
+        f"Global Per-Minute: {MAX_TOTP_PER_MINUTE} per vault/min\n"
+        f"Duplicate Limit: {MAX_TOTP_DUPLICATE} per vault\n\n"
         f"Use Specific User buttons to override limits for individual vaults.",
         reply_markup=kb,
     )
+
+
+async def adm_totp_dup_limit_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Ask admin for new TOTP duplicate limit."""
+    q = update.callback_query; await q.answer()
+    _admin_import_pending[update.effective_chat.id] = {"step": "adm_totp_dup_limit_wait"}
+    msg = await q.message.reply_text(
+        f"Write in numbers how many Duplicate you want to keep per TOTP.\n"
+        f"(Current: {MAX_TOTP_DUPLICATE})"
+    )
+    asyncio.create_task(auto_delete_msg(msg, delay=120))
 
 
 async def adm_vault_limit_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -4998,14 +5048,26 @@ async def adm_signup_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton(f"🌐 Public Sign-Up  (currently {pub_status})", callback_data="adm_signup_public_toggle")],
         [InlineKeyboardButton("👤 Specific Signup",                           callback_data="adm_specific_signup")],
         [InlineKeyboardButton("📋 Specific Signup Off User List",             callback_data="adm_signup_off_list")],
+        [InlineKeyboardButton(f"📊 Weekly Signup Limit  (currently {MAX_WEEKLY_SIGNUPS}/wk)", callback_data="adm_weekly_signup_limit")],
         [InlineKeyboardButton("⬅️ Back",                                      callback_data="adm_back")],
     ])
     msg = await q.message.reply_text(
-        f"📝 Signup Control\n\nPublic Sign-Up: {pub_status}\n"
+        f"📝 Signup Control\n\nPublic Sign-Up: {pub_status}\nWeekly Signup Limit: {MAX_WEEKLY_SIGNUPS}/week\n"
         "Use the buttons below to manage signup settings.",
         reply_markup=kb,
     )
     asyncio.create_task(auto_delete_msg(msg, delay=300))
+
+
+async def adm_weekly_signup_limit_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Ask admin how many signups per week to allow."""
+    q = update.callback_query; await q.answer()
+    _admin_import_pending[update.effective_chat.id] = {"step": "adm_weekly_signup_limit_wait"}
+    msg = await q.message.reply_text(
+        f"Write in numbers how many signups you want to keep per week.\n"
+        f"(Current: {MAX_WEEKLY_SIGNUPS}/week)"
+    )
+    asyncio.create_task(auto_delete_msg(msg, delay=120))
 
 
 async def adm_signup_public_toggle_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -5109,14 +5171,26 @@ async def adm_login_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton(f"🌐 Public Login  (currently {pub_status})", callback_data="adm_login_public_toggle")],
         [InlineKeyboardButton("👤 Specific Login",                          callback_data="adm_specific_login")],
         [InlineKeyboardButton("📋 Specific Login Off User List",            callback_data="adm_login_off_list")],
+        [InlineKeyboardButton(f"📊 Daily Login Limit  (currently {MAX_DAILY_LOGINS}/day)", callback_data="adm_daily_login_limit")],
         [InlineKeyboardButton("⬅️ Back",                                    callback_data="adm_back")],
     ])
     msg = await q.message.reply_text(
-        f"🔑 Login Control\n\nPublic Login: {pub_status}\n"
+        f"🔑 Login Control\n\nPublic Login: {pub_status}\nDaily Login Limit: {MAX_DAILY_LOGINS}/day\n"
         "Use the buttons below to manage login settings.",
         reply_markup=kb,
     )
     asyncio.create_task(auto_delete_msg(msg, delay=300))
+
+
+async def adm_daily_login_limit_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Ask admin how many logins per day to allow."""
+    q = update.callback_query; await q.answer()
+    _admin_import_pending[update.effective_chat.id] = {"step": "adm_daily_login_limit_wait"}
+    msg = await q.message.reply_text(
+        f"Write in numbers how many login you want to keep per day.\n"
+        f"(Current: {MAX_DAILY_LOGINS}/day)"
+    )
+    asyncio.create_task(auto_delete_msg(msg, delay=120))
 
 
 async def adm_login_public_toggle_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -5365,6 +5439,12 @@ def _fmt_user_info(u) -> str:
             totp_cnt = c.execute(
                 "SELECT COUNT(*) AS n FROM totp_accounts WHERE vault_id=?", (vault_id,)
             ).fetchone()["n"]
+            # Count duplicate TOTP entries (same name appearing more than once)
+            dup_cnt = c.execute(
+                "SELECT SUM(cnt - 1) AS n FROM "
+                "(SELECT COUNT(*) AS cnt FROM totp_accounts WHERE vault_id=? GROUP BY name HAVING cnt > 1)",
+                (vault_id,)
+            ).fetchone()["n"] or 0
             br = c.execute(
                 "SELECT frequency, enabled FROM backup_reminders WHERE telegram_id=?", (tid,)
             ).fetchone()
@@ -5395,7 +5475,8 @@ def _fmt_user_info(u) -> str:
             f"Telegram       : {username_str}\n"
             f"Telegram ID    : {tid}\n"
             f"Name           : {tg_name}\n\n"
-            f"Total TOTP     : {totp_cnt} Account(s)\n\n"
+            f"Total TOTP     : {totp_cnt} Account(s)\n"
+            f"Duplicate TOTP : {dup_cnt} TOTP\n\n"
             f"Created        : {created_at}\n\n"
             f"Last Online    : {last_seen}\n\n"
             f"Account Status : {status}\n\n"
@@ -5646,34 +5727,55 @@ async def admin_group_message_handler(update: Update, ctx: ContextTypes.DEFAULT_
             asyncio.create_task(auto_delete_msg(msg, delay=60))
             return
         vault_id = u["vault_id"]
-        # Export this user's rows from all relevant tables
+        # Export user's TOTP vault same way user self-exports (password = user's current vault password)
         with get_db() as c:
-            user_row   = dict(c.execute("SELECT * FROM users WHERE vault_id=?", (vault_id,)).fetchone() or {})
-            totp_rows  = [dict(r) for r in c.execute("SELECT * FROM totp_accounts WHERE vault_id=?", (vault_id,)).fetchall()]
-            sess_rows  = [dict(r) for r in c.execute("SELECT * FROM sessions WHERE vault_id=?", (vault_id,)).fetchall()]
-            alert_rows = [dict(r) for r in c.execute("SELECT * FROM login_alerts WHERE vault_id=?", (vault_id,)).fetchall()]
-        dump = {
-            "vault_id":  vault_id,
-            "user":      user_row,
-            "totp_accounts": totp_rows,
-            "sessions":  sess_rows,
-            "login_alerts": alert_rows,
-        }
-        plain   = json.dumps(dump, ensure_ascii=False, default=str).encode()
-        # Encrypt with vault_id as password (admin can share it separately)
-        payload = _admin_encrypt(plain, vault_id)
-        ts_str  = datetime.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-        fname   = f"bv_user_{vault_id[:8]}_{ts_str}.bvadmin"
-        bio     = BytesIO(payload); bio.name = fname
-        uname   = f"@{u['tg_username']}" if u["tg_username"] else str(u["telegram_id"])
+            totp_rows = c.execute(
+                "SELECT name, issuer, secret_enc, salt, iv FROM totp_accounts WHERE vault_id=?",
+                (vault_id,)
+            ).fetchall()
+        if not totp_rows:
+            msg = await update.message.reply_text(f"No TOTP accounts found for vault {vault_id}.")
+            asyncio.create_task(auto_delete_msg(msg, delay=60))
+            return
+        # Use live password from RAM cache (same as auto-backup)
+        live_pw = _session_pw_cache.get(vault_id)
+        if not live_pw:
+            msg = await update.message.reply_text(
+                f"Cannot export: user {vault_id} has no active session.\n"
+                "User must log in at least once for their password to be available."
+            )
+            asyncio.create_task(auto_delete_msg(msg, delay=120))
+            return
+        progress = await update.message.reply_text("⏳ Building vault export...")
+        def _build_specific_export():
+            vault_key = _get_vault_key(vault_id, live_pw)
+            entries = []
+            for row in totp_rows:
+                try:
+                    secret = decrypt(row["secret_enc"], row["salt"], row["iv"], vault_key, vault_id)
+                    entries.append({"name": row["name"], "issuer": row["issuer"] or "", "secret": secret})
+                except Exception as e:
+                    logger.error(f"Specific export decrypt {vault_id}/{row['name']}: {e}")
+            plain = json.dumps({"version": 3, "vault_id": vault_id, "accounts": entries}, ensure_ascii=False).encode()
+            return export_encrypt(plain, live_pw), len(entries)
+        payload, exported_cnt = await asyncio.to_thread(_build_specific_export)
+        try:
+            await progress.delete()
+        except Exception:
+            pass
+        ts_str = datetime.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        fname  = f"bv_backup_{ts_str}.bvault"
+        bio    = BytesIO(payload); bio.name = fname
+        uname  = f"@{u['tg_username']}" if u["tg_username"] else str(u["telegram_id"])
         await ctx.bot.send_document(
             chat_id=chat_id, document=bio, filename=fname,
             caption=(
                 f"👤 User Vault Export\n"
                 f"Vault: {vault_id}\n"
                 f"User: {uname}\n"
-                f"TOTP entries: {len(totp_rows)}\n"
-                f"🔑 Encrypted with vault ID as password."
+                f"TOTP entries: {exported_cnt}\n"
+                f"🔑 Encrypted with user's current account password.\n"
+                f"User can import this file with 📥 Import Vault."
             ),
         )
         return
@@ -6004,6 +6106,48 @@ async def admin_group_message_handler(update: Update, ctx: ContextTypes.DEFAULT_
         set_user_signup_disabled(tid_resolved, True)
         msg = await update.message.reply_text(
             f"🚫 Signup disabled for Telegram ID {tid_resolved}."
+        )
+        asyncio.create_task(auto_delete_msg(msg, delay=60))
+        return
+
+    if step == "adm_weekly_signup_limit_wait":
+        _admin_import_pending.pop(chat_id, None)
+        asyncio.create_task(auto_delete_msg(update.message, delay=5))
+        if not raw.isdigit() or int(raw) < 1:
+            msg = await update.message.reply_text("Invalid. Send a positive integer.")
+            asyncio.create_task(auto_delete_msg(msg, delay=60))
+            return
+        globals()["MAX_WEEKLY_SIGNUPS"] = int(raw)
+        msg = await update.message.reply_text(
+            f"✅ Weekly signup limit updated to {raw} signups/week."
+        )
+        asyncio.create_task(auto_delete_msg(msg, delay=60))
+        return
+
+    if step == "adm_daily_login_limit_wait":
+        _admin_import_pending.pop(chat_id, None)
+        asyncio.create_task(auto_delete_msg(update.message, delay=5))
+        if not raw.isdigit() or int(raw) < 1:
+            msg = await update.message.reply_text("Invalid. Send a positive integer.")
+            asyncio.create_task(auto_delete_msg(msg, delay=60))
+            return
+        globals()["MAX_DAILY_LOGINS"] = int(raw)
+        msg = await update.message.reply_text(
+            f"✅ Daily login limit updated to {raw} logins/day."
+        )
+        asyncio.create_task(auto_delete_msg(msg, delay=60))
+        return
+
+    if step == "adm_totp_dup_limit_wait":
+        _admin_import_pending.pop(chat_id, None)
+        asyncio.create_task(auto_delete_msg(update.message, delay=5))
+        if not raw.isdigit() or int(raw) < 1:
+            msg = await update.message.reply_text("Invalid. Send a positive integer.")
+            asyncio.create_task(auto_delete_msg(msg, delay=60))
+            return
+        globals()["MAX_TOTP_DUPLICATE"] = int(raw)
+        msg = await update.message.reply_text(
+            f"✅ TOTP duplicate limit updated to {raw}."
         )
         asyncio.create_task(auto_delete_msg(msg, delay=60))
         return
@@ -6360,7 +6504,7 @@ async def run_auto_backup_for_user(bot, tid: int, vault_id: str, freq_label: str
             "backup_type": "auto",
         }, ensure_ascii=False).encode()
 
-        payload = export_encrypt(plain, live_pw)
+        payload = await asyncio.to_thread(export_encrypt, plain, live_pw)
 
         try:
             import zoneinfo
@@ -6861,7 +7005,8 @@ def main():
     # ── Admin (group) commands ─────────────────────────────────
     if ADMIN_GROUP_ID != 0:
         admin_filter = filters.Chat(chat_id=ADMIN_GROUP_ID)
-        app.add_handler(CommandHandler("start",        admin_group_start,     filters=admin_filter))
+        # Admin group handlers use group=-1 to ensure they fire before user handlers
+        app.add_handler(CommandHandler("start",        admin_group_start,     filters=admin_filter), group=-1)
         # /login command removed - login is now managed via Dashboard Login Control button.
         app.add_handler(CommandHandler("userall",      admin_userall_export,  filters=admin_filter))
         # Dashboard callback handlers
@@ -6911,16 +7056,18 @@ def main():
         app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_broadcast_cb),           pattern="^adm_broadcast$"))
         app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_user_info_cb),           pattern="^adm_user_info$"))
         app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_totp_limit_cb),        pattern="^adm_totp_limit$"))
+        app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_totp_dup_limit_cb),   pattern="^adm_totp_dup_limit$"))
+        app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_weekly_signup_limit_cb), pattern="^adm_weekly_signup_limit$"))
+        app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_daily_login_limit_cb),   pattern="^adm_daily_login_limit$"))
         app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_vault_limit_cb),       pattern="^adm_vault_limit$"))
         app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_min_limit_cb),         pattern="^adm_min_limit$"))
         app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_specific_vault_max_cb),pattern="^adm_specific_vault_max$"))
         app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_specific_vault_min_cb),pattern="^adm_specific_vault_min$"))
         app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_back_cb),              pattern="^adm_back$"))
-        # Admin group message handler: handles ALL non-command messages (text, media, docs)
-        # Dispatches internally based on _admin_import_pending step.
+        # Admin group message handler: group=-1 gives it priority over user handlers
         app.add_handler(MessageHandler(
             admin_filter & ~filters.COMMAND, admin_group_message_handler
-        ))
+        ), group=-1)
 
     # ── Job queue: daily backup reminders + hourly auto-backup ──
     jq = app.job_queue
