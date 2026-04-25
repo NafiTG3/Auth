@@ -81,6 +81,16 @@ _bot_settings: dict = {
 # ── In-memory session password cache for auto-backup ─────────
 # Populated on login/signup, cleared on logout. Never persisted to DB.
 _session_pw_cache: dict = {}   # vault_id -> plaintext password
+_vault_key_cache:  dict = {}   # vault_id -> vault_key (bytes or str)
+
+def _get_cached_vault_key(vault_id: str, password: str):
+    """Return vault_key from session cache. Falls back to derive if missing."""
+    cached = _vault_key_cache.get(vault_id)
+    if cached is not None:
+        return cached
+    key = _get_vault_key(vault_id, password)
+    _vault_key_cache[vault_id] = key
+    return key
 
 def _oab_pw_enc_key(vault_id: str) -> bytes:
     """Derive a 32-byte AES key for encrypting the backup password in DB.
@@ -1768,6 +1778,7 @@ async def signup_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data["password"] = pw
     ctx.user_data["vault_id"] = vid
     _session_pw_cache[vid] = pw             # RAM cache for auto-backup
+    _vault_key_cache[vid]  = _get_vault_key(vid, pw)   # warm vault key cache
     _oab_store_password(uid, vid, pw)       # DB encrypted store for auto-backup
     record_weekly_signup(uid)               # track weekly signup count
     record_stat("signup", telegram_id=uid, vault_id=vid)  # stats tracking
@@ -2065,7 +2076,7 @@ async def login_pw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 ).fetchall()
                 for row in totp_rows:
                     try:
-                        plain = decrypt(row["secret_enc"], row["salt"], row["iv"], _get_vault_key(vid, pw), vid)
+                        plain = decrypt(row["secret_enc"], row["salt"], row["iv"], _get_cached_vault_key(vid, pw), vid)
                         new_ct, new_s, new_iv = encrypt(plain, master_key, vid)
                         c.execute(
                             "UPDATE totp_accounts SET secret_enc=?, salt=?, iv=? WHERE id=?",
@@ -2099,6 +2110,7 @@ async def login_pw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data["password"] = pw
     ctx.user_data["vault_id"] = vid
     _session_pw_cache[vid] = pw             # RAM cache for auto-backup
+    _vault_key_cache[vid]  = _get_vault_key(vid, pw)   # warm vault key cache
     _oab_store_password(uid, vid, pw)       # DB encrypted store for auto-backup
     owner_name = u["tg_name"] if u["tg_name"] else "User"
     await update.message.reply_text(
@@ -2640,7 +2652,7 @@ async def settings_reset_pw_confirm(update: Update, ctx: ContextTypes.DEFAULT_TY
             ).fetchall()
             for row in rows:
                 try:
-                    secret    = decrypt(row["secret_enc"], row["salt"], row["iv"], _get_vault_key(vault, old_pw), vault)
+                    secret    = decrypt(row["secret_enc"], row["salt"], row["iv"], _get_cached_vault_key(vault, old_pw), vault)
                     ct, s, iv = encrypt(secret, new_pw, vault)
                     c.execute("UPDATE totp_accounts SET secret_enc=?, salt=?, iv=? WHERE id=?",
                               (ct, s, iv, row["id"]))
@@ -2741,6 +2753,7 @@ async def logout(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     vault = get_session(uid)
     if vault:
         _session_pw_cache.pop(vault, None)   # clear cached password for auto-backup
+        _vault_key_cache.pop(vault, None)            # clear vault key cache
     clear_session(uid)
     ctx.user_data.clear()
     await q.edit_message_text(
@@ -2920,7 +2933,11 @@ async def change_pw_old(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid   = update.effective_user.id
     vault = get_session(uid)
     u     = get_user(vault)
-    if not u or not hmac.compare_digest(hash_pw(pw, bytes(u["pw_salt"]), u["kdf_type"] or "pbkdf2"), bytes(u["password_hash"])):
+    if not u:
+        await update.message.reply_text("Session expired\\. /start", parse_mode="MarkdownV2", reply_markup=kb_auth())
+        return AUTH_MENU
+    computed_cpw = await asyncio.to_thread(hash_pw, pw, bytes(u["pw_salt"]), u["kdf_type"] or "pbkdf2")
+    if not hmac.compare_digest(computed_cpw, bytes(u["password_hash"])):
         await update.message.reply_text(
             "❌ Wrong password\\.",
             parse_mode="MarkdownV2",
@@ -2978,14 +2995,15 @@ async def change_pw_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if u and u["mk_enc"]:
         # New architecture: only re-wrap the master key with new password
         try:
-            master_key = unwrap_master_key(u["mk_enc"], u["mk_salt"], u["mk_iv"], old_pw)
+            master_key = await asyncio.to_thread(unwrap_master_key, u["mk_enc"], u["mk_salt"], u["mk_iv"], old_pw)
             new_mk_enc, new_mk_salt, new_mk_iv = wrap_master_key(master_key, new_pw)
             ns = os.urandom(16)
             with get_db() as c:
                 c.execute(
                     "UPDATE users SET password_hash=?, pw_salt=?, kdf_type=?, "
+            new_pw_hash = await asyncio.to_thread(hash_pw, new_pw, ns, "argon2id")
                     "mk_enc=?, mk_salt=?, mk_iv=? WHERE vault_id=?",
-                    (hash_pw(new_pw, ns, "argon2id"), ns, "argon2id",
+                    (new_pw_hash, ns, "argon2id",
                      new_mk_enc, new_mk_salt, new_mk_iv, vault),
                 )
                 c.commit()
@@ -3004,7 +3022,7 @@ async def change_pw_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             ).fetchall()
             for row in rows:
                 try:
-                    secret    = decrypt(row["secret_enc"], row["salt"], row["iv"], _get_vault_key(vault, old_pw), vault)
+                    secret    = decrypt(row["secret_enc"], row["salt"], row["iv"], _get_cached_vault_key(vault, old_pw), vault)
                     ct, s, iv = encrypt(secret, new_pw, vault)
                     c.execute("UPDATE totp_accounts SET secret_enc=?, salt=?, iv=? WHERE id=?",
                               (ct, s, iv, row["id"]))
@@ -3013,7 +3031,8 @@ async def change_pw_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             ns = os.urandom(16)
             c.execute(
                 "UPDATE users SET password_hash=?, pw_salt=? WHERE vault_id=?",
-                (hash_pw(new_pw, ns, "argon2id"), ns, vault),
+            new_pw_hash_leg = await asyncio.to_thread(hash_pw, new_pw, ns, "argon2id")
+                (new_pw_hash_leg, ns, vault),
             )
             sk = load_user_secure_key(vault, old_pw)
             if sk:
@@ -3084,7 +3103,7 @@ async def _do_save_totp(update, vault, data, pw):
     # Auto-suffix name if duplicate, enforce max 20 chars
     final_name = _auto_suffix_name(vault, data["name"])
 
-    vault_key = _get_vault_key(vault, pw)
+    vault_key = _get_cached_vault_key(vault, pw)
     ct, salt, iv = encrypt(data["secret"], vault_key, vault)
     sk = load_user_secure_key(vault, pw)
     if sk:
@@ -3332,9 +3351,10 @@ async def _render_list_page(q_or_msg, vault: str, pw: str, page: int, is_edit: b
     chunk       = rows[page * TOTP_PER_PAGE : (page + 1) * TOTP_PER_PAGE]
 
     entries = []
+    _rlp_vkey = _get_cached_vault_key(vault, pw)   # derive once, reuse for all
     for i, row in enumerate(chunk, start=page * TOTP_PER_PAGE + 1):
         try:
-            secret = decrypt(row["secret_enc"], row["salt"], row["iv"], _get_vault_key(vault, pw), vault)
+            secret = decrypt(row["secret_enc"], row["salt"], row["iv"], _rlp_vkey, vault)
             note     = (row["note"] or "").strip()
             code, remain, next_code = generate_code(secret)
 
@@ -3523,7 +3543,7 @@ async def share_generate(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     final_names = []
     for db_row in db_rows:
         try:
-            plain = decrypt(db_row["secret_enc"], db_row["salt"], db_row["iv"], _get_vault_key(vault, pw), vault)
+            plain = decrypt(db_row["secret_enc"], db_row["salt"], db_row["iv"], _get_cached_vault_key(vault, pw), vault)
             enc   = share_encrypt_secret(plain, token)
             secrets_enc.append(enc)
             final_ids.append(db_row["id"])
@@ -3866,7 +3886,8 @@ async def show_secret_pw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not u:
         await update.message.reply_text("Session expired\\. /start", parse_mode="MarkdownV2", reply_markup=kb_auth())
         return AUTH_MENU
-    if not hmac.compare_digest(hash_pw(pw, bytes(u["pw_salt"]), u["kdf_type"] or "pbkdf2"), bytes(u["password_hash"])):
+    computed_ssp = await asyncio.to_thread(hash_pw, pw, bytes(u["pw_salt"]), u["kdf_type"] or "pbkdf2")
+    if not hmac.compare_digest(computed_ssp, bytes(u["password_hash"])):
         await update.message.reply_text(
             "❌ *Wrong password\\.* Secret key not revealed\\.",
             parse_mode="MarkdownV2",
@@ -3890,7 +3911,7 @@ async def show_secret_pw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ctx.user_data.pop("edit_name", None)
         return TOTP_MENU
     try:
-        secret = decrypt(row["secret_enc"], row["salt"], row["iv"], _get_vault_key(vault, pw), vault)
+        secret = decrypt(row["secret_enc"], row["salt"], row["iv"], _get_cached_vault_key(vault, pw), vault)
     except Exception as e:
         logger.error(f"Decrypt for show_secret failed: {e}")
         await update.message.reply_text(
@@ -4432,7 +4453,7 @@ async def global_auto_detect(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             entries = []
             for i, row in enumerate(matched, 1):
                 try:
-                    secret   = decrypt(row["secret_enc"], row["salt"], row["iv"], _get_vault_key(vault, pw), vault)
+                    secret   = decrypt(row["secret_enc"], row["salt"], row["iv"], _get_cached_vault_key(vault, pw), vault)
                     note     = (row["note"] or "").strip()
                     code, remain, next_code = generate_code(secret)
                     code_fmt  = code
@@ -4492,7 +4513,7 @@ async def global_auto_detect(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 ctx.user_data["_global_add"]    = True
                 return
             name = _auto_suffix_name(vault, raw_name)
-            vault_key = _get_vault_key(vault, pw)
+            vault_key = _get_cached_vault_key(vault, pw)
             ct, salt, iv = encrypt(secret, vault_key, vault)
             sk = load_user_secure_key(vault, pw)
             if sk:
@@ -4607,7 +4628,7 @@ async def search_totp_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     entries = []
     for i, row in enumerate(matched, 1):
         try:
-            secret = decrypt(row["secret_enc"], row["salt"], row["iv"], _get_vault_key(vault, pw), vault)
+            secret = decrypt(row["secret_enc"], row["salt"], row["iv"], _get_cached_vault_key(vault, pw), vault)
             note     = (row["note"] or "").strip()
             code, remain, next_code = generate_code(secret)
             code_fmt  = code
@@ -5318,6 +5339,7 @@ async def adm_account_action_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         c.commit()
     if flag:
         _session_pw_cache.pop(vault_id, None)
+        _vault_key_cache.pop(vault_id, None)
     # Record stats event
     _tid_acct = u["telegram_id"] if u else 0
     record_stat("account_disabled" if flag else "account_enabled",
@@ -5748,7 +5770,7 @@ async def admin_group_message_handler(update: Update, ctx: ContextTypes.DEFAULT_
             return
         progress = await update.message.reply_text("⏳ Building vault export...")
         def _build_specific_export():
-            vault_key = _get_vault_key(vault_id, live_pw)
+            vault_key = _get_cached_vault_key(vault_id, live_pw)
             entries = []
             for row in totp_rows:
                 try:
@@ -5890,6 +5912,7 @@ async def admin_group_message_handler(update: Update, ctx: ContextTypes.DEFAULT_
             c.execute("DELETE FROM sessions WHERE vault_id=?", (vault_id,))
             c.commit()
         _session_pw_cache.pop(vault_id, None)
+        _vault_key_cache.pop(vault_id, None)
         record_stat("account_disabled", telegram_id=u["telegram_id"], vault_id=vault_id)
         try:
             await ctx.bot.send_message(
