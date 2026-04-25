@@ -3173,7 +3173,7 @@ async def _do_save_totp(update, vault, data, pw):
         suffix_note = f"\n_\\(Renamed to avoid duplicate: {em(final_name)}\\)_"
 
     try:
-        code, remain, _ = generate_code(data["secret"])
+        code, remain, _ = generate_code(secret_clean)
     except Exception:
         code, remain = "------", 30
     issuer_line = f"\n_{em(data['issuer'])}_" if data.get("issuer") else ""
@@ -3205,20 +3205,33 @@ async def _process_input(update, ctx, vault, pw):
         await file_obj.download_to_memory(bio)
         bio.seek(0)
         try:
-            decoded = qr_decode(Image.open(bio))
+            img = Image.open(bio)
+            # Try original first, then RGB conversion for better pyzbar compat
+            decoded = qr_decode(img)
+            if not decoded:
+                decoded = qr_decode(img.convert("RGB"))
+            if not decoded and img.mode not in ("L", "RGB"):
+                decoded = qr_decode(img.convert("L"))   # grayscale fallback
             if decoded:
-                data = parse_otpauth(decoded[0].data.decode("utf-8"))
-                if data:
-                    return await _do_save_totp(update, vault, data, pw), True
+                for symbol in decoded:
+                    try:
+                        raw_uri = symbol.data.decode("utf-8")
+                    except Exception:
+                        continue
+                    data = parse_otpauth(raw_uri)
+                    if data:
+                        return await _do_save_totp(update, vault, data, pw), True
             await update.message.reply_text(
-                "⚠️ No valid TOTP QR found in image\\.",
+                "⚠️ *No valid TOTP QR found*\n\n"
+                "_Make sure the image contains a valid `otpauth://` QR code_\\.",
                 parse_mode="MarkdownV2",
                 reply_markup=kb_cancel(),
             )
         except Exception as e:
             logger.error(f"QR decode error: {e}")
             await update.message.reply_text(
-                "⚠️ Could not read image\\.",
+                "⚠️ *Could not read image*\n\n"
+                "_Try sending a clearer photo or the `otpauth://` URI directly_\\.",
                 parse_mode="MarkdownV2",
                 reply_markup=kb_cancel(),
             )
@@ -3269,6 +3282,9 @@ async def handle_add_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not vault or not pw:
         await update.message.reply_text("Session expired\\. /start", parse_mode="MarkdownV2")
         return AUTH_MENU
+    if is_maintenance():
+        await update.message.reply_text(MAINTENANCE_MSG, parse_mode="MarkdownV2")
+        return TOTP_MENU
     if update.message.text and update.message.text.strip().lower() == "manual":
         await update.message.reply_text(
             "⌨️ Enter *account name:*",
@@ -4481,6 +4497,14 @@ async def global_auto_detect(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if vault:
         update_last_seen(uid)
     if not vault or not pw:
+        return
+
+    # Block all actions during maintenance (QR scan, secret add, etc.)
+    if is_maintenance():
+        try:
+            await update.message.reply_text(MAINTENANCE_MSG, parse_mode="MarkdownV2")
+        except Exception:
+            pass
         return
 
     # ── # quick search (e.g. "#google") ────────────────────────
