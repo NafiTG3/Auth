@@ -1,4 +1,4 @@
-import os, re, hmac, time, json, struct, base64, hashlib, sqlite3, logging, datetime, secrets, string, asyncio
+import os, re, hmac, time, json, struct, base64, hashlib, logging, datetime, secrets, string, asyncio
 import datetime as _dt
 from zoneinfo import ZoneInfo as _ZoneInfo
 from io import BytesIO
@@ -16,8 +16,22 @@ from argon2.low_level import hash_secret_raw, Type as Argon2Type
 from pyzbar.pyzbar import decode as qr_decode
 from PIL import Image
 
+# ── PostgreSQL (asyncpg) ────────────────────────────────────
+# Primary backend for 100k+ users.
+# Falls back gracefully: if DATABASE_URL is unset, the bot refuses to start.
+import asyncpg
+
 logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# Global asyncpg connection pool — initialised in main() before polling starts.
+_pg_pool: asyncpg.Pool | None = None
+
+async def _get_pool() -> asyncpg.Pool:
+    """Return the shared asyncpg pool. Raises RuntimeError if not initialised."""
+    if _pg_pool is None:
+        raise RuntimeError("PostgreSQL pool is not initialised. Call init_db() first.")
+    return _pg_pool
 
 # ── States ─────────────────────────────────────────────────
 (
@@ -44,7 +58,7 @@ logger = logging.getLogger(__name__)
     SIGNUP_TERMS,         # new: terms & privacy agreement screen before signup
 ) = range(38)
 
-DB_PATH             = os.environ.get("DB_PATH", "auth.db")
+DATABASE_URL        = os.environ.get("DATABASE_URL", "")   # e.g. postgresql://user:pw@host/db
 SERVER_KEY          = os.environ.get("ENCRYPTION_KEY", "").encode()
 BOT_USERNAME        = os.environ.get("BOT_USERNAME", "TotpNafiBot")  # set without @
 ADMIN_GROUP_ID      = int(os.environ.get("GROUP_ID", "0"))           # admin group
@@ -81,16 +95,6 @@ _bot_settings: dict = {
 # ── In-memory session password cache for auto-backup ─────────
 # Populated on login/signup, cleared on logout. Never persisted to DB.
 _session_pw_cache: dict = {}   # vault_id -> plaintext password
-_vault_key_cache:  dict = {}   # vault_id -> vault_key (bytes or str)
-
-def _get_cached_vault_key(vault_id: str, password: str):
-    """Return vault_key from session cache. Falls back to derive if missing."""
-    cached = _vault_key_cache.get(vault_id)
-    if cached is not None:
-        return cached
-    key = _get_vault_key(vault_id, password)
-    _vault_key_cache[vault_id] = key
-    return key
 
 def _oab_pw_enc_key(vault_id: str) -> bytes:
     """Derive a 32-byte AES key for encrypting the backup password in DB.
@@ -100,28 +104,27 @@ def _oab_pw_enc_key(vault_id: str) -> bytes:
         algorithm=hashes.SHA256(), length=32, salt=salt, iterations=100_000
     ).derive(SERVER_KEY + vault_id.encode())
 
-def _oab_store_password(telegram_id: int, vault_id: str, password: str):
+async def _oab_store_password(telegram_id: int, vault_id: str, password: str):
     """Encrypt and persist the user's password for offline auto-backup."""
     key  = _oab_pw_enc_key(vault_id)
     iv   = os.urandom(12)
-    salt = os.urandom(16)   # stored but not used for key (kept for schema compat)
+    salt = os.urandom(16)
     ct   = AESGCM(key).encrypt(iv, password.encode(), None)
-    with get_db() as c:
-        c.execute(
-            "INSERT INTO auto_backup_settings (telegram_id, pw_enc, pw_salt, pw_iv) VALUES (?,?,?,?) "
-            "ON CONFLICT(telegram_id) DO UPDATE SET pw_enc=excluded.pw_enc, "
-            "pw_salt=excluded.pw_salt, pw_iv=excluded.pw_iv",
-            (telegram_id, ct, salt, iv),
+    async async async with get_db() as c:
+        await c.execute(
+            "INSERT INTO auto_backup_settings (telegram_id, pw_enc, pw_salt, pw_iv) VALUES ($1,$2,$3,$4) "
+            "ON CONFLICT (telegram_id) DO UPDATE SET pw_enc=EXCLUDED.pw_enc, "
+            "pw_salt=EXCLUDED.pw_salt, pw_iv=EXCLUDED.pw_iv",
+            telegram_id, ct, salt, iv,
         )
-        c.commit()
 
-def _oab_load_password(telegram_id: int, vault_id: str) -> str | None:
+async def _oab_load_password(telegram_id: int, vault_id: str) -> str | None:
     """Load and decrypt the stored backup password. Returns None if not available."""
-    with get_db() as c:
-        row = c.execute(
-            "SELECT pw_enc, pw_iv FROM auto_backup_settings WHERE telegram_id=?",
-            (telegram_id,)
-        ).fetchone()
+    async async async with get_db() as c:
+        row = await c.fetchrow(
+            "SELECT pw_enc, pw_iv FROM auto_backup_settings WHERE telegram_id=$1",
+            telegram_id,
+        )
     if not row or not row["pw_enc"]:
         return None
     try:
@@ -142,161 +145,141 @@ def _week_bucket() -> str:
     d = datetime.datetime.utcnow()
     return d.strftime("%Y-W%W")
 
-def check_daily_login_limit(telegram_id: int) -> bool:
+async def check_daily_login_limit(telegram_id: int) -> bool:
     """Returns True if the user has NOT exceeded MAX_DAILY_LOGINS today."""
     today = _today_bucket()
-    with get_db() as c:
-        row = c.execute(
-            "SELECT count, day_bucket FROM daily_login_counts WHERE telegram_id=?",
-            (telegram_id,)
-        ).fetchone()
+    async async async with get_db() as c:
+        row = await c.fetchrow(
+            "SELECT count, day_bucket FROM daily_login_counts WHERE telegram_id=$1", telegram_id
+        )
     if not row or row["day_bucket"] != today:
-        return True   # fresh day or no record
+        return True
     return row["count"] < MAX_DAILY_LOGINS
 
-def record_daily_login(telegram_id: int):
+async def record_daily_login(telegram_id: int):
     """Increment today's login counter for a telegram_id."""
     today = _today_bucket()
-    with get_db() as c:
-        row = c.execute(
-            "SELECT count, day_bucket FROM daily_login_counts WHERE telegram_id=?",
-            (telegram_id,)
-        ).fetchone()
+    async async async with get_db() as c:
+        row = await c.fetchrow(
+            "SELECT count, day_bucket FROM daily_login_counts WHERE telegram_id=$1", telegram_id
+        )
         if not row or row["day_bucket"] != today:
-            c.execute(
-                "INSERT INTO daily_login_counts (telegram_id, count, day_bucket) VALUES (?,?,?) "
-                "ON CONFLICT(telegram_id) DO UPDATE SET count=1, day_bucket=excluded.day_bucket",
-                (telegram_id, 1, today),
+            await c.execute(
+                "INSERT INTO daily_login_counts (telegram_id, count, day_bucket) VALUES ($1, 1, $2) "
+                "ON CONFLICT (telegram_id) DO UPDATE SET count=1, day_bucket=EXCLUDED.day_bucket",
+                telegram_id, today,
             )
         else:
-            c.execute(
-                "UPDATE daily_login_counts SET count=count+1 WHERE telegram_id=?",
-                (telegram_id,)
+            await c.execute(
+                "UPDATE daily_login_counts SET count=count+1 WHERE telegram_id=$1", telegram_id
             )
-        c.commit()
 
-def check_weekly_signup_limit(telegram_id: int) -> bool:
+async def check_weekly_signup_limit(telegram_id: int) -> bool:
     """Returns True if the user has NOT exceeded MAX_WEEKLY_SIGNUPS this week."""
     week = _week_bucket()
-    with get_db() as c:
-        row = c.execute(
-            "SELECT count, week_bucket FROM weekly_signup_counts WHERE telegram_id=?",
-            (telegram_id,)
-        ).fetchone()
+    async async async with get_db() as c:
+        row = await c.fetchrow(
+            "SELECT count, week_bucket FROM weekly_signup_counts WHERE telegram_id=$1", telegram_id
+        )
     if not row or row["week_bucket"] != week:
         return True
     return row["count"] < MAX_WEEKLY_SIGNUPS
 
-def record_weekly_signup(telegram_id: int):
+async def record_weekly_signup(telegram_id: int):
     """Increment this week's signup counter for a telegram_id."""
     week = _week_bucket()
-    with get_db() as c:
-        row = c.execute(
-            "SELECT count, week_bucket FROM weekly_signup_counts WHERE telegram_id=?",
-            (telegram_id,)
-        ).fetchone()
+    async async async with get_db() as c:
+        row = await c.fetchrow(
+            "SELECT count, week_bucket FROM weekly_signup_counts WHERE telegram_id=$1", telegram_id
+        )
         if not row or row["week_bucket"] != week:
-            c.execute(
-                "INSERT INTO weekly_signup_counts (telegram_id, count, week_bucket) VALUES (?,?,?) "
-                "ON CONFLICT(telegram_id) DO UPDATE SET count=1, week_bucket=excluded.week_bucket",
-                (telegram_id, 1, week),
+            await c.execute(
+                "INSERT INTO weekly_signup_counts (telegram_id, count, week_bucket) VALUES ($1, 1, $2) "
+                "ON CONFLICT (telegram_id) DO UPDATE SET count=1, week_bucket=EXCLUDED.week_bucket",
+                telegram_id, week,
             )
         else:
-            c.execute(
-                "UPDATE weekly_signup_counts SET count=count+1 WHERE telegram_id=?",
-                (telegram_id,)
+            await c.execute(
+                "UPDATE weekly_signup_counts SET count=count+1 WHERE telegram_id=$1", telegram_id
             )
-        c.commit()
 
-def check_vault_login_limit(telegram_id: int, vault_id: str) -> bool:
-    """Returns True if the telegram_id can login to this vault.
-    Allowed if vault already in history OR total distinct vaults < MAX_LIFETIME_VAULTS."""
-    with get_db() as c:
-        # Check if this vault is already known for this telegram_id
-        known = c.execute(
-            "SELECT 1 FROM vault_login_history WHERE telegram_id=? AND vault_id=?",
-            (telegram_id, vault_id)
-        ).fetchone()
+async def check_vault_login_limit(telegram_id: int, vault_id: str) -> bool:
+    """Returns True if the telegram_id can login to this vault."""
+    async async async with get_db() as c:
+        known = await c.fetchrow(
+            "SELECT 1 FROM vault_login_history WHERE telegram_id=$1 AND vault_id=$2",
+            telegram_id, vault_id,
+        )
         if known:
             return True
-        # Count distinct vaults ever logged in from this telegram_id
-        cnt = c.execute(
-            "SELECT COUNT(*) AS n FROM vault_login_history WHERE telegram_id=?",
-            (telegram_id,)
-        ).fetchone()["n"]
+        cnt = await c.fetchval(
+            "SELECT COUNT(*) FROM vault_login_history WHERE telegram_id=$1", telegram_id
+        )
     return cnt < MAX_LIFETIME_VAULTS
 
-def record_vault_login(telegram_id: int, vault_id: str):
+async def record_vault_login(telegram_id: int, vault_id: str):
     """Record this (telegram_id, vault_id) pair in history."""
-    with get_db() as c:
-        c.execute(
-            "INSERT OR IGNORE INTO vault_login_history (telegram_id, vault_id) VALUES (?,?)",
-            (telegram_id, vault_id),
+    async async async with get_db() as c:
+        await c.execute(
+            "INSERT INTO vault_login_history (telegram_id, vault_id) VALUES ($1, $2) "
+            "ON CONFLICT DO NOTHING",
+            telegram_id, vault_id,
         )
-        c.commit()
 
-def is_user_signup_disabled(telegram_id: int) -> bool:
-    """Returns True if this specific Telegram ID has been individually blocked from signup."""
-    with get_db() as c:
-        row = c.execute(
-            "SELECT 1 FROM user_signup_disabled WHERE telegram_id=?", (telegram_id,)
-        ).fetchone()
+async def is_user_signup_disabled(telegram_id: int) -> bool:
+    async async async with get_db() as c:
+        row = await c.fetchrow(
+            "SELECT 1 FROM user_signup_disabled WHERE telegram_id=$1", telegram_id
+        )
     return row is not None
 
-def set_user_signup_disabled(telegram_id: int, disabled: bool):
-    """Enable or disable signup for a specific Telegram ID."""
-    with get_db() as c:
+async def set_user_signup_disabled(telegram_id: int, disabled: bool):
+    async async async with get_db() as c:
         if disabled:
-            c.execute(
-                "INSERT OR IGNORE INTO user_signup_disabled (telegram_id) VALUES (?)",
-                (telegram_id,)
+            await c.execute(
+                "INSERT INTO user_signup_disabled (telegram_id) VALUES ($1) ON CONFLICT DO NOTHING",
+                telegram_id,
             )
         else:
-            c.execute(
-                "DELETE FROM user_signup_disabled WHERE telegram_id=?",
-                (telegram_id,)
+            await c.execute(
+                "DELETE FROM user_signup_disabled WHERE telegram_id=$1", telegram_id
             )
-        c.commit()
 
-def get_all_signup_disabled_users() -> list:
-    """Return list of all telegram_ids with signup individually disabled."""
-    with get_db() as c:
-        rows = c.execute(
+async def get_all_signup_disabled_users() -> list:
+    async async async with get_db() as c:
+        rows = await c.fetch(
             "SELECT telegram_id FROM user_signup_disabled ORDER BY disabled_at DESC"
-        ).fetchall()
+        )
     return [r["telegram_id"] for r in rows]
 
 
 # ── Telegram Ban helpers ───────────────────────────────────────────────────
 
-def is_telegram_banned(telegram_id: int) -> bool:
-    """Returns True if this Telegram ID is banned from using the bot."""
-    with get_db() as c:
-        row = c.execute(
-            "SELECT 1 FROM telegram_banned WHERE telegram_id=?", (telegram_id,)
-        ).fetchone()
+async def is_telegram_banned(telegram_id: int) -> bool:
+    async async async with get_db() as c:
+        row = await c.fetchrow(
+            "SELECT 1 FROM telegram_banned WHERE telegram_id=$1", telegram_id
+        )
     return row is not None
 
-def set_telegram_ban(telegram_id: int, username: str, banned: bool):
-    """Ban or unban a Telegram ID."""
-    with get_db() as c:
+async def set_telegram_ban(telegram_id: int, username: str, banned: bool):
+    async async async with get_db() as c:
         if banned:
-            c.execute(
-                "INSERT OR REPLACE INTO telegram_banned (telegram_id, tg_username) VALUES (?,?)",
-                (telegram_id, username or "")
+            await c.execute(
+                "INSERT INTO telegram_banned (telegram_id, tg_username) VALUES ($1, $2) "
+                "ON CONFLICT (telegram_id) DO UPDATE SET tg_username=EXCLUDED.tg_username",
+                telegram_id, username or "",
             )
         else:
-            c.execute(
-                "DELETE FROM telegram_banned WHERE telegram_id=?", (telegram_id,)
+            await c.execute(
+                "DELETE FROM telegram_banned WHERE telegram_id=$1", telegram_id
             )
-        c.commit()
 
-def get_all_banned_users() -> list:
-    """Return all banned telegram entries as list of dicts."""
-    with get_db() as c:
-        rows = c.execute(
+async def get_all_banned_users() -> list:
+    async async async with get_db() as c:
+        rows = await c.fetch(
             "SELECT telegram_id, tg_username, banned_at FROM telegram_banned ORDER BY banned_at DESC"
-        ).fetchall()
+        )
     return [dict(r) for r in rows]
 
 
@@ -336,65 +319,57 @@ def _bdt_month_start() -> int:
                             0, 0, 0, tzinfo=_BDT)
     return int(first.timestamp())
 
-def record_stat(event_type: str, telegram_id: int = 0, vault_id: str = ""):
-    """Insert one event row into stats_events."""
-    try:
-        with get_db() as c:
-            c.execute(
-                "INSERT INTO stats_events (event_type, telegram_id, vault_id) VALUES (?,?,?)",
-                (event_type, telegram_id, vault_id)
-            )
-            c.commit()
-    except Exception as e:
-        logger.warning(f"record_stat({event_type}): {e}")
+async def record_stat(event_type: str, telegram_id: int = 0, vault_id: str = ""):
+    """Insert one event row into stats_events (fire-and-forget)."""
+    async def _do():
+        try:
+            async async async with get_db() as c:
+                await c.execute(
+                    "INSERT INTO stats_events (event_type, telegram_id, vault_id) VALUES ($1,$2,$3)",
+                    event_type, telegram_id, vault_id,
+                )
+        except Exception as e:
+            logger.warning(f"await record_stat({event_type}): {e}")
+    asyncio.create_task(_do())
 
-def _count_stat(event_type: str, since_ts: int) -> int:
-    """Count events of a given type since a Unix timestamp."""
-    with get_db() as c:
-        row = c.execute(
-            "SELECT COUNT(*) AS n FROM stats_events WHERE event_type=? AND ts>=?",
-            (event_type, since_ts)
-        ).fetchone()
-    return row["n"] if row else 0
+async def _count_stat(event_type: str, since_ts: int) -> int:
+    async async async with get_db() as c:
+        val = await c.fetchval(
+            "SELECT COUNT(*) FROM stats_events WHERE event_type=$1 AND ts>=$2",
+            event_type, since_ts,
+        )
+    return val or 0
 
-def _count_disabled_net(since_ts: int) -> int:
-    """Count accounts that are STILL disabled (not re-enabled) in a period."""
-    with get_db() as c:
-        row = c.execute(
-            "SELECT COUNT(*) AS n FROM stats_events WHERE event_type='account_disabled' AND ts>=?",
-            (since_ts,)
-        ).fetchone()
-        disabled = row["n"] if row else 0
-        row2 = c.execute(
-            "SELECT COUNT(*) AS n FROM stats_events WHERE event_type='account_enabled' AND ts>=?",
-            (since_ts,)
-        ).fetchone()
-        enabled = row2["n"] if row2 else 0
+async def _count_disabled_net(since_ts: int) -> int:
+    async async async with get_db() as c:
+        disabled = await c.fetchval(
+            "SELECT COUNT(*) FROM stats_events WHERE event_type='account_disabled' AND ts>=$1", since_ts
+        ) or 0
+        enabled = await c.fetchval(
+            "SELECT COUNT(*) FROM stats_events WHERE event_type='account_enabled' AND ts>=$1", since_ts
+        ) or 0
     return max(0, disabled - enabled)
 
-def _count_active(since_ts: int) -> int:
-    """Count distinct users who had any session (vault active) since since_ts."""
-    with get_db() as c:
-        row = c.execute(
-            "SELECT COUNT(DISTINCT telegram_id) AS n FROM stats_events "
-            "WHERE event_type='user_active' AND ts>=?",
-            (since_ts,)
-        ).fetchone()
-    return row["n"] if row else 0
+async def _count_active(since_ts: int) -> int:
+    async async async with get_db() as c:
+        val = await c.fetchval(
+            "SELECT COUNT(DISTINCT telegram_id) FROM stats_events "
+            "WHERE event_type='user_active' AND ts>=$1",
+            since_ts,
+        )
+    return val or 0
 
-def _build_stats_text(label: str, since_ts: int, include_active: bool = True) -> str:
-    """Build a formatted statistics message for the given time window."""
-    new_join  = _count_stat("signup",              since_ts)
-    active    = _count_active(since_ts) if include_active else None
-    disabled  = _count_disabled_net(since_ts)
-    deleted   = _count_stat("account_deleted",     since_ts)
-    totp_add  = _count_stat("totp_added",          since_ts)
-    login_ok  = _count_stat("login_success",       since_ts)
-    login_fail= _count_stat("login_fail",          since_ts)
-    reset_ok  = _count_stat("reset_success",       since_ts)
-    reset_skip= _count_stat("reset_success_skip",  since_ts)
-    reset_fail= _count_stat("reset_fail",          since_ts)
-
+async def _build_stats_text(label: str, since_ts: int, include_active: bool = True) -> str:
+    new_join   = await _count_stat("signup",             since_ts)
+    active     = await _count_active(since_ts) if include_active else None
+    disabled   = await _count_disabled_net(since_ts)
+    deleted    = await _count_stat("account_deleted",    since_ts)
+    totp_add   = await _count_stat("totp_added",         since_ts)
+    login_ok   = await _count_stat("login_success",      since_ts)
+    login_fail = await _count_stat("login_fail",         since_ts)
+    reset_ok   = await _count_stat("reset_success",      since_ts)
+    reset_skip = await _count_stat("reset_success_skip", since_ts)
+    reset_fail = await _count_stat("reset_fail",         since_ts)
     lines = [f"📊 *{label} Statistics*"]
     lines.append(f"👥 New Joined       : {new_join} User")
     if include_active:
@@ -410,200 +385,101 @@ def _build_stats_text(label: str, since_ts: int, include_active: bool = True) ->
     return "\n".join(lines)
 
 
-def is_user_login_disabled(telegram_id: int) -> bool:
-    """Returns True if this specific Telegram ID has been individually blocked from login."""
-    with get_db() as c:
-        row = c.execute(
-            "SELECT 1 FROM user_login_disabled WHERE telegram_id=?", (telegram_id,)
-        ).fetchone()
+async def is_user_login_disabled(telegram_id: int) -> bool:
+    async async async with get_db() as c:
+        row = await c.fetchrow(
+            "SELECT 1 FROM user_login_disabled WHERE telegram_id=$1", telegram_id
+        )
     return row is not None
 
-def set_user_login_disabled(telegram_id: int, disabled: bool):
-    """Enable or disable login for a specific Telegram ID."""
-    with get_db() as c:
+async def set_user_login_disabled(telegram_id: int, disabled: bool):
+    async async async with get_db() as c:
         if disabled:
-            c.execute(
-                "INSERT OR IGNORE INTO user_login_disabled (telegram_id) VALUES (?)",
-                (telegram_id,)
+            await c.execute(
+                "INSERT INTO user_login_disabled (telegram_id) VALUES ($1) ON CONFLICT DO NOTHING",
+                telegram_id,
             )
         else:
-            c.execute(
-                "DELETE FROM user_login_disabled WHERE telegram_id=?",
-                (telegram_id,)
+            await c.execute(
+                "DELETE FROM user_login_disabled WHERE telegram_id=$1", telegram_id
             )
-        c.commit()
 
-def get_all_login_disabled_users() -> list:
-    """Return list of all telegram_ids with login individually disabled."""
-    with get_db() as c:
-        rows = c.execute(
+async def get_all_login_disabled_users() -> list:
+    async async async with get_db() as c:
+        rows = await c.fetch(
             "SELECT telegram_id FROM user_login_disabled ORDER BY disabled_at DESC"
-        ).fetchall()
+        )
     return [r["telegram_id"] for r in rows]
 
-
-def get_vault_custom_limits(vault_id: str):
-    """Return (max_per_vault, max_per_min) for a vault.
-    Returns None for each field if no custom limit is set (fall back to global)."""
-    with get_db() as c:
-        row = c.execute(
-            "SELECT max_per_vault, max_per_min FROM vault_custom_limits WHERE vault_id=?",
-            (vault_id,)
-        ).fetchone()
+async def get_vault_custom_limits(vault_id: str):
+    async async async with get_db() as c:
+        row = await c.fetchrow(
+            "SELECT max_per_vault, max_per_min FROM vault_custom_limits WHERE vault_id=$1", vault_id
+        )
     if not row:
         return None, None
     return row["max_per_vault"], row["max_per_min"]
 
-def get_effective_vault_max(vault_id: str) -> int:
-    """Return the effective max TOTP per vault for this vault (custom or global)."""
-    custom, _ = get_vault_custom_limits(vault_id)
+async def get_effective_vault_max(vault_id: str) -> int:
+    custom, _ = await get_vault_custom_limits(vault_id)
     return custom if custom is not None else MAX_TOTP_PER_VAULT
 
-def get_effective_per_min_limit(vault_id: str) -> int:
-    """Return the effective per-minute TOTP limit for this vault (custom or global)."""
-    _, custom = get_vault_custom_limits(vault_id)
+async def get_effective_per_min_limit(vault_id: str) -> int:
+    _, custom = await get_vault_custom_limits(vault_id)
     return custom if custom is not None else MAX_TOTP_PER_MINUTE
 
-def set_vault_max_limit(vault_id: str, limit: int):
-    """Set a custom max TOTP per vault limit for a specific vault."""
-    with get_db() as c:
-        c.execute(
-            "INSERT INTO vault_custom_limits (vault_id, max_per_vault) VALUES (?,?) "
-            "ON CONFLICT(vault_id) DO UPDATE SET max_per_vault=excluded.max_per_vault",
-            (vault_id, limit)
+async def set_vault_max_limit(vault_id: str, limit: int):
+    async async async with get_db() as c:
+        await c.execute(
+            "INSERT INTO vault_custom_limits (vault_id, max_per_vault) VALUES ($1,$2) "
+            "ON CONFLICT (vault_id) DO UPDATE SET max_per_vault=EXCLUDED.max_per_vault",
+            vault_id, limit,
         )
-        c.commit()
 
-def set_vault_per_min_limit(vault_id: str, limit: int):
-    """Set a custom per-minute TOTP limit for a specific vault."""
-    with get_db() as c:
-        c.execute(
-            "INSERT INTO vault_custom_limits (vault_id, max_per_min) VALUES (?,?) "
-            "ON CONFLICT(vault_id) DO UPDATE SET max_per_min=excluded.max_per_min",
-            (vault_id, limit)
+async def set_vault_per_min_limit(vault_id: str, limit: int):
+    async async async with get_db() as c:
+        await c.execute(
+            "INSERT INTO vault_custom_limits (vault_id, max_per_min) VALUES ($1,$2) "
+            "ON CONFLICT (vault_id) DO UPDATE SET max_per_min=EXCLUDED.max_per_min",
+            vault_id, limit,
         )
-        c.commit()
 
-def check_totp_add_rate(vault_id: str) -> bool:
-    """Returns True if vault has NOT exceeded per-minute limit in the last 60 seconds.
-    Uses per-vault custom limit if set, otherwise falls back to global MAX_TOTP_PER_MINUTE."""
+async def check_totp_add_rate(vault_id: str) -> bool:
     now       = int(time.time())
-    eff_limit = get_effective_per_min_limit(vault_id)
-    with get_db() as c:
-        row = c.execute(
-            "SELECT count, window_start FROM totp_add_rate WHERE vault_id=?",
-            (vault_id,)
-        ).fetchone()
+    eff_limit = await get_effective_per_min_limit(vault_id)
+    async async async with get_db() as c:
+        row = await c.fetchrow(
+            "SELECT count, window_start FROM totp_add_rate WHERE vault_id=$1", vault_id
+        )
     if not row or now - row["window_start"] >= 60:
-        return True   # window expired or no record
+        return True
     return row["count"] < eff_limit
 
-def record_totp_add(vault_id: str):
-    """Increment the per-minute TOTP add counter for a vault."""
+async def record_totp_add(vault_id: str):
     now = int(time.time())
-    with get_db() as c:
-        row = c.execute(
-            "SELECT count, window_start FROM totp_add_rate WHERE vault_id=?",
-            (vault_id,)
-        ).fetchone()
+    async async async with get_db() as c:
+        row = await c.fetchrow(
+            "SELECT count, window_start FROM totp_add_rate WHERE vault_id=$1", vault_id
+        )
         if not row or now - row["window_start"] >= 60:
-            # Start fresh window
-            c.execute(
-                "INSERT INTO totp_add_rate (vault_id, count, window_start) VALUES (?,?,?) "
-                "ON CONFLICT(vault_id) DO UPDATE SET count=1, window_start=excluded.window_start",
-                (vault_id, 1, now),
+            await c.execute(
+                "INSERT INTO totp_add_rate (vault_id, count, window_start) VALUES ($1,1,$2) "
+                "ON CONFLICT (vault_id) DO UPDATE SET count=1, window_start=EXCLUDED.window_start",
+                vault_id, now,
             )
         else:
-            c.execute(
-                "UPDATE totp_add_rate SET count=count+1 WHERE vault_id=?",
-                (vault_id,)
+            await c.execute(
+                "UPDATE totp_add_rate SET count=count+1 WHERE vault_id=$1", vault_id
             )
-        c.commit()
 
-# ── Duplicate TOTP secret enforcement ───────────────────────
-
-def _count_secret_duplicates(vault_id: str, secret_hash: str) -> int:
-    """Count how many TOTP entries in this vault share the same secret hash."""
-    with get_db() as c:
-        row = c.execute(
-            "SELECT COUNT(*) AS n FROM totp_accounts WHERE vault_id=? AND secret_hash=?",
-            (vault_id, secret_hash)
-        ).fetchone()
-    return row["n"] if row else 0
-
-def _is_vault_dup_disabled(vault_id: str) -> tuple:
-    """Return (is_disabled, disabled_until_unix). True if vault is in 18h ban."""
-    with get_db() as c:
-        row = c.execute(
-            "SELECT disabled_until FROM dup_attempts WHERE vault_id=?", (vault_id,)
-        ).fetchone()
-    if not row:
-        return False, 0
-    now = int(time.time())
-    if row["disabled_until"] > now:
-        return True, row["disabled_until"]
-    return False, 0
-
-def _record_dup_attempt(vault_id: str) -> bool:
-    """Record a duplicate attempt beyond the limit.
-    Returns True if vault should now be banned (18h).
-    After MAX_TOTP_DUPLICATE exceeded: 20 more tries -> 18h ban, counter resets."""
-    now          = int(time.time())
-    WINDOW       = 3600 * 24   # 24h sliding window for the 20-attempt counter
-    BAN_DURATION = 3600 * 18   # 18h ban
-    BAN_THRESHOLD = 20         # attempts-after-limit before ban
-    with get_db() as c:
-        row = c.execute(
-            "SELECT attempt_count, window_start, disabled_until FROM dup_attempts WHERE vault_id=?",
-            (vault_id,)
-        ).fetchone()
-        if not row:
-            c.execute(
-                "INSERT INTO dup_attempts (vault_id, attempt_count, window_start, disabled_until) "
-                "VALUES (?,1,?,0)",
-                (vault_id, now)
-            )
-            c.commit()
-            return False
-        count        = row["attempt_count"]
-        window_start = row["window_start"]
-        # Reset window if older than 24h
-        if now - window_start > WINDOW:
-            count        = 0
-            window_start = now
-        count += 1
-        should_ban     = count >= BAN_THRESHOLD
-        disabled_until = (now + BAN_DURATION) if should_ban else row["disabled_until"]
-        if should_ban:
-            count        = 0   # reset counter after ban triggers
-            window_start = now
-        c.execute(
-            "INSERT INTO dup_attempts (vault_id, attempt_count, window_start, disabled_until) "
-            "VALUES (?,?,?,?) ON CONFLICT(vault_id) DO UPDATE SET "
-            "attempt_count=excluded.attempt_count, window_start=excluded.window_start, "
-            "disabled_until=excluded.disabled_until",
-            (vault_id, count, window_start, disabled_until)
-        )
-        c.commit()
-    return should_ban
-
-def _reset_dup_attempts(vault_id: str):
-    """Clear duplicate attempt counter for a vault (admin use)."""
-    with get_db() as c:
-        c.execute("DELETE FROM dup_attempts WHERE vault_id=?", (vault_id,))
-        c.commit()
-
-# ── Name suffix helper ───────────────────────────────────────
-
-def _auto_suffix_name(vault_id: str, requested_name: str) -> str:
+async def _auto_suffix_name(vault_id: str, requested_name: str) -> str:
     """If 'Google' already exists, return 'Google 1', 'Google 2', etc."""
     base = requested_name.strip()[:TOTP_NAME_MAX_LEN]
-    with get_db() as c:
-        existing = {
-            r["name"] for r in c.execute(
-                "SELECT name FROM totp_accounts WHERE vault_id=?", (vault_id,)
-            ).fetchall()
-        }
+    async async async with get_db() as c:
+        rows = await c.fetch(
+            "SELECT name FROM totp_accounts WHERE vault_id=$1", vault_id
+        )
+    existing = {r["name"] for r in rows}
     if base not in existing:
         return base
     for i in range(1, 1000):
@@ -613,337 +489,266 @@ def _auto_suffix_name(vault_id: str, requested_name: str) -> str:
     return base  # fallback (should never happen)
 
 # ── DB ─────────────────────────────────────────────────────
-import threading as _threading
+# asyncpg-based PostgreSQL layer.
+# All DB helpers are now async and use the shared pool.
+# Parameter style: $1, $2, ... (PostgreSQL positional).
 
-_db_local = _threading.local()   # one persistent connection per thread
+class _AsyncDB:
+    """Async context manager — acquires a connection from the pool,
+    wraps it in a transaction, commits on success, rolls back on error.
 
-def _get_thread_conn() -> sqlite3.Connection:
-    """Return a long-lived, WAL-enabled SQLite connection for the current thread.
-    Opens once per thread, reuses afterwards — eliminates per-call connect overhead.
-    check_same_thread=False is safe here because we use thread-local storage.
+    Usage:
+        async async async with get_db() as c:
+            row = await c.fetchrow("SELECT * FROM users WHERE vault_id=$1", vid)
     """
-    conn = getattr(_db_local, "conn", None)
-    if conn is None:
-        conn = sqlite3.connect(
-            DB_PATH,
-            timeout=30.0,
-            check_same_thread=False,   # safe: one conn per thread via _db_local
-        )
-        conn.row_factory = sqlite3.Row
-        # WAL mode: readers never block writers, writers never block readers
-        conn.execute("PRAGMA journal_mode=WAL")
-        # Larger cache = fewer disk reads
-        conn.execute("PRAGMA cache_size=-8000")   # 8 MB per thread
-        # Sync less aggressively (WAL already protects durability)
-        conn.execute("PRAGMA synchronous=NORMAL")
-        _db_local.conn = conn
-    return conn
+    def __init__(self):
+        self._conn: asyncpg.Connection | None = None
+        self._tr = None
 
-
-class _DB:
-    """Context manager that wraps the thread-local connection.
-    Commits on clean exit, rolls back on exception, never closes the connection
-    (it stays alive for the thread lifetime for performance).
-    """
-    def __enter__(self) -> sqlite3.Connection:
-        self._conn = _get_thread_conn()
+    async def __aenter__(self) -> asyncpg.Connection:
+        pool = await _get_pool()
+        self._conn = await pool.acquire()
+        self._tr   = self._conn.transaction()
+        await self._tr.start()
         return self._conn
 
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        if exc_type is None:
-            try:
-                self._conn.commit()
-            except Exception as e:
-                logger.warning(f"DB commit failed: {e}")
-        else:
-            try:
-                self._conn.rollback()
-            except Exception:
-                pass
-        return False   # do NOT suppress exceptions
-
-    # Allow using _DB instance directly (legacy callers do `with get_db() as c: c.execute(...)`)
-    def execute(self, *a, **kw):
-        return _get_thread_conn().execute(*a, **kw)
-
-    def commit(self):
-        _get_thread_conn().commit()
-
-
-def get_db() -> "_DB":
-    return _DB()
-
-def init_db():
-    # Enable WAL mode at startup (persists in DB file, applies to all future connections)
-    _startup_conn = sqlite3.connect(DB_PATH, timeout=30.0)
-    _startup_conn.execute("PRAGMA journal_mode=WAL")
-    _startup_conn.execute("PRAGMA synchronous=NORMAL")
-    _startup_conn.commit()
-    _startup_conn.close()
-
-    with get_db() as c:
-        c.execute("""CREATE TABLE IF NOT EXISTS users (
-            id            INTEGER PRIMARY KEY AUTOINCREMENT,
-            vault_id      TEXT    UNIQUE NOT NULL,
-            telegram_id   INTEGER UNIQUE NOT NULL,
-            password_hash BLOB    NOT NULL,
-            pw_salt       BLOB    NOT NULL,
-            tg_name       TEXT    DEFAULT '',
-            tg_username   TEXT    DEFAULT '',
-            timezone      TEXT    DEFAULT 'UTC',
-            kdf_type      TEXT    DEFAULT 'pbkdf2',
-            mk_enc        BLOB,
-            mk_salt       BLOB,
-            mk_iv         BLOB,
-            created_at    INTEGER DEFAULT (strftime('%s','now')))""")
-        c.execute("""CREATE TABLE IF NOT EXISTS sessions (
-            telegram_id INTEGER PRIMARY KEY,
-            vault_id    TEXT    NOT NULL,
-            created_at  INTEGER DEFAULT (strftime('%s','now')))""")
-        c.execute("""CREATE TABLE IF NOT EXISTS totp_accounts (
-            id         INTEGER PRIMARY KEY AUTOINCREMENT,
-            vault_id   TEXT NOT NULL,
-            name       TEXT NOT NULL,
-            issuer     TEXT DEFAULT '',
-            secret_enc BLOB NOT NULL,
-            salt       BLOB NOT NULL,
-            iv         BLOB NOT NULL,
-            sk_enc     BLOB,
-            sk_salt    BLOB,
-            sk_iv      BLOB,
-            note       TEXT DEFAULT '',
-            account_type TEXT DEFAULT 'totp',
-            hotp_counter INTEGER DEFAULT 0,
-            secret_hash  TEXT DEFAULT '',
-            created_at INTEGER DEFAULT (strftime('%s','now')))""")
-        c.execute("""CREATE TABLE IF NOT EXISTS reset_otps (
-            vault_id   TEXT    NOT NULL,
-            otp        TEXT    NOT NULL,
-            expires_at INTEGER NOT NULL,
-            used       INTEGER DEFAULT 0)""")
-        c.execute("""CREATE TABLE IF NOT EXISTS reset_attempts (
-            vault_id     TEXT    PRIMARY KEY,
-            attempts     INTEGER DEFAULT 0,
-            frozen_until INTEGER DEFAULT 0)""")
-        c.execute("""CREATE TABLE IF NOT EXISTS login_alerts (
-            alert_id   TEXT    PRIMARY KEY,
-            owner_id   INTEGER NOT NULL,
-            vault_id   TEXT    NOT NULL,
-            message_id INTEGER NOT NULL,
-            chat_id    INTEGER NOT NULL,
-            created_at INTEGER NOT NULL)""")
-        c.execute("""CREATE TABLE IF NOT EXISTS share_links (
-            token       TEXT    PRIMARY KEY,
-            vault_id    TEXT    NOT NULL,
-            totp_ids    TEXT    NOT NULL,
-            secrets_enc TEXT    NOT NULL,
-            names       TEXT    NOT NULL,
-            expires_at  INTEGER NOT NULL,
-            created_at  INTEGER DEFAULT (strftime('%s','now')))""")
-
-        # New: track failed login attempts per vault to prevent brute-force
-        c.execute("""CREATE TABLE IF NOT EXISTS login_attempts (
-            vault_id     TEXT    PRIMARY KEY,
-            attempts     INTEGER DEFAULT 0,
-            frozen_until INTEGER DEFAULT 0)""")
-
-        # New: backup reminder preferences per user
-        c.execute("""CREATE TABLE IF NOT EXISTS backup_reminders (
-            telegram_id INTEGER PRIMARY KEY,
-            frequency   TEXT    DEFAULT 'weekly',
-            last_sent   INTEGER DEFAULT 0,
-            enabled     INTEGER DEFAULT 1)""")
-
-        # New: bot-wide settings (maintenance mode, signup/login toggles)
-        c.execute("""CREATE TABLE IF NOT EXISTS bot_settings (
-            key   TEXT PRIMARY KEY,
-            value TEXT NOT NULL)""")
-
-        # New: offline auto-backup preferences per user
-        c.execute("""CREATE TABLE IF NOT EXISTS auto_backup_settings (
-            telegram_id  INTEGER PRIMARY KEY,
-            enabled      INTEGER DEFAULT 0,
-            frequency    TEXT    DEFAULT 'weekly',
-            last_weekly  INTEGER DEFAULT 0,
-            last_monthly INTEGER DEFAULT 0,
-            pw_enc       BLOB,
-            pw_salt      BLOB,
-            pw_iv        BLOB)""")
-
-        # New: daily login counter per telegram_id
-        c.execute("""CREATE TABLE IF NOT EXISTS daily_login_counts (
-            telegram_id  INTEGER PRIMARY KEY,
-            count        INTEGER DEFAULT 0,
-            day_bucket   TEXT    DEFAULT '')""")
-
-        # New: weekly signup counter per telegram_id
-        c.execute("""CREATE TABLE IF NOT EXISTS weekly_signup_counts (
-            telegram_id  INTEGER PRIMARY KEY,
-            count        INTEGER DEFAULT 0,
-            week_bucket  TEXT    DEFAULT '')""")
-
-        # New: lifetime distinct vault logins per telegram_id
-        c.execute("""CREATE TABLE IF NOT EXISTS vault_login_history (
-            telegram_id  INTEGER NOT NULL,
-            vault_id     TEXT    NOT NULL,
-            PRIMARY KEY  (telegram_id, vault_id))""")
-
-        # New: TOTP add rate limiting per vault (1-minute window)
-        c.execute("""CREATE TABLE IF NOT EXISTS totp_add_rate (
-            vault_id     TEXT    PRIMARY KEY,
-            count        INTEGER DEFAULT 0,
-            window_start INTEGER DEFAULT 0)""")
-
-        # Per-vault custom limits (overrides global MAX_TOTP_PER_VAULT / MAX_TOTP_PER_MINUTE)
-        c.execute("""CREATE TABLE IF NOT EXISTS vault_custom_limits (
-            vault_id      TEXT    PRIMARY KEY,
-            max_per_vault INTEGER DEFAULT NULL,
-            max_per_min   INTEGER DEFAULT NULL)""")
-
-        # Per-user specific signup disable (blocks signup for specific Telegram IDs
-        # regardless of global public signup toggle)
-        c.execute("""CREATE TABLE IF NOT EXISTS user_signup_disabled (
-            telegram_id   INTEGER PRIMARY KEY,
-            disabled_at   INTEGER DEFAULT (strftime('%s','now')))""")
-
-        # Per-user specific login disable (blocks login for specific Telegram IDs
-        # regardless of global public login toggle)
-        c.execute("""CREATE TABLE IF NOT EXISTS user_login_disabled (
-            telegram_id   INTEGER PRIMARY KEY,
-            disabled_at   INTEGER DEFAULT (strftime('%s','now')))""")
-
-        # Telegram-level ban (blocks all bot interaction except broadcast)
-        c.execute("""CREATE TABLE IF NOT EXISTS telegram_banned (
-            telegram_id   INTEGER PRIMARY KEY,
-            tg_username   TEXT    DEFAULT '',
-            banned_at     INTEGER DEFAULT (strftime('%s','now')))""")
-
-        # Statistics event log - records all key events with BDT-aligned timestamps
-        c.execute("""CREATE TABLE IF NOT EXISTS stats_events (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            event_type  TEXT    NOT NULL,
-            telegram_id INTEGER DEFAULT 0,
-            vault_id    TEXT    DEFAULT '',
-            ts          INTEGER DEFAULT (strftime('%s','now')))""")
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        pool = await _get_pool()
         try:
-            c.execute("CREATE INDEX IF NOT EXISTS idx_stats_ts ON stats_events (ts)")
-            c.execute("CREATE INDEX IF NOT EXISTS idx_stats_type ON stats_events (event_type, ts)")
-        except Exception:
-            pass
+            if exc_type is None:
+                await self._tr.commit()
+            else:
+                await self._tr.rollback()
+        finally:
+            await pool.release(self._conn)
+        return False   # never suppress exceptions
 
-        # Migrations
-        for col, defval in [("tg_name", "''"), ("timezone", "'UTC'"), ("tg_username", "''")]:
-            try:
-                c.execute(f"ALTER TABLE users ADD COLUMN {col} TEXT DEFAULT {defval}")
-            except Exception:
-                pass
 
-        # Argon2id + Master Key migration columns
-        for col, coltype, defval in [
-            ("kdf_type", "TEXT",    "'pbkdf2'"),
-            ("mk_enc",   "BLOB",    "NULL"),
-            ("mk_salt",  "BLOB",    "NULL"),
-            ("mk_iv",    "BLOB",    "NULL"),
-        ]:
-            try:
-                stmt = f"ALTER TABLE users ADD COLUMN {col} {coltype}"
-                if defval != "NULL":
-                    stmt += f" DEFAULT {defval}"
-                c.execute(stmt)
-            except Exception:
-                pass
+def get_db() -> _AsyncDB:
+    """Return a new async DB context manager."""
+    return _AsyncDB()
 
-        # Migrate auto_backup_settings: add encrypted password columns
-        for col, coltype in [("pw_enc", "BLOB"), ("pw_salt", "BLOB"), ("pw_iv", "BLOB")]:
-            try:
-                c.execute(f"ALTER TABLE auto_backup_settings ADD COLUMN {col} {coltype}")
-            except Exception:
-                pass
 
-        # Migrate users: add sk_verifier for secure key verification without password
-        try:
-            c.execute("ALTER TABLE users ADD COLUMN sk_verifier TEXT DEFAULT ''")
-        except Exception:
-            pass
+async def init_db():
+    """Create all tables (PostgreSQL DDL) and run migrations.
+    Called once at startup before the bot starts polling.
+    """
+    global _pg_pool
+    if not DATABASE_URL:
+        raise RuntimeError(
+            "DATABASE_URL environment variable is not set. "
+            "Set it to your PostgreSQL connection string, e.g. "
+            "postgresql://user:password@host:5432/dbname"
+        )
+    _pg_pool = await asyncpg.create_pool(
+        DATABASE_URL,
+        min_size=5,
+        max_size=20,
+        command_timeout=30,
+    )
+    logger.info("PostgreSQL pool created (min=5, max=20).")
 
-        for col in [("sk_enc", "BLOB"), ("sk_salt", "BLOB"), ("sk_iv", "BLOB")]:
-            try:
-                c.execute(f"ALTER TABLE users ADD COLUMN {col[0]} {col[1]}")
-            except Exception:
-                pass
+    # ── PostgreSQL DDL (idempotent) ──────────────────────────
+    async async async with get_db() as c:
+        await c.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                id               BIGSERIAL PRIMARY KEY,
+                vault_id         TEXT    UNIQUE NOT NULL,
+                telegram_id      BIGINT  UNIQUE NOT NULL,
+                password_hash    BYTEA   NOT NULL,
+                pw_salt          BYTEA   NOT NULL,
+                tg_name          TEXT    DEFAULT '',
+                tg_username      TEXT    DEFAULT '',
+                timezone         TEXT    DEFAULT 'UTC',
+                kdf_type         TEXT    DEFAULT 'pbkdf2',
+                mk_enc           BYTEA,
+                mk_salt          BYTEA,
+                mk_iv            BYTEA,
+                sk_enc           BYTEA,
+                sk_salt          BYTEA,
+                sk_iv            BYTEA,
+                sk_verifier      TEXT    DEFAULT '',
+                account_disabled INTEGER DEFAULT 0,
+                last_seen        BIGINT  DEFAULT 0,
+                created_at       BIGINT  DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT
+            )""")
+        await c.execute("""
+            CREATE TABLE IF NOT EXISTS sessions (
+                telegram_id BIGINT PRIMARY KEY,
+                vault_id    TEXT   NOT NULL,
+                created_at  BIGINT DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT
+            )""")
+        await c.execute("""
+            CREATE TABLE IF NOT EXISTS totp_accounts (
+                id           BIGSERIAL PRIMARY KEY,
+                vault_id     TEXT   NOT NULL,
+                name         TEXT   NOT NULL,
+                issuer       TEXT   DEFAULT '',
+                secret_enc   BYTEA  NOT NULL,
+                salt         BYTEA  NOT NULL,
+                iv           BYTEA  NOT NULL,
+                sk_enc       BYTEA,
+                sk_salt      BYTEA,
+                sk_iv        BYTEA,
+                note         TEXT   DEFAULT '',
+                account_type TEXT   DEFAULT 'totp',
+                hotp_counter BIGINT DEFAULT 0,
+                created_at   BIGINT DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT
+            )""")
+        await c.execute("CREATE INDEX IF NOT EXISTS idx_totp_vault ON totp_accounts (vault_id)")
+        await c.execute("""
+            CREATE TABLE IF NOT EXISTS reset_otps (
+                vault_id   TEXT   NOT NULL,
+                otp        TEXT   NOT NULL,
+                expires_at BIGINT NOT NULL,
+                used       INTEGER DEFAULT 0
+            )""")
+        await c.execute("""
+            CREATE TABLE IF NOT EXISTS reset_attempts (
+                vault_id     TEXT    PRIMARY KEY,
+                attempts     INTEGER DEFAULT 0,
+                frozen_until BIGINT  DEFAULT 0
+            )""")
+        await c.execute("""
+            CREATE TABLE IF NOT EXISTS login_attempts (
+                vault_id     TEXT    PRIMARY KEY,
+                attempts     INTEGER DEFAULT 0,
+                frozen_until BIGINT  DEFAULT 0
+            )""")
+        await c.execute("""
+            CREATE TABLE IF NOT EXISTS login_alerts (
+                alert_id   TEXT   PRIMARY KEY,
+                owner_id   BIGINT NOT NULL,
+                vault_id   TEXT   NOT NULL,
+                message_id BIGINT NOT NULL,
+                chat_id    BIGINT NOT NULL,
+                created_at BIGINT NOT NULL
+            )""")
+        await c.execute("""
+            CREATE TABLE IF NOT EXISTS share_links (
+                token       TEXT   PRIMARY KEY,
+                vault_id    TEXT   NOT NULL,
+                totp_ids    TEXT   NOT NULL,
+                secrets_enc TEXT   NOT NULL,
+                names       TEXT   NOT NULL,
+                expires_at  BIGINT NOT NULL,
+                created_at  BIGINT DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT
+            )""")
+        await c.execute("""
+            CREATE TABLE IF NOT EXISTS backup_reminders (
+                telegram_id BIGINT  PRIMARY KEY,
+                frequency   TEXT    DEFAULT 'weekly',
+                last_sent   BIGINT  DEFAULT 0,
+                enabled     INTEGER DEFAULT 1
+            )""")
+        await c.execute("""
+            CREATE TABLE IF NOT EXISTS bot_settings (
+                key   TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )""")
+        await c.execute("""
+            CREATE TABLE IF NOT EXISTS auto_backup_settings (
+                telegram_id  BIGINT  PRIMARY KEY,
+                enabled      INTEGER DEFAULT 0,
+                frequency    TEXT    DEFAULT 'weekly',
+                last_weekly  BIGINT  DEFAULT 0,
+                last_monthly BIGINT  DEFAULT 0,
+                pw_enc       BYTEA,
+                pw_salt      BYTEA,
+                pw_iv        BYTEA
+            )""")
+        await c.execute("""
+            CREATE TABLE IF NOT EXISTS daily_login_counts (
+                telegram_id BIGINT  PRIMARY KEY,
+                count       INTEGER DEFAULT 0,
+                day_bucket  TEXT    DEFAULT ''
+            )""")
+        await c.execute("""
+            CREATE TABLE IF NOT EXISTS weekly_signup_counts (
+                telegram_id BIGINT  PRIMARY KEY,
+                count       INTEGER DEFAULT 0,
+                week_bucket TEXT    DEFAULT ''
+            )""")
+        await c.execute("""
+            CREATE TABLE IF NOT EXISTS vault_login_history (
+                telegram_id BIGINT NOT NULL,
+                vault_id    TEXT   NOT NULL,
+                PRIMARY KEY (telegram_id, vault_id)
+            )""")
+        await c.execute("""
+            CREATE TABLE IF NOT EXISTS totp_add_rate (
+                vault_id     TEXT    PRIMARY KEY,
+                count        INTEGER DEFAULT 0,
+                window_start BIGINT  DEFAULT 0
+            )""")
+        await c.execute("""
+            CREATE TABLE IF NOT EXISTS vault_custom_limits (
+                vault_id      TEXT    PRIMARY KEY,
+                max_per_vault INTEGER DEFAULT NULL,
+                max_per_min   INTEGER DEFAULT NULL
+            )""")
+        await c.execute("""
+            CREATE TABLE IF NOT EXISTS user_signup_disabled (
+                telegram_id BIGINT PRIMARY KEY,
+                disabled_at BIGINT DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT
+            )""")
+        await c.execute("""
+            CREATE TABLE IF NOT EXISTS user_login_disabled (
+                telegram_id BIGINT PRIMARY KEY,
+                disabled_at BIGINT DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT
+            )""")
+        await c.execute("""
+            CREATE TABLE IF NOT EXISTS telegram_banned (
+                telegram_id BIGINT PRIMARY KEY,
+                tg_username TEXT   DEFAULT '',
+                banned_at   BIGINT DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT
+            )""")
+        await c.execute("""
+            CREATE TABLE IF NOT EXISTS stats_events (
+                id          BIGSERIAL PRIMARY KEY,
+                event_type  TEXT   NOT NULL,
+                telegram_id BIGINT DEFAULT 0,
+                vault_id    TEXT   DEFAULT '',
+                ts          BIGINT DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT
+            )""")
+        await c.execute("CREATE INDEX IF NOT EXISTS idx_stats_ts   ON stats_events (ts)")
+        await c.execute("CREATE INDEX IF NOT EXISTS idx_stats_type ON stats_events (event_type, ts)")
 
-        for col in [("sk_enc", "BLOB"), ("sk_salt", "BLOB"), ("sk_iv", "BLOB")]:
-            try:
-                c.execute(f"ALTER TABLE totp_accounts ADD COLUMN {col[0]} {col[1]}")
-            except Exception:
-                pass
-
-        # Migrate new columns to totp_accounts
-        for col, coltype, default in [
-            ("note",         "TEXT",    "''"),
-            ("account_type", "TEXT",    "'totp'"),
-            ("hotp_counter", "INTEGER", "0"),
-            ("secret_hash",  "TEXT",    "''"),
-        ]:
-            try:
-                c.execute(f"ALTER TABLE totp_accounts ADD COLUMN {col} {coltype} DEFAULT {default}")
-            except Exception:
-                pass
-
-        # Migrate users table: account_disabled, last_seen
-        for col, coltype, default in [
-            ("account_disabled", "INTEGER", "0"),
-            ("last_seen",        "INTEGER", "0"),
-        ]:
-            try:
-                c.execute(f"ALTER TABLE users ADD COLUMN {col} {coltype} DEFAULT {default}")
-            except Exception:
-                pass
-
-        # Duplicate attempt tracking per vault (for duplicate limit enforcement)
-        c.execute("""CREATE TABLE IF NOT EXISTS dup_attempts (
-            vault_id       TEXT    PRIMARY KEY,
-            attempt_count  INTEGER DEFAULT 0,
-            window_start   INTEGER DEFAULT 0,
-            disabled_until INTEGER DEFAULT 0)""")
-
-        # Migration: add disabled_until to existing dup_attempts rows
-        try:
-            c.execute("ALTER TABLE dup_attempts ADD COLUMN disabled_until INTEGER DEFAULT 0")
-        except Exception:
-            pass
-
-        c.commit()
-
-        # Load bot_settings into memory
-        _load_bot_settings(c)
+    logger.info("PostgreSQL tables created/verified.")
+    await _load_bot_settings_async()
 
 
 # ── Bot Settings (maintenance, signup/login toggles) ───────
-def _load_bot_settings(conn=None):
-    """Load persisted settings from DB into in-memory dict."""
+async def _load_bot_settings_async():
+    """Async: load persisted settings from DB into in-memory dict."""
     try:
-        if conn:
-            rows = conn.execute("SELECT key, value FROM bot_settings").fetchall()
-        else:
-            with get_db() as c2:
-                rows = c2.execute("SELECT key, value FROM bot_settings").fetchall()
+        async async async with get_db() as c:
+            rows = await c.fetch("SELECT key, value FROM bot_settings")
         for row in rows:
             if row["key"] in _bot_settings:
                 val = row["value"]
-                if val in ("true", "false"):
-                    _bot_settings[row["key"]] = val == "true"
-                else:
-                    _bot_settings[row["key"]] = val
-    except Exception:
-        pass
+                _bot_settings[row["key"]] = (val == "true") if val in ("true", "false") else val
+    except Exception as e:
+        logger.warning(f"_load_bot_settings_async: {e}")
 
-def _save_setting(key: str, value):
+def _load_bot_settings(conn=None):
+    """Sync shim — kept for call-sites that haven't been converted yet.
+    Safe to call; silently does nothing (settings already loaded async)."""
+    pass
+
+async def _save_setting_async(key: str, value):
     _bot_settings[key] = value
     str_val = "true" if value is True else ("false" if value is False else str(value))
-    with get_db() as c:
-        c.execute("INSERT OR REPLACE INTO bot_settings (key, value) VALUES (?,?)", (key, str_val))
-        c.commit()
+    async async async with get_db() as c:
+        await c.execute(
+            "INSERT INTO bot_settings (key, value) VALUES ($1, $2) "
+            "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+            key, str_val,
+        )
+
+def _save_setting_async(key: str, value):
+    """Sync shim — schedules the async save as a fire-and-forget task."""
+    asyncio.create_task(await _save_setting_async(key, value))
 
 def is_maintenance() -> bool:
     return bool(_bot_settings.get("maintenance", False))
@@ -964,12 +769,17 @@ MAINTENANCE_MSG = (
 )
 
 def update_last_seen(telegram_id: int):
-    with get_db() as c:
-        c.execute(
-            "UPDATE users SET last_seen=? WHERE telegram_id=?",
-            (int(time.time()), telegram_id)
-        )
-        c.commit()
+    """Fire-and-forget last_seen update — does not block the event loop."""
+    async def _do():
+        try:
+            async async async with get_db() as c:
+                await c.execute(
+                    "UPDATE users SET last_seen=$1 WHERE telegram_id=$2",
+                    int(time.time()), telegram_id,
+                )
+        except Exception as e:
+            logger.warning(f"update_last_seen {telegram_id}: {e}")
+    asyncio.create_task(_do())
 
 def fmt_bd_time(ts: int) -> str:
     """Format timestamp in Bangladesh time (UTC+6)."""
@@ -1045,18 +855,26 @@ def unwrap_master_key(mk_enc: bytes, mk_salt: bytes, mk_iv: bytes, password: str
     wrap_key = _pw_wrap_key(password, bytes(mk_salt))
     return AESGCM(wrap_key).decrypt(bytes(mk_iv), bytes(mk_enc), None)
 
-def load_master_key(vault_id: str, password: str) -> bytes | None:
-    """Load and unwrap the master key for a vault. Returns None if not migrated yet."""
-    with get_db() as c:
-        row = c.execute(
-            "SELECT mk_enc, mk_salt, mk_iv FROM users WHERE vault_id=?", (vault_id,)
-        ).fetchone()
+async def load_master_key(vault_id: str, password: str) -> bytes | None:
+    """Async: Load and unwrap the master key for a vault. Returns None if not migrated yet."""
+    async async async with get_db() as c:
+        row = await c.fetchrow(
+            "SELECT mk_enc, mk_salt, mk_iv FROM users WHERE vault_id=$1", vault_id
+        )
     if not row or not row["mk_enc"]:
         return None
     try:
-        return unwrap_master_key(row["mk_enc"], row["mk_salt"], row["mk_iv"], password)
+        # unwrap_master_key uses Argon2 — run in thread
+        return await asyncio.to_thread(
+            unwrap_master_key, row["mk_enc"], row["mk_salt"], row["mk_iv"], password
+        )
     except Exception:
         return None
+
+async def _get_vault_key(vault_id: str, password: str) -> bytes | str:
+    """Async: return master_key (bytes) if available, else password (str) for legacy path."""
+    mk = await load_master_key(vault_id, password)
+    return mk if mk is not None else password
 
 # ── Symmetric encryption (uses master_key) ─────────────────
 def enc_key(password: str, vault_id: str, salt: bytes) -> bytes:
@@ -1087,11 +905,6 @@ def decrypt(ct, salt, iv, password_or_mk: str | bytes, vault_id: str) -> str:
     else:
         key = enc_key(password_or_mk, vault_id, bytes(salt))
     return AESGCM(key).decrypt(bytes(iv), bytes(ct), None).decode()
-
-def _get_vault_key(vault_id: str, password: str) -> bytes | str:
-    """Return master_key (bytes) if available, else password (str) for legacy path."""
-    mk = load_master_key(vault_id, password)
-    return mk if mk is not None else password
 
 def export_enc_key(password: str, salt: bytes) -> bytes:
     return PBKDF2HMAC(algorithm=hashes.SHA256(), length=32, salt=salt, iterations=310_000).derive(password.encode())
@@ -1132,11 +945,10 @@ def gen_share_token() -> str:
     """Generate a cryptographically random URL-safe 43-char token."""
     return base64.urlsafe_b64encode(secrets.token_bytes(32)).rstrip(b"=").decode()
 
-def purge_expired_share_links():
+async def purge_expired_share_links():
     """Remove expired share links. Called on bot startup."""
-    with get_db() as c:
-        c.execute("DELETE FROM share_links WHERE expires_at <= ?", (int(time.time()),))
-        c.commit()
+    async async async with get_db() as c:
+        await c.execute("DELETE FROM share_links WHERE expires_at <= $1", int(time.time()))
 
 # ── Secure Key crypto ───────────────────────────────────────
 def gen_secure_key() -> str:
@@ -1157,61 +969,61 @@ def sk_decrypt_totp(sk_ct: bytes, sk_salt: bytes, sk_iv: bytes, secure_key_hex: 
         bytes(sk_iv), bytes(sk_ct), None
     )
 
-def store_user_secure_key(vault_id: str, secure_key_hex: str, password: str):
-    """Store secure key encrypted with master_key (or password for legacy)."""
-    vault_key = _get_vault_key(vault_id, password)
-    ct, salt, iv = encrypt(secure_key_hex, vault_key, vault_id)
-    with get_db() as c:
-        c.execute(
-            "UPDATE users SET sk_enc=?, sk_salt=?, sk_iv=? WHERE vault_id=?",
-            (ct, salt, iv, vault_id),
+async def store_user_secure_key(vault_id: str, secure_key_hex: str, password: str):
+    """Store secure key encrypted with master_key (or password for legacy).
+    vault_key is resolved async before offloading encryption to thread."""
+    vault_key = await _get_vault_key(vault_id, password)
+    ct, salt, iv = await asyncio.to_thread(encrypt, secure_key_hex, vault_key, vault_id)
+    async async async with get_db() as c:
+        await c.execute(
+            "UPDATE users SET sk_enc=$1, sk_salt=$2, sk_iv=$3 WHERE vault_id=$4",
+            ct, salt, iv, vault_id,
         )
-        c.commit()
 
-def load_user_secure_key(vault_id: str, password: str) -> str | None:
-    """Load and decrypt the secure key using master_key or password (legacy)."""
-    with get_db() as c:
-        row = c.execute(
-            "SELECT sk_enc, sk_salt, sk_iv FROM users WHERE vault_id=?", (vault_id,)
-        ).fetchone()
+async def load_user_secure_key(vault_id: str, password: str) -> str | None:
+    """Load and decrypt the secure key. DB fetch async, crypto in thread."""
+    async async async with get_db() as c:
+        row = await c.fetchrow(
+            "SELECT sk_enc, sk_salt, sk_iv FROM users WHERE vault_id=$1", vault_id
+        )
     if not row or not row["sk_enc"]:
         return None
-    vault_key = _get_vault_key(vault_id, password)
-    try:
-        return decrypt(row["sk_enc"], row["sk_salt"], row["sk_iv"], vault_key, vault_id)
-    except Exception:
-        return None
-
-def verify_secure_key_by_totp(vault_id: str, candidate_hex: str) -> bool:
-    """Verify the Secure Key against users table sk_enc OR totp_accounts sk_enc.
-    Falls back gracefully when the user has no TOTP entries."""
-    candidate = candidate_hex.strip()
-    # Primary: try to decrypt any TOTP entry's sk_enc with the candidate
-    with get_db() as c:
-        totp_rows = c.execute(
-            "SELECT sk_enc, sk_salt, sk_iv FROM totp_accounts "
-            "WHERE vault_id=? AND sk_enc IS NOT NULL LIMIT 3",
-            (vault_id,)
-        ).fetchall()
-    for row in totp_rows:
+    vault_key = await _get_vault_key(vault_id, password)
+    def _dec():
         try:
-            sk_decrypt_totp(row["sk_enc"], row["sk_salt"], row["sk_iv"], candidate, vault_id)
-            return True   # Successfully decrypted = correct key
+            return decrypt(row["sk_enc"], row["sk_salt"], row["sk_iv"], vault_key, vault_id)
         except Exception:
-            continue
+            return None
+    return await asyncio.to_thread(_dec)
+
+async def verify_secure_key_by_totp(vault_id: str, candidate_hex: str) -> bool:
+    """Async: Verify Secure Key against totp_accounts sk_enc OR users.sk_verifier."""
+    candidate = candidate_hex.strip()
+    async async async with get_db() as c:
+        totp_rows = await c.fetch(
+            "SELECT sk_enc, sk_salt, sk_iv FROM totp_accounts "
+            "WHERE vault_id=$1 AND sk_enc IS NOT NULL LIMIT 3",
+            vault_id,
+        )
     if totp_rows:
-        return False  # Had TOTP entries but none decrypted = wrong key
-    # No TOTP entries at all — verify using users.sk_enc HMAC verifier
-    with get_db() as c:
-        row = c.execute(
-            "SELECT sk_verifier FROM users WHERE vault_id=?", (vault_id,)
-        ).fetchone()
+        # Try to decrypt each; success means correct key. All crypto in thread.
+        def _try_decrypt():
+            for row in totp_rows:
+                try:
+                    sk_decrypt_totp(row["sk_enc"], row["sk_salt"], row["sk_iv"], candidate, vault_id)
+                    return True
+                except Exception:
+                    continue
+            return False
+        return await asyncio.to_thread(_try_decrypt)
+    # No TOTP entries — fall back to HMAC verifier stored in users table
+    async async async with get_db() as c:
+        row = await c.fetchrow(
+            "SELECT sk_verifier FROM users WHERE vault_id=$1", vault_id
+        )
     if row and row["sk_verifier"]:
         expected = hmac.new(SERVER_KEY, candidate.encode(), hashlib.sha256).hexdigest()
         return hmac.compare_digest(row["sk_verifier"], expected)
-    # No verifier stored (old account) and no TOTP entries.
-    # Reject: cannot verify the key, so we cannot safely accept any input.
-    # The user should skip secure key and lose TOTP data (there are none anyway).
     return False
 
 # ── TOTP ───────────────────────────────────────────────────
@@ -1296,20 +1108,22 @@ def gen_otp() -> str:
         num //= 62
     return "".join(chars)
 
-def store_otp(vault_id: str, otp: str):
+async def store_otp(vault_id: str, otp: str):
     otp_hmac = hmac.new(SERVER_KEY, otp.encode(), hashlib.sha256).hexdigest()
-    with get_db() as c:
-        c.execute("DELETE FROM reset_otps WHERE vault_id=?", (vault_id,))
-        c.execute("INSERT INTO reset_otps (vault_id,otp,expires_at) VALUES (?,?,?)",
-                  (vault_id, otp_hmac, int(time.time()) + OTP_TTL))
-        c.commit()
+    async async async with get_db() as c:
+        await c.execute("DELETE FROM reset_otps WHERE vault_id=$1", vault_id)
+        await c.execute(
+            "INSERT INTO reset_otps (vault_id, otp, expires_at) VALUES ($1,$2,$3)",
+            vault_id, otp_hmac, int(time.time()) + OTP_TTL,
+        )
 
-def verify_otp(vault_id: str, otp: str) -> bool:
-    with get_db() as c:
-        row = c.execute(
-            "SELECT otp,expires_at,used FROM reset_otps WHERE vault_id=? ORDER BY expires_at DESC LIMIT 1",
-            (vault_id,)
-        ).fetchone()
+async def verify_otp(vault_id: str, otp: str) -> bool:
+    async async async with get_db() as c:
+        row = await c.fetchrow(
+            "SELECT otp, expires_at, used FROM reset_otps "
+            "WHERE vault_id=$1 ORDER BY expires_at DESC LIMIT 1",
+            vault_id,
+        )
     if not row:
         return False
     if row["used"] or int(time.time()) > row["expires_at"]:
@@ -1317,40 +1131,45 @@ def verify_otp(vault_id: str, otp: str) -> bool:
     otp_hmac = hmac.new(SERVER_KEY, otp.strip().encode(), hashlib.sha256).hexdigest()
     return hmac.compare_digest(row["otp"], otp_hmac)
 
-def mark_otp_used(vault_id: str):
-    with get_db() as c:
-        c.execute("UPDATE reset_otps SET used=1 WHERE vault_id=?", (vault_id,))
-        c.commit()
+async def mark_otp_used(vault_id: str):
+    async async async with get_db() as c:
+        await c.execute("UPDATE reset_otps SET used=1 WHERE vault_id=$1", vault_id)
 
-# ── Rate limiting ───────────────────────────────────────────
-def record_reset_attempt(vault_id: str) -> bool:
+async def record_reset_attempt(vault_id: str) -> bool:
     now = int(time.time())
-    with get_db() as c:
-        row = c.execute("SELECT attempts, frozen_until FROM reset_attempts WHERE vault_id=?", (vault_id,)).fetchone()
+    async async async with get_db() as c:
+        row = await c.fetchrow(
+            "SELECT attempts, frozen_until FROM reset_attempts WHERE vault_id=$1", vault_id
+        )
         if row and row["frozen_until"] > now:
             return True
         attempts     = (row["attempts"] if row else 0) + 1
         frozen_until = now + FREEZE_HOURS * 3600 if attempts >= MAX_RESET_ATTEMPTS else 0
-        c.execute("INSERT OR REPLACE INTO reset_attempts (vault_id, attempts, frozen_until) VALUES (?,?,?)",
-                  (vault_id, attempts, frozen_until))
-        c.commit()
+        await c.execute(
+            "INSERT INTO reset_attempts (vault_id, attempts, frozen_until) VALUES ($1,$2,$3) "
+            "ON CONFLICT (vault_id) DO UPDATE SET attempts=EXCLUDED.attempts, frozen_until=EXCLUDED.frozen_until",
+            vault_id, attempts, frozen_until,
+        )
         return frozen_until > now
 
-def reset_attempts_clear(vault_id: str):
-    with get_db() as c:
-        c.execute("DELETE FROM reset_attempts WHERE vault_id=?", (vault_id,))
-        c.commit()
+async def reset_attempts_clear(vault_id: str):
+    async async async with get_db() as c:
+        await c.execute("DELETE FROM reset_attempts WHERE vault_id=$1", vault_id)
 
-def is_reset_frozen(vault_id: str) -> bool:
-    with get_db() as c:
-        row = c.execute("SELECT frozen_until FROM reset_attempts WHERE vault_id=?", (vault_id,)).fetchone()
-        return bool(row and row["frozen_until"] > int(time.time()))
+async def is_reset_frozen(vault_id: str) -> bool:
+    async async async with get_db() as c:
+        row = await c.fetchrow(
+            "SELECT frozen_until FROM reset_attempts WHERE vault_id=$1", vault_id
+        )
+    return bool(row and row["frozen_until"] > int(time.time()))
 
-def get_freeze_remaining(vault_id: str) -> int:
-    with get_db() as c:
-        row = c.execute("SELECT frozen_until FROM reset_attempts WHERE vault_id=?", (vault_id,)).fetchone()
-        if row and row["frozen_until"] > int(time.time()):
-            return row["frozen_until"] - int(time.time())
+async def get_freeze_remaining(vault_id: str) -> int:
+    async async async with get_db() as c:
+        row = await c.fetchrow(
+            "SELECT frozen_until FROM reset_attempts WHERE vault_id=$1", vault_id
+        )
+    if row and row["frozen_until"] > int(time.time()):
+        return row["frozen_until"] - int(time.time())
     return 0
 
 # ── MarkdownV2 escaping (FIXED) ────────────────────────────
@@ -1387,7 +1206,7 @@ def parse_tz(raw: str):
     """Parse user timezone input like +6, -5:30, +5:45 into a valid IANA tz string.
     Uses fixed-offset IANA names: Etc/GMT signs are INVERTED (POSIX convention),
     so we use a direct UTC±HH:MM approach via zoneinfo fixed offsets instead."""
-    m = re.match(r"^([+-])(\d{1,2})(?::(\d{2}))?$", raw.strip())
+    m = re.match(r"^([+-])(\d{1,2})($1::(\d{2}))$2$", raw.strip())
     if not m:
         return None
     sign, h, mn = m.group(1), int(m.group(2)), int(m.group(3) or 0)
@@ -1553,12 +1372,12 @@ async def send_login_alert(bot, owner_id: int, vault_id: str, new_telegram_id: i
             parse_mode="MarkdownV2",
             reply_markup=kb,
         )
-        with get_db() as c:
-            c.execute(
-                "INSERT INTO login_alerts (alert_id,owner_id,vault_id,message_id,chat_id,created_at) VALUES (?,?,?,?,?,?)",
-                (alert_id, owner_id, vault_id, msg.message_id, owner_id, now),
+        async async async with get_db() as c:
+            await c.execute(
+                "INSERT INTO login_alerts (alert_id,owner_id,vault_id,message_id,chat_id,created_at) "
+                "VALUES ($1,$2,$3,$4,$5,$6)",
+                alert_id, owner_id, vault_id, msg.message_id, owner_id, now,
             )
-            c.commit()
         logger.info(f"Login alert sent to owner {owner_id} for vault {vault_id}")
     except Exception as e:
         logger.error(f"Failed to send login alert to owner {owner_id}: {e}")
@@ -1567,9 +1386,8 @@ async def handle_alert_ack(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer("Acknowledged. No action taken.")
     alert_id = q.data[len("alert_ack_"):]
-    with get_db() as c:
-        c.execute("DELETE FROM login_alerts WHERE alert_id=?", (alert_id,))
-        c.commit()
+    async async async with get_db() as c:
+        await c.execute("DELETE FROM login_alerts WHERE alert_id=$1", alert_id)
     try:
         await q.message.delete()
     except Exception:
@@ -1579,71 +1397,72 @@ async def handle_alert_logout(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer("Logging out all sessions...")
     alert_id = q.data[len("alert_logout_"):]
-    with get_db() as c:
-        row = c.execute("SELECT vault_id FROM login_alerts WHERE alert_id=?", (alert_id,)).fetchone()
+    async async async with get_db() as c:
+        row = await c.fetchrow(
+            "SELECT vault_id FROM login_alerts WHERE alert_id=$1", alert_id
+        )
         if not row:
             await q.edit_message_text("⚠️ Alert expired or already processed\\.", parse_mode="MarkdownV2")
             return
         vault_id = row["vault_id"]
-        c.execute("DELETE FROM sessions WHERE vault_id=?", (vault_id,))
-        c.execute("DELETE FROM login_alerts WHERE alert_id=?", (alert_id,))
-        c.commit()
+        await c.execute("DELETE FROM sessions WHERE vault_id=$1", vault_id)
+        await c.execute("DELETE FROM login_alerts WHERE alert_id=$1", alert_id)
     await q.edit_message_text(
         "✅ *All sessions logged out\\.* You may now change your password if needed\\.",
         parse_mode="MarkdownV2",
     )
 
-# ── Session Helpers ─────────────────────────────────────────
-def get_session(tid) -> str | None:
-    with get_db() as c:
-        r = c.execute("SELECT vault_id FROM sessions WHERE telegram_id=?", (tid,)).fetchone()
+async def get_session(tid) -> str | None:
+    async async async with get_db() as c:
+        r = await c.fetchrow("SELECT vault_id FROM sessions WHERE telegram_id=$1", tid)
     return r["vault_id"] if r else None
 
-def set_session(tid, vault_id):
-    with get_db() as c:
-        c.execute("DELETE FROM sessions WHERE vault_id=? AND telegram_id!=?", (vault_id, tid))
-        c.execute(
-            "INSERT INTO sessions (telegram_id,vault_id) VALUES (?,?) "
-            "ON CONFLICT(telegram_id) DO UPDATE SET vault_id=excluded.vault_id,created_at=strftime('%s','now')",
-            (tid, vault_id),
+async def set_session(tid, vault_id):
+    async async async with get_db() as c:
+        # Evict any OTHER telegram_id currently holding this vault (single-session-per-vault)
+        await c.execute(
+            "DELETE FROM sessions WHERE vault_id=$1 AND telegram_id!=$2", vault_id, tid
         )
-        c.commit()
+        await c.execute(
+            "INSERT INTO sessions (telegram_id, vault_id) VALUES ($1,$2) "
+            "ON CONFLICT (telegram_id) DO UPDATE SET vault_id=EXCLUDED.vault_id, "
+            "created_at=EXTRACT(EPOCH FROM NOW())::BIGINT",
+            tid, vault_id,
+        )
 
-def clear_session(tid):
-    with get_db() as c:
-        c.execute("DELETE FROM sessions WHERE telegram_id=?", (tid,))
-        c.commit()
+async def clear_session(tid):
+    async async async with get_db() as c:
+        await c.execute("DELETE FROM sessions WHERE telegram_id=$1", tid)
 
-def get_user(vault_id):
-    with get_db() as c:
-        return c.execute("SELECT * FROM users WHERE vault_id=?", (vault_id,)).fetchone()
+async def get_user(vault_id):
+    async async async with get_db() as c:
+        return await c.fetchrow("SELECT * FROM users WHERE vault_id=$1", vault_id)
 
-def get_user_by_tid(tid):
-    with get_db() as c:
-        return c.execute("SELECT * FROM users WHERE telegram_id=?", (tid,)).fetchone()
+async def get_user_by_tid(tid):
+    async async async with get_db() as c:
+        return await c.fetchrow("SELECT * FROM users WHERE telegram_id=$1", tid)
 
-def find_user_by_id_or_vault(raw: str):
+async def find_user_by_id_or_vault(raw: str):
     raw = raw.strip()
-    u   = get_user(raw.lower())
+    u   = await get_user(raw.lower())
     if u:
         return u
     if raw.isdigit():
-        with get_db() as c:
-            return c.execute("SELECT * FROM users WHERE telegram_id=?", (int(raw),)).fetchone()
+        async async async with get_db() as c:
+            return await c.fetchrow("SELECT * FROM users WHERE telegram_id=$1", int(raw))
     return None
 
-def update_tg_name(vault_id: str, tg_user):
-    u = get_user(vault_id)
+async def update_tg_name(vault_id: str, tg_user):
+    u = await get_user(vault_id)
     if not u or tg_user.id != u["telegram_id"]:
         return
     name     = ((tg_user.first_name or "") + " " + (tg_user.last_name or "")).strip()
     username = tg_user.username or ""
-    with get_db() as c:
-        c.execute(
-            "UPDATE users SET tg_name=?, tg_username=? WHERE vault_id=?",
-            (name or u["tg_name"], username, vault_id),
+    async async async with get_db() as c:
+        await c.execute(
+            "UPDATE users SET tg_name=$1, tg_username=$2 WHERE vault_id=$3",
+            name or u["tg_name"], username, vault_id,
         )
-        c.commit()
 
 # ── /start ──────────────────────────────────────────────────
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1651,7 +1470,7 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     uid  = update.effective_user.id
     # Ban check: silently ignore all banned users (no response)
-    if is_telegram_banned(uid):
+    if await is_telegram_banned(uid):
         try:
             await update.message.delete()
         except Exception:
@@ -1665,7 +1484,7 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if ctx.args:
         token = ctx.args[0].strip()
         await handle_share_view(update, token)
-        vault = get_session(uid)
+        vault = await get_session(uid)
         if vault:
             return TOTP_MENU
         return AUTH_MENU
@@ -1675,9 +1494,9 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             MAINTENANCE_MSG, parse_mode="MarkdownV2"
         )
         return AUTH_MENU
-    vault = get_session(uid)
+    vault = await get_session(uid)
     if vault:
-        u = get_user(vault)
+        u = await get_user(vault)
         if u:
             # Check if account is disabled
             if u["account_disabled"]:
@@ -1686,7 +1505,7 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     parse_mode="MarkdownV2",
                 )
                 return AUTH_MENU
-            update_tg_name(vault, update.effective_user)
+            await update_tg_name(vault, update.effective_user)
             display_name = u["tg_name"] if u["tg_name"] else (update.effective_user.first_name or "User")
             await update.message.reply_text(
                 f"👋 Welcome back, *{em(display_name)}*\\!\n\nChoose an option:",
@@ -1720,13 +1539,13 @@ async def signup_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return AUTH_MENU
     uid = update.effective_user.id
     # Per-user specific signup block (overrides global toggle)
-    if is_user_signup_disabled(uid):
+    if await is_user_signup_disabled(uid):
         await q.edit_message_text(
             "⚠️ *Sign Up is not available for your account\\.* Please contact support.",
             parse_mode="MarkdownV2", reply_markup=kb_auth()
         )
         return AUTH_MENU
-    if get_user_by_tid(uid):
+    if await get_user_by_tid(uid):
         await q.edit_message_text(
             "⚠️ *This Telegram account already has a vault\\.* Use *Login*\\.",
             parse_mode="MarkdownV2",
@@ -1734,7 +1553,7 @@ async def signup_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         return AUTH_MENU
     # Weekly signup limit: max 2 signups per Telegram account per week
-    if not check_weekly_signup_limit(uid):
+    if not await check_weekly_signup_limit(uid):
         await q.edit_message_text(
             "⚠️ *Weekly sign\\-up limit reached\\.* You can create a maximum of "
             f"*{MAX_WEEKLY_SIGNUPS}* accounts per week from one Telegram account\\.\n\n"
@@ -1829,7 +1648,7 @@ async def signup_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             reply_markup=kb_cancel(),
         )
         return SIGNUP_PASSWORD
-    if get_user_by_tid(uid):
+    if await get_user_by_tid(uid):
         ctx.user_data.clear()
         await update.message.reply_text(
             "⚠️ Account already exists\\. Use *Login*\\.",
@@ -1846,33 +1665,30 @@ async def signup_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     master_key       = gen_master_key()
     mk_enc, mk_salt, mk_iv = wrap_master_key(master_key, pw)
 
-    with get_db() as c:
-        c.execute(
+    async async with get_db() as c:
+        await c.execute(
             "INSERT INTO users (vault_id,telegram_id,password_hash,pw_salt,tg_name,tg_username,"
-            "kdf_type,mk_enc,mk_salt,mk_iv) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            "kdf_type,mk_enc,mk_salt,mk_iv) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)",
             (vid, uid, hash_pw(pw, salt, "argon2id"), salt, tg_name, tg_username,
              "argon2id", mk_enc, mk_salt, mk_iv),
         )
-        c.commit()
 
     # Store secure key encrypted with master_key (not password)
     secure_key = gen_secure_key()
-    store_user_secure_key(vid, secure_key, pw)
+    await store_user_secure_key(vid, secure_key, pw)
     # Store HMAC verifier so secure key can be verified without password
     sk_verifier = hmac.new(SERVER_KEY, secure_key.encode(), hashlib.sha256).hexdigest()
-    with get_db() as c:
-        c.execute("UPDATE users SET sk_verifier=? WHERE vault_id=?", (sk_verifier, vid))
-        c.commit()
+    async async with get_db() as c:
+        await c.execute("UPDATE users SET sk_verifier=$1 WHERE vault_id=$2", sk_verifier, vid)
 
-    set_session(uid, vid)
+    await set_session(uid, vid)
     ctx.user_data["password"] = pw
     ctx.user_data["vault_id"] = vid
     _session_pw_cache[vid] = pw             # RAM cache for auto-backup
-    _vault_key_cache[vid]  = _get_vault_key(vid, pw)   # warm vault key cache
-    _oab_store_password(uid, vid, pw)       # DB encrypted store for auto-backup
-    record_weekly_signup(uid)               # track weekly signup count
-    record_stat("signup", telegram_id=uid, vault_id=vid)  # stats tracking
-    record_vault_login(uid, vid)            # track lifetime vault access
+    await _oab_store_password(uid, vid, pw)       # DB encrypted store for auto-backup
+    await record_weekly_signup(uid)               # track weekly signup count
+    await record_stat("signup", telegram_id=uid, vault_id=vid)  # stats tracking
+    await record_vault_login(uid, vid)            # track lifetime vault access
 
     sk_display = " ".join(secure_key[i:i+8] for i in range(0, len(secure_key), 8))
 
@@ -1920,7 +1736,7 @@ async def login_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return AUTH_MENU
     # Per-user specific login block (overrides global toggle)
     uid = update.effective_user.id
-    if is_user_login_disabled(uid):
+    if await is_user_login_disabled(uid):
         await q.edit_message_text(
             "⚠️ *Login is not available for your account\\.* Please contact support\\.",
             parse_mode="MarkdownV2", reply_markup=kb_auth()
@@ -1932,7 +1748,7 @@ async def login_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("📱 Login with My Telegram",            callback_data="login_auto")],
             [InlineKeyboardButton("🔑 Login with Vault/Telegram User ID", callback_data="login_manual")],
-            [InlineKeyboardButton("🔓 Forgot Password?",                   callback_data="reset_pw_start")],
+            [InlineKeyboardButton("🔓 Forgot Password$1",                   callback_data="reset_pw_start")],
             [InlineKeyboardButton("❌ Cancel",                              callback_data="cancel_to_menu")],
         ]),
     )
@@ -1943,7 +1759,7 @@ async def login_auto(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await q.answer()
     uid = update.effective_user.id
     vid = gen_vault_id(uid)
-    u   = get_user(vid)
+    u   = await get_user(vid)
     if not u:
         await q.edit_message_text(
             "❌ No account found for this Telegram account\\. Please *Sign Up*\\.",
@@ -1985,7 +1801,7 @@ async def login_id_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.delete()
     except Exception:
         pass
-    u = find_user_by_id_or_vault(raw)
+    u = await find_user_by_id_or_vault(raw)
     if not u:
         await update.message.reply_text(
             "❌ *ID not found\\.* Check and try again\\.",
@@ -2013,34 +1829,32 @@ async def login_id_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 def record_login_failure(vault_id: str) -> bool:
     """Record a failed login attempt. Returns True if account is now frozen."""
     now = int(time.time())
-    with get_db() as c:
-        row = c.execute(
-            "SELECT attempts, frozen_until FROM login_attempts WHERE vault_id=?", (vault_id,)
-        ).fetchone()
+    async async with get_db() as c:
+        row = await c.fetchrow(
+            "SELECT attempts, frozen_until FROM login_attempts WHERE vault_id=$1", (vault_id,)
+        )
         if row and row["frozen_until"] > now:
             return True  # already frozen
         attempts     = (row["attempts"] if row else 0) + 1
         frozen_until = now + LOGIN_FREEZE_HOURS * 3600 if attempts >= MAX_LOGIN_ATTEMPTS else 0
-        c.execute(
-            "INSERT OR REPLACE INTO login_attempts (vault_id, attempts, frozen_until) VALUES (?,?,?)",
+        await c.execute(
+            "INSERT INTO login_attempts (vault_id, attempts, frozen_until) VALUES ($1,$2,$3)",
             (vault_id, attempts, frozen_until),
         )
-        c.commit()
         return frozen_until > now
 
 def clear_login_failures(vault_id: str):
-    with get_db() as c:
-        c.execute("DELETE FROM login_attempts WHERE vault_id=?", (vault_id,))
-        c.commit()
+    async async with get_db() as c:
+        await c.execute("DELETE FROM login_attempts WHERE vault_id=$1", vault_id)
 
 def is_login_frozen(vault_id: str) -> bool:
-    with get_db() as c:
-        row = c.execute("SELECT frozen_until FROM login_attempts WHERE vault_id=?", (vault_id,)).fetchone()
+    async async with get_db() as c:
+        row = await c.fetchrow("SELECT frozen_until FROM login_attempts WHERE vault_id=$1", vault_id)
         return bool(row and row["frozen_until"] > int(time.time()))
 
 def get_login_freeze_remaining(vault_id: str) -> int:
-    with get_db() as c:
-        row = c.execute("SELECT frozen_until, attempts FROM login_attempts WHERE vault_id=?", (vault_id,)).fetchone()
+    async async with get_db() as c:
+        row = await c.fetchrow("SELECT frozen_until, attempts FROM login_attempts WHERE vault_id=$1", vault_id,))
         if row and row["frozen_until"] > int(time.time()):
             return row["frozen_until"] - int(time.time()), row["attempts"]
     return 0, 0
@@ -2053,7 +1867,7 @@ async def login_pw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         pass
     uid = update.effective_user.id
     vid = ctx.user_data.get("login_vid")
-    u   = get_user(vid)
+    u   = await get_user(vid)
     if not u:
         await update.message.reply_text(
             "❌ Session expired\\.",
@@ -2088,7 +1902,7 @@ async def login_pw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not hmac.compare_digest(computed, bytes(u["password_hash"])):
         # Record failed attempt and check freeze
         frozen = record_login_failure(vid)
-        record_stat("login_fail", telegram_id=uid, vault_id=vid)
+        await record_stat("login_fail", telegram_id=uid, vault_id=vid)
         if frozen:
             remaining, _ = get_login_freeze_remaining(vid)
             h, m = remaining // 3600, (remaining % 3600) // 60
@@ -2101,8 +1915,8 @@ async def login_pw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         else:
             _, attempts = get_login_freeze_remaining(vid)
             # get attempts without freeze context
-            with get_db() as c:
-                row = c.execute("SELECT attempts FROM login_attempts WHERE vault_id=?", (vid,)).fetchone()
+            async async with get_db() as c:
+                row = await c.fetchrow("SELECT attempts FROM login_attempts WHERE vault_id=$1", vid)
                 attempts = row["attempts"] if row else 1
             left = max(0, MAX_LOGIN_ATTEMPTS - attempts)
             await update.message.reply_text(
@@ -2117,7 +1931,7 @@ async def login_pw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     update_last_seen(uid)
 
     # Daily login limit: max 7 successful logins per day per telegram_id
-    if not check_daily_login_limit(uid):
+    if not await check_daily_login_limit(uid):
         await update.message.reply_text(
             f"⚠️ *Daily login limit reached\\.* Maximum *{MAX_DAILY_LOGINS}* logins per day allowed\\.\n\n"
             "Please try again tomorrow\\.",
@@ -2127,7 +1941,7 @@ async def login_pw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return AUTH_MENU
 
     # Lifetime vault limit: a telegram_id can access at most 5 distinct vaults ever
-    if not check_vault_login_limit(uid, vid):
+    if not await check_vault_login_limit(uid, vid):
         await update.message.reply_text(
             f"⚠️ *Vault access limit reached\\.* A single Telegram account can access "
             f"at most *{MAX_LIFETIME_VAULTS}* different vaults lifetime\\.\n\n"
@@ -2138,10 +1952,10 @@ async def login_pw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return AUTH_MENU
 
     # Record this login
-    record_daily_login(uid)
-    record_vault_login(uid, vid)
-    record_stat("login_success", telegram_id=uid, vault_id=vid)
-    record_stat("user_active",   telegram_id=uid, vault_id=vid)
+    await record_daily_login(uid)
+    await record_vault_login(uid, vid)
+    await record_stat("login_success", telegram_id=uid, vault_id=vid)
+    await record_stat("user_active",   telegram_id=uid, vault_id=vid)
 
     # ── Auto-upgrade legacy users to Argon2id + Master Key ──────
     kdf_type = u["kdf_type"] or "pbkdf2"
@@ -2152,37 +1966,35 @@ async def login_pw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             new_pw_hash = hash_pw(pw, new_salt, "argon2id")
             master_key  = gen_master_key()
             mk_enc, mk_salt, mk_iv = wrap_master_key(master_key, pw)
-            with get_db() as c:
-                c.execute(
-                    "UPDATE users SET password_hash=?, pw_salt=?, kdf_type=?, "
-                    "mk_enc=?, mk_salt=?, mk_iv=? WHERE vault_id=?",
+            async async with get_db() as c:
+                await c.execute(
+                    "UPDATE users SET password_hash=$1, pw_salt=$2, kdf_type=$3, "
+                    "mk_enc=$1, mk_salt=$2, mk_iv=$3 WHERE vault_id=$4",
                     (new_pw_hash, new_salt, "argon2id", mk_enc, mk_salt, mk_iv, vid),
                 )
-                c.commit()
             # Re-encrypt all TOTP secrets with master_key (migrate from password-based)
-            with get_db() as c:
-                totp_rows = c.execute(
-                    "SELECT id, secret_enc, salt, iv FROM totp_accounts WHERE vault_id=?", (vid,)
-                ).fetchall()
+            async async with get_db() as c:
+                totp_rows = await c.fetch(
+                    "SELECT id, secret_enc, salt, iv FROM totp_accounts WHERE vault_id=$1", (vid,)
+                )
                 for row in totp_rows:
                     try:
-                        plain = decrypt(row["secret_enc"], row["salt"], row["iv"], _get_cached_vault_key(vid, pw), vid)
+                        plain = decrypt(row["secret_enc"], row["salt"], row["iv"], await _get_vault_key(vid, pw), vid)
                         new_ct, new_s, new_iv = encrypt(plain, master_key, vid)
-                        c.execute(
-                            "UPDATE totp_accounts SET secret_enc=?, salt=?, iv=? WHERE id=?",
+                        await c.execute(
+                            "UPDATE totp_accounts SET secret_enc=$1, salt=$2, iv=$3 WHERE id=$4",
                             (new_ct, new_s, new_iv, row["id"]),
                         )
                     except Exception as e:
                         logger.error(f"MK migration TOTP {row['id']}: {e}")
                 # Also re-encrypt sk_enc (secure key) with master_key
-                sk = load_user_secure_key(vid, pw)  # load with old method before migration
+                sk = await load_user_secure_key(vid, pw)  # load with old method before migration
                 if sk:
                     sk_ct, sk_s, sk_iv = encrypt(sk, master_key, vid)
-                    c.execute(
-                        "UPDATE users SET sk_enc=?, sk_salt=?, sk_iv=? WHERE vault_id=?",
+                    await c.execute(
+                        "UPDATE users SET sk_enc=$1, sk_salt=$2, sk_iv=$3 WHERE vault_id=$4",
                         (sk_ct, sk_s, sk_iv, vid),
                     )
-                c.commit()
             logger.info(f"Auto-upgraded vault {vid} to Argon2id + MasterKey")
         except Exception as e:
             logger.error(f"Auto-upgrade failed for {vid}: {e}")
@@ -2194,14 +2006,13 @@ async def login_pw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             send_login_alert(ctx.bot, u["telegram_id"], vid, uid, new_username)
         )
 
-    set_session(uid, vid)
+    await set_session(uid, vid)
     if uid == u["telegram_id"]:
-        update_tg_name(vid, update.effective_user)
+        await update_tg_name(vid, update.effective_user)
     ctx.user_data["password"] = pw
     ctx.user_data["vault_id"] = vid
     _session_pw_cache[vid] = pw             # RAM cache for auto-backup
-    _vault_key_cache[vid]  = _get_vault_key(vid, pw)   # warm vault key cache
-    _oab_store_password(uid, vid, pw)       # DB encrypted store for auto-backup
+    await _oab_store_password(uid, vid, pw)       # DB encrypted store for auto-backup
     owner_name = u["tg_name"] if u["tg_name"] else "User"
     await update.message.reply_text(
         f"✅ *Logged in\\!* Welcome to vault of *{em(owner_name)}*\\.",
@@ -2229,7 +2040,7 @@ async def reset_id_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.delete()
     except Exception:
         pass
-    u = find_user_by_id_or_vault(raw)
+    u = await find_user_by_id_or_vault(raw)
     if not u:
         await update.message.reply_text(
             "❌ ID not found\\. Try again:",
@@ -2264,8 +2075,8 @@ async def reset_id_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return AUTH_MENU
 
     # Block password reset while already reset-frozen
-    if is_reset_frozen(vid):
-        remaining = get_freeze_remaining(vid)
+    if await is_reset_frozen(vid):
+        remaining = await get_freeze_remaining(vid)
         h, m      = remaining // 3600, (remaining % 3600) // 60
         await update.message.reply_text(
             f"⚠️ *Account temporarily disabled* due to too many failed reset attempts\\.\n\n"
@@ -2276,7 +2087,7 @@ async def reset_id_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return RESET_ID_INPUT
 
     otp = gen_otp()
-    store_otp(vid, otp)
+    await store_otp(vid, otp)
     ctx.user_data["reset_vid"] = vid
     try:
         await ctx.bot.send_message(
@@ -2312,14 +2123,14 @@ async def reset_otp_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     except Exception:
         pass
     vid = ctx.user_data.get("reset_vid")
-    if not verify_otp(vid, otp):
-        frozen = record_reset_attempt(vid)
+    if not await verify_otp(vid, otp):
+        frozen = await record_reset_attempt(vid)
         # Resolve telegram_id for stats
-        _u_rst = get_user(vid)
+        _u_rst = await get_user(vid)
         _tid_rst = _u_rst["telegram_id"] if _u_rst else 0
-        record_stat("reset_fail", telegram_id=_tid_rst, vault_id=vid)
+        await record_stat("reset_fail", telegram_id=_tid_rst, vault_id=vid)
         if frozen:
-            h, m = get_freeze_remaining(vid) // 3600, (get_freeze_remaining(vid) % 3600) // 60
+            h, m = await get_freeze_remaining(vid) // 3600, (await get_freeze_remaining(vid) % 3600) // 60
             await update.message.reply_text(
                 f"⚠️ *Too many failed attempts\\.* Account disabled for *{h}h {m}m*\\.",
                 parse_mode="MarkdownV2",
@@ -2327,8 +2138,8 @@ async def reset_otp_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             )
             ctx.user_data.pop("reset_vid", None)
             return AUTH_MENU
-        with get_db() as c:
-            row      = c.execute("SELECT attempts FROM reset_attempts WHERE vault_id=?", (vid,)).fetchone()
+        async async with get_db() as c:
+            row      = await c.fetchrow("SELECT attempts FROM reset_attempts WHERE vault_id=$1", vid)
             attempts = row["attempts"] if row else 0
             left     = max(0, MAX_RESET_ATTEMPTS - attempts)
         await update.message.reply_text(
@@ -2337,14 +2148,14 @@ async def reset_otp_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             reply_markup=kb_cancel(),
         )
         return RESET_OTP_INPUT
-    reset_attempts_clear(vid)
-    mark_otp_used(vid)
+    await reset_attempts_clear(vid)
+    await mark_otp_used(vid)
     ctx.user_data["reset_otp_verified"] = True
 
-    with get_db() as c:
-        totp_count = c.execute(
-            "SELECT COUNT(*) as n FROM totp_accounts WHERE vault_id=?", (vid,)
-        ).fetchone()["n"]
+    async async with get_db() as c:
+        totp_count = await c.fetchval(
+            "SELECT COUNT(*) as n FROM totp_accounts WHERE vault_id=$1", (vid,)
+        )
 
     await update.message.reply_text(
         "✅ *OTP verified\\!*\n\n"
@@ -2376,7 +2187,7 @@ async def reset_secure_key_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
         )
         return RESET_SECURE_KEY_INPUT
 
-    if not verify_secure_key_by_totp(vid, candidate):
+    if not await verify_secure_key_by_totp(vid, candidate):
         await update.message.reply_text(
             "❌ *Secure Key does not match\\.* Try again, or skip to lose all TOTP data\\.",
             parse_mode="MarkdownV2",
@@ -2451,15 +2262,15 @@ async def reset_new_pw_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     reenc_fail  = 0
     deleted_cnt = 0
 
-    with get_db() as c:
-        rows = c.execute(
+    async async with get_db() as c:
+        rows = await c.fetch(
             "SELECT id, secret_enc, salt, iv, sk_enc, sk_salt, sk_iv "
-            "FROM totp_accounts WHERE vault_id=?", (vid,)
-        ).fetchall()
+            "FROM totp_accounts WHERE vault_id=$1", (vid,)
+        )
 
         if sk_skipped:
             # User skipped secure key: permanently delete ALL TOTP accounts
-            c.execute("DELETE FROM totp_accounts WHERE vault_id=?", (vid,))
+            await c.execute("DELETE FROM totp_accounts WHERE vault_id=$1", vid)
             deleted_cnt = len(rows)
             # Generate brand-new master key and secure key
             new_secure_key = gen_secure_key()
@@ -2467,13 +2278,12 @@ async def reset_new_pw_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             new_mk_enc, new_mk_salt, new_mk_iv = wrap_master_key(new_master_key, new_pw)
             ct_sk, s_sk, iv_sk = encrypt(new_secure_key, new_master_key, vid)
             new_verifier = hmac.new(SERVER_KEY, new_secure_key.encode(), hashlib.sha256).hexdigest()
-            c.execute(
-                "UPDATE users SET password_hash=?, pw_salt=?, kdf_type=?, "
-                "mk_enc=?, mk_salt=?, mk_iv=?, sk_enc=?, sk_salt=?, sk_iv=?, sk_verifier=? WHERE vault_id=?",
+            await c.execute(
+                "UPDATE users SET password_hash=$1, pw_salt=$2, kdf_type=$3, "
+                "mk_enc=$1, mk_salt=$2, mk_iv=$3, sk_enc=$4, sk_salt=$5, sk_iv=$6, sk_verifier=$7 WHERE vault_id=$8",
                 (hash_pw(new_pw, new_salt, "argon2id"), new_salt, "argon2id",
                  new_mk_enc, new_mk_salt, new_mk_iv, ct_sk, s_sk, iv_sk, new_verifier, vid),
             )
-            c.commit()
         elif secure_key:
             for row in rows:
                 try:
@@ -2486,21 +2296,21 @@ async def reset_new_pw_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                         new_sk_ct, new_sk_s, new_sk_iv = sk_encrypt_totp(
                             plain_secret.encode(), secure_key, vid
                         )
-                        c.execute(
-                            "UPDATE totp_accounts SET secret_enc=?, salt=?, iv=?, "
-                            "sk_enc=?, sk_salt=?, sk_iv=? WHERE id=?",
+                        await c.execute(
+                            "UPDATE totp_accounts SET secret_enc=$1, salt=$2, iv=$3, "
+                            "sk_enc=$1, sk_salt=$2, sk_iv=$3 WHERE id=$4",
                             (new_ct, new_s, new_iv, new_sk_ct, new_sk_s, new_sk_iv, row["id"]),
                         )
                         reenc_ok += 1
                     else:
-                        c.execute("DELETE FROM totp_accounts WHERE id=?", (row["id"],))
+                        await c.execute("DELETE FROM totp_accounts WHERE id=$1", row["id"])
                         reenc_fail += 1
                 except Exception as e:
                     logger.error(f"Re-encrypt TOTP with secure key during reset: {e}")
-                    c.execute("DELETE FROM totp_accounts WHERE id=?", (row["id"],))
+                    await c.execute("DELETE FROM totp_accounts WHERE id=$1", row["id"])
                     reenc_fail += 1
         else:
-            c.execute("DELETE FROM totp_accounts WHERE vault_id=?", (vid,))
+            await c.execute("DELETE FROM totp_accounts WHERE vault_id=$1", vid)
             deleted_cnt = len(rows)
 
         # For sk_skipped path, password + new secure key already updated above.
@@ -2508,7 +2318,7 @@ async def reset_new_pw_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if not sk_skipped:
             ns = os.urandom(16)
             # Check if user has master key - if so, need to re-wrap it
-            u_row = c.execute("SELECT mk_enc, mk_salt, mk_iv FROM users WHERE vault_id=?", (vid,)).fetchone()
+            u_row = await c.fetchrow("SELECT mk_enc, mk_salt, mk_iv FROM users WHERE vault_id=$1", vid)
             if u_row and u_row["mk_enc"] and secure_key:
                 # Unauthenticated reset with secure key: we cannot unwrap old mk_enc
                 # (requires old password). Instead generate new master key and re-encrypt
@@ -2516,54 +2326,53 @@ async def reset_new_pw_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 new_master_key = gen_master_key()
                 new_mk_enc, new_mk_salt, new_mk_iv = wrap_master_key(new_master_key, new_pw)
                 # Re-encrypt all already-re-encrypted TOTP secrets with new master key
-                totp_rows2 = c.execute(
-                    "SELECT id, secret_enc, salt, iv FROM totp_accounts WHERE vault_id=?", (vid,)
-                ).fetchall()
+                totp_rows2 = await c.fetch(
+                    "SELECT id, secret_enc, salt, iv FROM totp_accounts WHERE vault_id=$1", (vid,)
+                )
                 for tr in totp_rows2:
                     try:
                         # These are now encrypted with new_pw (done above), re-encrypt with mk
                         plain2 = decrypt(tr["secret_enc"], tr["salt"], tr["iv"], new_pw, vid)
                         nct, ns2, niv = encrypt(plain2, new_master_key, vid)
-                        c.execute("UPDATE totp_accounts SET secret_enc=?, salt=?, iv=? WHERE id=?",
+                        await c.execute("UPDATE totp_accounts SET secret_enc=$1, salt=$2, iv=$3 WHERE id=$4",
                                   (nct, ns2, niv, tr["id"]))
                     except Exception:
                         pass
                 # Store sk encrypted with new master key
                 sk_nct, sk_ns, sk_niv = encrypt(secure_key, new_master_key, vid)
-                c.execute(
-                    "UPDATE users SET password_hash=?, pw_salt=?, kdf_type=?, "
-                    "mk_enc=?, mk_salt=?, mk_iv=?, sk_enc=?, sk_salt=?, sk_iv=? WHERE vault_id=?",
+                await c.execute(
+                    "UPDATE users SET password_hash=$1, pw_salt=$2, kdf_type=$3, "
+                    "mk_enc=$1, mk_salt=$2, mk_iv=$3, sk_enc=$4, sk_salt=$5, sk_iv=$6 WHERE vault_id=$7",
                     (hash_pw(new_pw, ns, "argon2id"), ns, "argon2id",
                      new_mk_enc, new_mk_salt, new_mk_iv, sk_nct, sk_ns, sk_niv, vid),
                 )
             else:
-                c.execute(
-                    "UPDATE users SET password_hash=?, pw_salt=?, kdf_type=? WHERE vault_id=?",
+                await c.execute(
+                    "UPDATE users SET password_hash=$1, pw_salt=$2, kdf_type=$3 WHERE vault_id=$4",
                     (hash_pw(new_pw, ns, "argon2id"), ns, "argon2id", vid),
                 )
                 if secure_key:
                     ct, s, iv = encrypt(secure_key, new_pw, vid)
-                    c.execute(
-                        "UPDATE users SET sk_enc=?, sk_salt=?, sk_iv=? WHERE vault_id=?",
+                    await c.execute(
+                        "UPDATE users SET sk_enc=$1, sk_salt=$2, sk_iv=$3 WHERE vault_id=$4",
                         (ct, s, iv, vid),
                     )
-            c.commit()
 
     for k in ("reset_vid", "reset_new_pw", "reset_otp_verified",
               "reset_secure_key", "reset_sk_skipped"):
         ctx.user_data.pop(k, None)
 
     # Update auto-backup stored password after reset (use vault owner's telegram_id)
-    u_owner = get_user(vid)
+    u_owner = await get_user(vid)
     if u_owner:
-        _oab_store_password(u_owner["telegram_id"], vid, new_pw)
+        await _oab_store_password(u_owner["telegram_id"], vid, new_pw)
 
     # Resolve owner for stats
-    _u_rst_ok = get_user(vid)
+    _u_rst_ok = await get_user(vid)
     _tid_rst_ok = _u_rst_ok["telegram_id"] if _u_rst_ok else 0
 
     if sk_skipped or deleted_cnt > 0:
-        record_stat("reset_success_skip", telegram_id=_tid_rst_ok, vault_id=vid)
+        await record_stat("reset_success_skip", telegram_id=_tid_rst_ok, vault_id=vid)
         result_msg = (
             "✅ *Password reset successful\\!*\n\n"
             f"⚠️ _All {em(str(deleted_cnt))} TOTP accounts were permanently deleted \\(Secure Key not provided\\)\\._\n\n"
@@ -2572,7 +2381,7 @@ async def reset_new_pw_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "Login with your new password\\."
         )
     elif reenc_fail > 0:
-        record_stat("reset_success", telegram_id=_tid_rst_ok, vault_id=vid)
+        await record_stat("reset_success", telegram_id=_tid_rst_ok, vault_id=vid)
         result_msg = (
             "✅ *Password reset successful\\!*\n\n"
             f"🔒 _{reenc_ok} TOTP secret\\(s\\) restored successfully\\._\n"
@@ -2580,7 +2389,7 @@ async def reset_new_pw_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "Login with your new password\\."
         )
     else:
-        record_stat("reset_success", telegram_id=_tid_rst_ok, vault_id=vid)
+        await record_stat("reset_success", telegram_id=_tid_rst_ok, vault_id=vid)
         result_msg = (
             "✅ *Password reset successful\\!*\n\n"
             f"🔒 _All {reenc_ok} TOTP secret\\(s\\) restored with your Secure Key\\._\n\n"
@@ -2599,16 +2408,16 @@ async def settings_reset_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q   = update.callback_query
     await q.answer()
     uid = update.effective_user.id
-    vault = get_session(uid)
+    vault = await get_session(uid)
     if not vault:
         await q.edit_message_text("Session expired\\.", parse_mode="MarkdownV2", reply_markup=kb_auth())
         return AUTH_MENU
-    u = get_user(vault)
+    u = await get_user(vault)
     if not u:
         await q.edit_message_text("User not found\\.", parse_mode="MarkdownV2", reply_markup=kb_main())
         return TOTP_MENU
     otp = gen_otp()
-    store_otp(vault, otp)
+    await store_otp(vault, otp)
     try:
         await ctx.bot.send_message(
             chat_id=u["telegram_id"],
@@ -2643,19 +2452,19 @@ async def settings_reset_otp(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     except Exception:
         pass
     uid   = update.effective_user.id
-    vault = get_session(uid)
-    if not verify_otp(vault, otp):
-        frozen = record_reset_attempt(vault)
+    vault = await get_session(uid)
+    if not await verify_otp(vault, otp):
+        frozen = await record_reset_attempt(vault)
         if frozen:
-            h, m = get_freeze_remaining(vault) // 3600, (get_freeze_remaining(vault) % 3600) // 60
+            h, m = await get_freeze_remaining(vault) // 3600, (await get_freeze_remaining(vault) % 3600) // 60
             await update.message.reply_text(
                 f"⚠️ *Too many failed attempts\\.* Account disabled for *{h}h {m}m*\\.",
                 parse_mode="MarkdownV2",
                 reply_markup=kb_cancel(),
             )
             return TOTP_MENU
-        with get_db() as c:
-            row      = c.execute("SELECT attempts FROM reset_attempts WHERE vault_id=?", (vault,)).fetchone()
+        async async with get_db() as c:
+            row      = await c.fetchrow("SELECT attempts FROM reset_attempts WHERE vault_id=$1", vault)
             attempts = row["attempts"] if row else 0
             left     = max(0, MAX_RESET_ATTEMPTS - attempts)
         await update.message.reply_text(
@@ -2664,8 +2473,8 @@ async def settings_reset_otp(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             reply_markup=kb_cancel(),
         )
         return SETTINGS_RESET_OTP
-    reset_attempts_clear(vault)
-    mark_otp_used(vault)
+    await reset_attempts_clear(vault)
+    await mark_otp_used(vault)
     await update.message.reply_text(
         "✅ Verified\\! Enter *new password* \\(min 6 chars\\):",
         parse_mode="MarkdownV2",
@@ -2702,7 +2511,7 @@ async def settings_reset_pw_confirm(update: Update, ctx: ContextTypes.DEFAULT_TY
         pass
     new_pw = ctx.user_data.pop("sreset_pw", "")
     uid    = update.effective_user.id
-    vault  = get_session(uid)
+    vault  = await get_session(uid)
     old_pw = ctx.user_data.get("password", "")
     if confirm != new_pw:
         await update.message.reply_text(
@@ -2711,22 +2520,21 @@ async def settings_reset_pw_confirm(update: Update, ctx: ContextTypes.DEFAULT_TY
             reply_markup=kb_cancel(),
         )
         return SETTINGS_RESET_PW
-    with get_db() as c:
-        u = c.execute("SELECT mk_enc, mk_salt, mk_iv FROM users WHERE vault_id=?", (vault,)).fetchone()
+    async async with get_db() as c:
+        u = await c.fetchrow("SELECT mk_enc, mk_salt, mk_iv FROM users WHERE vault_id=$1", vault)
     if u and u["mk_enc"]:
         # New architecture: only re-wrap master key
         try:
             master_key = unwrap_master_key(u["mk_enc"], u["mk_salt"], u["mk_iv"], old_pw)
             new_mk_enc, new_mk_salt, new_mk_iv = wrap_master_key(master_key, new_pw)
             ns = os.urandom(16)
-            with get_db() as c:
-                c.execute(
-                    "UPDATE users SET password_hash=?, pw_salt=?, kdf_type=?, "
-                    "mk_enc=?, mk_salt=?, mk_iv=? WHERE vault_id=?",
+            async async with get_db() as c:
+                await c.execute(
+                    "UPDATE users SET password_hash=$1, pw_salt=$2, kdf_type=$3, "
+                    "mk_enc=$1, mk_salt=$2, mk_iv=$3 WHERE vault_id=$4",
                     (hash_pw(new_pw, ns, "argon2id"), ns, "argon2id",
                      new_mk_enc, new_mk_salt, new_mk_iv, vault),
                 )
-                c.commit()
         except Exception as e:
             logger.error(f"settings_reset master key rewrap: {e}")
             await update.message.reply_text(
@@ -2736,32 +2544,31 @@ async def settings_reset_pw_confirm(update: Update, ctx: ContextTypes.DEFAULT_TY
             return TOTP_MENU
     else:
         # Legacy path
-        with get_db() as c:
-            rows = c.execute(
-                "SELECT id, secret_enc, salt, iv FROM totp_accounts WHERE vault_id=?", (vault,)
-            ).fetchall()
+        async async with get_db() as c:
+            rows = await c.fetch(
+                "SELECT id, secret_enc, salt, iv FROM totp_accounts WHERE vault_id=$1", (vault,)
+            )
             for row in rows:
                 try:
-                    secret    = decrypt(row["secret_enc"], row["salt"], row["iv"], _get_cached_vault_key(vault, old_pw), vault)
+                    secret    = decrypt(row["secret_enc"], row["salt"], row["iv"], await _get_vault_key(vault, old_pw), vault)
                     ct, s, iv = encrypt(secret, new_pw, vault)
-                    c.execute("UPDATE totp_accounts SET secret_enc=?, salt=?, iv=? WHERE id=?",
+                    await c.execute("UPDATE totp_accounts SET secret_enc=$1, salt=$2, iv=$3 WHERE id=$4",
                               (ct, s, iv, row["id"]))
                 except Exception as e:
                     logger.error(f"Re-encrypt TOTP settings_reset (legacy): {e}")
             new_salt = os.urandom(16)
-            c.execute(
-                "UPDATE users SET password_hash=?, pw_salt=? WHERE vault_id=?",
+            await c.execute(
+                "UPDATE users SET password_hash=$1, pw_salt=$2 WHERE vault_id=$3",
                 (hash_pw(new_pw, new_salt, "argon2id"), new_salt, vault),
             )
-            sk = load_user_secure_key(vault, old_pw)
+            sk = await load_user_secure_key(vault, old_pw)
             if sk:
                 ct, s, iv = encrypt(sk, new_pw, vault)
-                c.execute("UPDATE users SET sk_enc=?, sk_salt=?, sk_iv=? WHERE vault_id=?",
+                await c.execute("UPDATE users SET sk_enc=$1, sk_salt=$2, sk_iv=$3 WHERE vault_id=$4",
                           (ct, s, iv, vault))
-            c.commit()
     ctx.user_data["password"] = new_pw
     _session_pw_cache[vault] = new_pw
-    _oab_store_password(uid, vault, new_pw)
+    await _oab_store_password(uid, vault, new_pw)
     await update.message.reply_text(
         "✅ *Password reset\\!*",
         parse_mode="MarkdownV2",
@@ -2774,7 +2581,7 @@ async def view_secure_key_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     uid = update.effective_user.id
-    if not get_session(uid):
+    if not await get_session(uid):
         await q.edit_message_text("Session expired\\.", parse_mode="MarkdownV2", reply_markup=kb_auth())
         return AUTH_MENU
     await q.edit_message_text(
@@ -2793,19 +2600,22 @@ async def view_secure_key_pw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     except Exception:
         pass
     uid   = update.effective_user.id
-    vault = get_session(uid)
-    u     = get_user(vault)
+    vault = await get_session(uid)
+    u     = await get_user(vault)
     if not u:
         await update.message.reply_text("Session expired\\. /start", parse_mode="MarkdownV2", reply_markup=kb_auth())
         return AUTH_MENU
-    if not hmac.compare_digest(hash_pw(pw, bytes(u["pw_salt"]), u["kdf_type"] or "pbkdf2"), bytes(u["password_hash"])):
+    # ✅ FIX 1: hash_pw (Argon2) in thread
+    computed = await asyncio.to_thread(hash_pw, pw, bytes(u["pw_salt"]), u["kdf_type"] or "pbkdf2")
+    if not hmac.compare_digest(computed, bytes(u["password_hash"])):
         await update.message.reply_text(
             "❌ *Wrong password\\.*",
             parse_mode="MarkdownV2",
             reply_markup=kb_main(),
         )
         return TOTP_MENU
-    sk = load_user_secure_key(vault, pw)
+    # ✅ FIX 2: load_user_secure_key (Argon2 unwrap) is now async + to_thread internally
+    sk = await load_user_secure_key(vault, pw)
     if not sk:
         await update.message.reply_text(
             "⚠️ *Secure Key not found\\.* Your account may have been created before this feature\\.",
@@ -2840,11 +2650,10 @@ async def logout(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     uid   = update.effective_user.id
-    vault = get_session(uid)
+    vault = await get_session(uid)
     if vault:
-        _session_pw_cache.pop(vault, None)   # clear cached password for auto-backup
-        _vault_key_cache.pop(vault, None)            # clear vault key cache
-    clear_session(uid)
+        _session_pw_cache.pop(vault, None)
+    await clear_session(uid)
     ctx.user_data.clear()
     await q.edit_message_text(
         "🚪 *Logged out\\.* Your data remains encrypted in the vault\\.",
@@ -2931,19 +2740,19 @@ async def show_profile(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q   = update.callback_query
     await q.answer()
     uid = update.effective_user.id
-    vault = get_session(uid)
+    vault = await get_session(uid)
     if not vault:
         await q.edit_message_text("Session expired\\. /start", parse_mode="MarkdownV2", reply_markup=kb_auth())
         return AUTH_MENU
-    u = get_user(vault)
+    u = await get_user(vault)
     if not u:
         await q.edit_message_text("⚠️ Profile not found\\.", parse_mode="MarkdownV2", reply_markup=kb_main())
         return TOTP_MENU
     owner_name = u["tg_name"] if u["tg_name"] else "Unknown"
     tz         = u["timezone"] or "UTC"
     has_sk     = "✅ Active" if u["sk_enc"] else "❌ Not set"
-    with get_db() as c:
-        cnt = c.execute("SELECT COUNT(*) as n FROM totp_accounts WHERE vault_id=?", (vault,)).fetchone()["n"]
+    async async with get_db() as c:
+        cnt = await c.fetchrow("SELECT COUNT(*) as n FROM totp_accounts WHERE vault_id=$1", vault)["n"]
     text = (
         f"👤 *Vault Owner Profile*\n\n"
         f"*Owner Name:* {em(owner_name)}\n\n"
@@ -2993,9 +2802,8 @@ async def change_tz_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             reply_markup=kb_cancel(),
         )
         return TZ_INPUT
-    with get_db() as c:
-        c.execute("UPDATE users SET timezone=? WHERE telegram_id=?", (tz, update.effective_user.id))
-        c.commit()
+    async async with get_db() as c:
+        await c.execute("UPDATE users SET timezone=$1 WHERE telegram_id=$2", tz, update.effective_user.id)
     await update.message.reply_text(
         f"✅ Timezone set to *{em(raw)}*\\.",
         parse_mode="MarkdownV2",
@@ -3021,13 +2829,14 @@ async def change_pw_old(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     except Exception:
         pass
     uid   = update.effective_user.id
-    vault = get_session(uid)
-    u     = get_user(vault)
+    vault = await get_session(uid)
+    u     = await get_user(vault)
     if not u:
-        await update.message.reply_text("Session expired\\. /start", parse_mode="MarkdownV2", reply_markup=kb_auth())
+        await update.message.reply_text("❌ Session expired\\.", parse_mode="MarkdownV2", reply_markup=kb_auth())
         return AUTH_MENU
-    computed_cpw = await asyncio.to_thread(hash_pw, pw, bytes(u["pw_salt"]), u["kdf_type"] or "pbkdf2")
-    if not hmac.compare_digest(computed_cpw, bytes(u["password_hash"])):
+    # ✅ FIX: hash_pw (Argon2) is CPU-heavy — run in thread
+    computed = await asyncio.to_thread(hash_pw, pw, bytes(u["pw_salt"]), u["kdf_type"] or "pbkdf2")
+    if not hmac.compare_digest(computed, bytes(u["password_hash"])):
         await update.message.reply_text(
             "❌ Wrong password\\.",
             parse_mode="MarkdownV2",
@@ -3077,26 +2886,31 @@ async def change_pw_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         return CHANGE_PW_NEW
     uid    = update.effective_user.id
-    vault  = get_session(uid)
+    vault  = await get_session(uid)
     old_pw = ctx.user_data.get("password", "")
-    with get_db() as c:
-        u = c.execute("SELECT mk_enc, mk_salt, mk_iv, kdf_type, pw_salt, sk_enc, sk_salt, sk_iv "
-                      "FROM users WHERE vault_id=?", (vault,)).fetchone()
+
+    async async async with get_db() as c:
+        u = await c.fetchrow(
+            "SELECT mk_enc, mk_salt, mk_iv, kdf_type, pw_salt, sk_enc, sk_salt, sk_iv "
+            "FROM users WHERE vault_id=$1", vault
+        )
+
     if u and u["mk_enc"]:
-        # New architecture: only re-wrap the master key with new password
+        # ✅ FIX: New architecture — only re-wrap master key (Argon2 in thread)
         try:
-            master_key = await asyncio.to_thread(unwrap_master_key, u["mk_enc"], u["mk_salt"], u["mk_iv"], old_pw)
-            new_mk_enc, new_mk_salt, new_mk_iv = wrap_master_key(master_key, new_pw)
-            ns = os.urandom(16)
-            new_pw_hash = await asyncio.to_thread(hash_pw, new_pw, ns, "argon2id")
-            with get_db() as c:
-                c.execute(
-                    "UPDATE users SET password_hash=?, pw_salt=?, kdf_type=?, "
-                    "mk_enc=?, mk_salt=?, mk_iv=? WHERE vault_id=?",
-                    (new_pw_hash, ns, "argon2id",
-                     new_mk_enc, new_mk_salt, new_mk_iv, vault),
+            def _rewrap():
+                mk     = unwrap_master_key(u["mk_enc"], u["mk_salt"], u["mk_iv"], old_pw)
+                ns     = os.urandom(16)
+                new_hash = hash_pw(new_pw, ns, "argon2id")
+                new_mk_enc, new_mk_salt, new_mk_iv = wrap_master_key(mk, new_pw)
+                return ns, new_hash, new_mk_enc, new_mk_salt, new_mk_iv
+            ns, new_hash, new_mk_enc, new_mk_salt, new_mk_iv = await asyncio.to_thread(_rewrap)
+            async async async with get_db() as c:
+                await c.execute(
+                    "UPDATE users SET password_hash=$1, pw_salt=$2, kdf_type='argon2id', "
+                    "mk_enc=$3, mk_salt=$4, mk_iv=$5 WHERE vault_id=$6",
+                    new_hash, ns, new_mk_enc, new_mk_salt, new_mk_iv, vault,
                 )
-                c.commit()
         except Exception as e:
             logger.error(f"change_pw master key rewrap failed: {e}")
             await update.message.reply_text(
@@ -3105,34 +2919,52 @@ async def change_pw_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             )
             return TOTP_MENU
     else:
-        # Legacy path: re-encrypt all TOTP secrets and sk with new password
-        with get_db() as c:
-            rows = c.execute(
-                "SELECT id, secret_enc, salt, iv FROM totp_accounts WHERE vault_id=?", (vault,)
-            ).fetchall()
+        # ✅ FIX: Legacy path — all crypto (N×decrypt + N×encrypt + hash_pw) in thread
+        async async async with get_db() as c:
+            rows = await c.fetch(
+                "SELECT id, secret_enc, salt, iv FROM totp_accounts WHERE vault_id=$1", vault
+            )
+        sk = await load_user_secure_key(vault, old_pw)
+
+        def _legacy_reencrypt():
+            updates = []
             for row in rows:
                 try:
-                    secret    = decrypt(row["secret_enc"], row["salt"], row["iv"], _get_cached_vault_key(vault, old_pw), vault)
+                    secret    = decrypt(row["secret_enc"], row["salt"], row["iv"], old_pw, vault)
                     ct, s, iv = encrypt(secret, new_pw, vault)
-                    c.execute("UPDATE totp_accounts SET secret_enc=?, salt=?, iv=? WHERE id=?",
-                              (ct, s, iv, row["id"]))
+                    updates.append((ct, s, iv, row["id"]))
                 except Exception as e:
                     logger.error(f"Re-encrypt TOTP during change_pw (legacy): {e}")
-            ns = os.urandom(16)
-            new_pw_hash_leg = await asyncio.to_thread(hash_pw, new_pw, ns, "argon2id")
-            c.execute(
-                "UPDATE users SET password_hash=?, pw_salt=? WHERE vault_id=?",
-                (new_pw_hash_leg, ns, vault),
-            )
-            sk = load_user_secure_key(vault, old_pw)
+            ns       = os.urandom(16)
+            new_hash = hash_pw(new_pw, ns, "argon2id")
+            sk_update = None
             if sk:
                 ct, s, iv = encrypt(sk, new_pw, vault)
-                c.execute("UPDATE users SET sk_enc=?, sk_salt=?, sk_iv=? WHERE vault_id=?",
-                          (ct, s, iv, vault))
-            c.commit()
+                sk_update = (ct, s, iv)
+            return updates, ns, new_hash, sk_update
+
+        updates, ns, new_hash, sk_update = await asyncio.to_thread(_legacy_reencrypt)
+
+        async async async with get_db() as c:
+            for (ct, s, iv, row_id) in updates:
+                await c.execute(
+                    "UPDATE totp_accounts SET secret_enc=$1, salt=$2, iv=$3 WHERE id=$4",
+                    ct, s, iv, row_id,
+                )
+            await c.execute(
+                "UPDATE users SET password_hash=$1, pw_salt=$2 WHERE vault_id=$3",
+                new_hash, ns, vault,
+            )
+            if sk_update:
+                ct, s, iv = sk_update
+                await c.execute(
+                    "UPDATE users SET sk_enc=$1, sk_salt=$2, sk_iv=$3 WHERE vault_id=$4",
+                    ct, s, iv, vault,
+                )
+
     ctx.user_data["password"] = new_pw
-    _session_pw_cache[vault] = new_pw
-    _oab_store_password(uid, vault, new_pw)
+    _session_pw_cache[vault]  = new_pw
+    await _oab_store_password(uid, vault, new_pw)
     await update.message.reply_text(
         "✅ *Password changed\\!*",
         parse_mode="MarkdownV2",
@@ -3144,7 +2976,7 @@ async def change_pw_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def add_totp_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-    if not get_session(update.effective_user.id):
+    if not await get_session(update.effective_user.id):
         await q.edit_message_text("Session expired\\. /start", parse_mode="MarkdownV2", reply_markup=kb_auth())
         return AUTH_MENU
     await q.edit_message_text(
@@ -3166,11 +2998,11 @@ async def _do_save_totp(update, vault, data, pw):
     note     = (data.get("note", "") or "")[:NOTE_MAX_LEN]
 
     # Vault TOTP limit
-    with get_db() as _lc:
-        _vcnt = _lc.execute(
-            "SELECT COUNT(*) AS n FROM totp_accounts WHERE vault_id=?", (vault,)
-        ).fetchone()["n"]
-    _eff_vault_max = get_effective_vault_max(vault)
+    async async with get_db() as _lc:
+        _vcnt = _lawait c.fetchval(
+            "SELECT COUNT(*) AS n FROM totp_accounts WHERE vault_id=$1", (vault,)
+        )
+    _eff_vault_max = await get_effective_vault_max(vault)
     if _vcnt >= _eff_vault_max:
         await update.message.reply_text(
             f"Vault full! Maximum {_eff_vault_max} TOTP accounts per vault. "
@@ -3179,8 +3011,8 @@ async def _do_save_totp(update, vault, data, pw):
         return TOTP_MENU
 
     # Per-minute rate limit: uses per-vault custom limit if set, else global
-    if not check_totp_add_rate(vault):
-        _eff_per_min = get_effective_per_min_limit(vault)
+    if not await check_totp_add_rate(vault):
+        _eff_per_min = await get_effective_per_min_limit(vault)
         await update.message.reply_text(
             f"⚠️ *Too many accounts added\\.*\n\n"
             f"Maximum *{_eff_per_min}* TOTP accounts can be added per minute\\.\n"
@@ -3190,69 +3022,26 @@ async def _do_save_totp(update, vault, data, pw):
         )
         return TOTP_MENU
 
-    # ── Duplicate secret check ──────────────────────────────────
-    # Hash the raw secret (uppercase, stripped) for comparison.
-    # Only the hash is stored/compared — never the plaintext secret.
-    secret_clean = data["secret"].upper().replace(" ", "").replace("-", "")
-    secret_hash  = hashlib.sha256(secret_clean.encode()).hexdigest()
-
-    # Check if vault is already banned for too many duplicate attempts
-    is_disabled, disabled_until = _is_vault_dup_disabled(vault)
-    if is_disabled:
-        remaining_h = max(1, round((disabled_until - int(time.time())) / 3600))
-        await update.message.reply_text(
-            f"🚫 *Vault temporarily disabled*\n\n"
-            f"Too many duplicate TOTP attempts\\.\n"
-            f"Try again in *{remaining_h}h*\\.",
-            parse_mode="MarkdownV2",
-            reply_markup=kb_main(),
-        )
-        return TOTP_MENU
-
-    # Count how many times this exact secret already exists in this vault
-    existing_dup_count = _count_secret_duplicates(vault, secret_hash)
-    if existing_dup_count >= MAX_TOTP_DUPLICATE:
-        # Secret already at limit — record attempt and possibly ban
-        should_ban = _record_dup_attempt(vault)
-        if should_ban:
-            await update.message.reply_text(
-                "🚫 *Vault disabled for 18 hours*\n\n"
-                "Too many attempts to add a TOTP secret that has reached the duplicate limit\\.",
-                parse_mode="MarkdownV2",
-                reply_markup=kb_main(),
-            )
-        else:
-            await update.message.reply_text(
-                f"⚠️ *Duplicate limit reached*\n\n"
-                f"This TOTP secret already exists *{existing_dup_count}* time\\(s\\) in your vault\\.\n"
-                f"Maximum allowed duplicates: *{MAX_TOTP_DUPLICATE}*\\.",
-                parse_mode="MarkdownV2",
-                reply_markup=kb_main(),
-            )
-        return TOTP_MENU
-    # ── End duplicate check ─────────────────────────────────────
-
     # Auto-suffix name if duplicate, enforce max 20 chars
-    final_name = _auto_suffix_name(vault, data["name"])
+    final_name = await _auto_suffix_name(vault, data["name"])
 
-    vault_key = _get_cached_vault_key(vault, pw)
-    ct, salt, iv = encrypt(secret_clean, vault_key, vault)
-    sk = load_user_secure_key(vault, pw)
+    vault_key = await _get_vault_key(vault, pw)
+    ct, salt, iv = encrypt(data["secret"], vault_key, vault)
+    sk = await load_user_secure_key(vault, pw)
     if sk:
-        sk_ct, sk_s, sk_iv = sk_encrypt_totp(secret_clean.encode(), sk, vault)
+        sk_ct, sk_s, sk_iv = sk_encrypt_totp(data["secret"].encode(), sk, vault)
     else:
         sk_ct = sk_s = sk_iv = None
-    with get_db() as c:
-        c.execute(
+    async async with get_db() as c:
+        await c.execute(
             "INSERT INTO totp_accounts (vault_id, name, issuer, secret_enc, salt, iv, "
-            "sk_enc, sk_salt, sk_iv, note, account_type, hotp_counter, secret_hash) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "sk_enc, sk_salt, sk_iv, note, account_type, hotp_counter) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)",
             (vault, final_name, data.get("issuer", ""), ct, salt, iv,
-             sk_ct, sk_s, sk_iv, note, acc_type, hotp_ctr, secret_hash),
+             sk_ct, sk_s, sk_iv, note, acc_type, hotp_ctr),
         )
-        c.commit()
 
-    record_totp_add(vault)
-    record_stat("totp_added", vault_id=vault)
+    await record_totp_add(vault)
+    await record_stat("totp_added", vault_id=vault)
 
     # Show different name if it was auto-suffixed
     display_name = final_name
@@ -3261,7 +3050,7 @@ async def _do_save_totp(update, vault, data, pw):
         suffix_note = f"\n_\\(Renamed to avoid duplicate: {em(final_name)}\\)_"
 
     try:
-        code, remain, _ = generate_code(secret_clean)
+        code, remain, _ = generate_code(data["secret"])
     except Exception:
         code, remain = "------", 30
     issuer_line = f"\n_{em(data['issuer'])}_" if data.get("issuer") else ""
@@ -3352,14 +3141,11 @@ async def _process_input(update, ctx, vault, pw):
 
 async def handle_add_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid   = update.effective_user.id
-    vault = get_session(uid)
+    vault = await get_session(uid)
     pw    = ctx.user_data.get("password")
     if not vault or not pw:
         await update.message.reply_text("Session expired\\. /start", parse_mode="MarkdownV2")
         return AUTH_MENU
-    if is_maintenance():
-        await update.message.reply_text(MAINTENANCE_MSG, parse_mode="MarkdownV2")
-        return TOTP_MENU
     if update.message.text and update.message.text.strip().lower() == "manual":
         await update.message.reply_text(
             "⌨️ Enter *account name:*",
@@ -3404,7 +3190,7 @@ async def handle_manual_name(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     preloaded = ctx.user_data.pop("pending_secret", None)
     if preloaded:
         uid   = update.effective_user.id
-        vault = get_session(uid)
+        vault = await get_session(uid)
         pw    = ctx.user_data.get("password")
         return await _do_save_totp(update, vault, {"name": name, "issuer": "", "secret": preloaded}, pw)
     ctx.user_data["pending_name"] = name
@@ -3423,7 +3209,7 @@ async def handle_manual_secret(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     except Exception:
         pass
     uid   = update.effective_user.id
-    vault = get_session(uid)
+    vault = await get_session(uid)
     pw    = ctx.user_data.get("password")
     ok, cleaned = validate_secret(raw)
     if not ok:
@@ -3464,13 +3250,13 @@ def build_list_page_kb(page: int, total_pages: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 async def _render_list_page(q_or_msg, vault: str, pw: str, page: int, is_edit: bool = True):
-    """Render one page of TOTP list with the new card format."""
-    with get_db() as c:
-        rows = c.execute(
+    """Render one page of TOTP list. DB fetch is async; crypto loop runs in thread."""
+    async async async with get_db() as c:
+        rows = await c.fetch(
             "SELECT id, name, issuer, secret_enc, salt, iv, note, account_type, hotp_counter "
-            "FROM totp_accounts WHERE vault_id=? ORDER BY name",
-            (vault,)
-        ).fetchall()
+            "FROM totp_accounts WHERE vault_id=$1 ORDER BY name",
+            vault,
+        )
     total = len(rows)
     if total == 0:
         text = "📋 *No TOTP accounts yet\\.*\n\nUse ➕ Add New TOTP to add one\\."
@@ -3485,37 +3271,31 @@ async def _render_list_page(q_or_msg, vault: str, pw: str, page: int, is_edit: b
     page        = max(0, min(page, total_pages - 1))
     chunk       = rows[page * TOTP_PER_PAGE : (page + 1) * TOTP_PER_PAGE]
 
-    entries = []
-    _rlp_vkey = _get_cached_vault_key(vault, pw)   # derive once, reuse for all
-    for i, row in enumerate(chunk, start=page * TOTP_PER_PAGE + 1):
-        try:
-            secret = decrypt(row["secret_enc"], row["salt"], row["iv"], _rlp_vkey, vault)
-            note     = (row["note"] or "").strip()
-            code, remain, next_code = generate_code(secret)
+    # ✅ FIX: resolve vault_key ONCE (async Argon2 unwrap), then decrypt all in thread
+    vault_key = await _get_vault_key(vault, pw)
 
-            # Format TOTP code: "123 456"
-            code_fmt  = code
-            time_line = f"{bar(remain)} {remain}s"
+    def _build_entries():
+        result = []
+        for i, row in enumerate(chunk, start=page * TOTP_PER_PAGE + 1):
+            try:
+                secret   = decrypt(row["secret_enc"], row["salt"], row["iv"], vault_key, vault)
+                note     = (row["note"] or "").strip()
+                code, remain, next_code = generate_code(secret)
+                name_line = f"*{i}\\. {em(row['name'])}*"
+                if row["issuer"]:
+                    name_line += f" \\| _{em(row['issuer'])}_"
+                block = [name_line, f"Current Code: `{code}` {bar(remain)} {remain}s"]
+                if next_code:
+                    block.append(f"Next code: `{next_code}`")
+                if note:
+                    block.append(f"Note: {em(note)}")
+                result.append("\n".join(block))
+            except Exception as e:
+                logger.error(f"List TOTP error: {e}")
+                result.append(f"*{i}\\. {em(row['name'])}*\n_\\[Decrypt error\\]_")
+        return result
 
-            # Next code display
-            next_line = f"Next code: `{next_code}`" if next_code else ""
-
-            note_line = f"Note: {em(note)}" if note else ""
-
-            # Build entry block
-            name_line = f"*{i}\\. {em(row['name'])}*"
-            if row["issuer"]:
-                name_line += f" \\| _{em(row['issuer'])}_"
-
-            block = [name_line, f"Current Code: `{code}` {time_line}"]
-            if next_line:
-                block.append(next_line)
-            if note_line:
-                block.append(note_line)
-            entries.append("\n".join(block))
-        except Exception as e:
-            logger.error(f"List TOTP error: {e}")
-            entries.append(f"*{i}\\. {em(row['name'])}*\n_\\[Decrypt error\\]_")
+    entries = await asyncio.to_thread(_build_entries)
 
     header = f"📋 *Your TOTP Codes* \\({page+1}/{total_pages}\\)\n\n"
     text   = header + "\n\n".join(entries)
@@ -3529,7 +3309,7 @@ async def list_totp(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q   = update.callback_query
     await q.answer()
     uid = update.effective_user.id
-    vault = get_session(uid)
+    vault = await get_session(uid)
     pw    = ctx.user_data.get("password")
     if not vault or not pw:
         await q.edit_message_text("Session expired\\. /start", parse_mode="MarkdownV2", reply_markup=kb_auth())
@@ -3550,7 +3330,7 @@ async def list_page_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         page = 0
     ctx.user_data["list_page"] = page
     uid   = update.effective_user.id
-    vault = get_session(uid)
+    vault = await get_session(uid)
     pw    = ctx.user_data.get("password")
     if not vault or not pw:
         await q.edit_message_text("Session expired\\. /start", parse_mode="MarkdownV2", reply_markup=kb_auth())
@@ -3565,15 +3345,15 @@ async def share_codes_open(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q     = update.callback_query
     await q.answer()
     uid   = update.effective_user.id
-    vault = get_session(uid)
+    vault = await get_session(uid)
     pw    = ctx.user_data.get("password")
     if not vault or not pw:
         await q.edit_message_text("Session expired\\. /start", parse_mode="MarkdownV2", reply_markup=kb_auth())
         return AUTH_MENU
-    with get_db() as c:
-        rows = c.execute(
-            "SELECT id, name FROM totp_accounts WHERE vault_id=? ORDER BY name", (vault,)
-        ).fetchall()
+    async async with get_db() as c:
+        rows = await c.fetch(
+            "SELECT id, name FROM totp_accounts WHERE vault_id=$1 ORDER BY name", (vault,)
+        )
     if not rows:
         await q.edit_message_text(
             "📁 *Share Codes*\n\n⚠️ No TOTP accounts to share\\.",
@@ -3649,7 +3429,7 @@ async def share_generate(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q     = update.callback_query
     await q.answer()
     uid   = update.effective_user.id
-    vault = get_session(uid)
+    vault = await get_session(uid)
     pw    = ctx.user_data.get("password")
     if not vault or not pw:
         await q.edit_message_text("Session expired\\. /start", parse_mode="MarkdownV2", reply_markup=kb_auth())
@@ -3661,49 +3441,52 @@ async def share_generate(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return TOTP_MENU
     selected_ids = [r["id"] for r in rows if r["id"] in selected]
     id_to_name   = {r["id"]: r["name"] for r in rows if r["id"] in selected}
-    with get_db() as c:
-        placeholders = ",".join("?" * len(selected_ids))
-        db_rows = c.execute(
+    # Fetch all selected rows from DB (async)
+    async async async with get_db() as c:
+        db_rows = await c.fetch(
             f"SELECT id, secret_enc, salt, iv FROM totp_accounts "
-            f"WHERE vault_id=? AND id IN ({placeholders})",
-            [vault] + selected_ids,
-        ).fetchall()
+            f"WHERE vault_id=$1 AND id = ANY($2::bigint[])",
+            vault, selected_ids,
+        )
     if not db_rows:
         await q.answer("Could not load selected accounts.", show_alert=True)
         return TOTP_MENU
-    # Generate token first (needed for per-link key derivation)
-    token       = gen_share_token()
-    secrets_enc = []
-    final_ids   = []
-    final_names = []
-    for db_row in db_rows:
-        try:
-            plain = decrypt(db_row["secret_enc"], db_row["salt"], db_row["iv"], _get_cached_vault_key(vault, pw), vault)
-            enc   = share_encrypt_secret(plain, token)
-            secrets_enc.append(enc)
-            final_ids.append(db_row["id"])
-            final_names.append(id_to_name.get(db_row["id"], "Unknown"))
-        except Exception as e:
-            logger.error(f"Share encrypt error for totp_id={db_row['id']}: {e}")
+    # ✅ FIX: resolve vault_key once (Argon2, async), then do decrypt loop in thread
+    vault_key = await _get_vault_key(vault, pw)
+    token     = gen_share_token()
+
+    def _build_share():
+        secrets_enc, final_ids, final_names = [], [], []
+        for db_row in db_rows:
+            try:
+                plain = decrypt(db_row["secret_enc"], db_row["salt"], db_row["iv"], vault_key, vault)
+                enc   = share_encrypt_secret(plain, token)
+                secrets_enc.append(enc)
+                final_ids.append(db_row["id"])
+                final_names.append(id_to_name.get(db_row["id"], "Unknown"))
+            except Exception as e:
+                logger.error(f"Share encrypt error for totp_id={db_row['id']}: {e}")
+        return secrets_enc, final_ids, final_names
+
+    secrets_enc, final_ids, final_names = await asyncio.to_thread(_build_share)
+
     if not secrets_enc:
         await q.answer("Could not encrypt secrets. Try again.", show_alert=True)
         return TOTP_MENU
     expires_at = int(time.time()) + SHARE_LINK_TTL
-    with get_db() as c:
-        c.execute(
+    async async async with get_db() as c:
+        await c.execute(
             "INSERT INTO share_links (token, vault_id, totp_ids, secrets_enc, names, expires_at) "
-            "VALUES (?,?,?,?,?,?)",
-            (token, vault, json.dumps(final_ids), json.dumps(secrets_enc),
-             json.dumps(final_names), expires_at),
+            "VALUES ($1,$2,$3,$4,$5,$6)",
+            token, vault, json.dumps(final_ids), json.dumps(secrets_enc),
+            json.dumps(final_names), expires_at,
         )
-        c.commit()
     async def _cleanup():
         await asyncio.sleep(SHARE_LINK_TTL + 5)
-        with get_db() as c2:
-            c2.execute("DELETE FROM share_links WHERE token=?", (token,))
-            c2.commit()
+        async async with get_db() as c2:
+            await c2.execute("DELETE FROM share_links WHERE token=$1", token)
     asyncio.create_task(_cleanup())
-    share_url  = f"https://t.me/{BOT_USERNAME}?start={token}"
+    share_url  = f"https://t.me/{BOT_USERNAME}$1start={token}"
     names_text = ", ".join(em(n) for n in final_names)
     exp_min    = SHARE_LINK_TTL // 60
     await q.edit_message_text(
@@ -3734,11 +3517,11 @@ async def share_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ── Share View (deep link handler) ───────────────────────────
 async def handle_share_view(update: Update, token: str):
     """Show live TOTP codes for a valid share link."""
-    with get_db() as c:
-        row = c.execute(
-            "SELECT * FROM share_links WHERE token=? AND expires_at > ?",
-            (token, int(time.time())),
-        ).fetchone()
+    async async async with get_db() as c:
+        row = await c.fetchrow(
+            "SELECT * FROM share_links WHERE token=$1 AND expires_at > $2",
+            token, int(time.time()),
+        )
     if not row:
         await update.message.reply_text(
             "❌ *This share link has expired or is invalid\\.*\n\n"
@@ -3764,7 +3547,7 @@ async def handle_share_view(update: Update, token: str):
         except Exception as e:
             logger.error(f"Share view decrypt error idx={i}: {e}")
             lines.append(f"*{em(name)}*\n_\\[Unavailable\\]_")
-    refresh_url = f"https://t.me/{BOT_USERNAME}?start={token}"
+    refresh_url = f"https://t.me/{BOT_USERNAME}$1start={token}"
     text = (
         "📋 *Shared TOTP Codes*\n\n"
         + "\n\n".join(lines)
@@ -3779,15 +3562,15 @@ async def edit_totp_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     uid = update.effective_user.id
-    vault = get_session(uid)
+    vault = await get_session(uid)
     if not vault:
         await q.edit_message_text("Session expired\\. /start", parse_mode="MarkdownV2", reply_markup=kb_auth())
         return AUTH_MENU
     try:
-        with get_db() as c:
-            rows = c.execute(
-                "SELECT id, name FROM totp_accounts WHERE vault_id=? ORDER BY name", (vault,)
-            ).fetchall()
+        async async with get_db() as c:
+            rows = await c.fetch(
+                "SELECT id, name FROM totp_accounts WHERE vault_id=$1 ORDER BY name", (vault,)
+            )
         if not rows:
             await q.edit_message_text("No TOTP accounts found\\.", parse_mode="MarkdownV2", reply_markup=kb_main())
             return TOTP_MENU
@@ -3832,14 +3615,14 @@ async def edit_pg_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         page = 0
     ctx.user_data["edit_pg"] = page
     uid   = update.effective_user.id
-    vault = get_session(uid)
+    vault = await get_session(uid)
     if not vault:
         await q.edit_message_text("Session expired. /start", reply_markup=kb_auth())
         return AUTH_MENU
-    with get_db() as c:
-        rows = c.execute(
-            "SELECT id, name FROM totp_accounts WHERE vault_id=? ORDER BY name", (vault,)
-        ).fetchall()
+    async async with get_db() as c:
+        rows = await c.fetch(
+            "SELECT id, name FROM totp_accounts WHERE vault_id=$1 ORDER BY name", (vault,)
+        )
     per_pg   = 5
     total_pg = max(1, (len(rows) + per_pg - 1) // per_pg)
     page     = max(0, min(page, total_pg - 1))
@@ -3871,18 +3654,18 @@ async def edit_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await q.answer("Invalid selection.", show_alert=True)
         return TOTP_MENU
     uid    = update.effective_user.id
-    vault  = get_session(uid)
-    with get_db() as c:
-        row = c.execute(
-            "SELECT name FROM totp_accounts WHERE id=? AND vault_id=?", (acc_id, vault)
-        ).fetchone()
+    vault  = await get_session(uid)
+    async async with get_db() as c:
+        row = await c.fetchrow(
+            "SELECT name FROM totp_accounts WHERE id=$1 AND vault_id=$2", (acc_id, vault)
+        )
     if not row:
         await q.edit_message_text("⚠️ Account not found\\.", parse_mode="MarkdownV2", reply_markup=kb_main())
         return TOTP_MENU
     ctx.user_data["edit_id"]   = acc_id
     ctx.user_data["edit_name"] = row["name"]
     await q.edit_message_text(
-        f"✏️ *{em(row['name'])}*\n\nWhat would you like to do?",
+        f"✏️ *{em(row['name'])}*\n\nWhat would you like to do$1",
         parse_mode="MarkdownV2",
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("✏️ Rename",         callback_data="edit_action_rename")],
@@ -3925,8 +3708,8 @@ async def edit_action(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         # Show current note
         current_note = ""
         if acc_id:
-            with get_db() as c:
-                r = c.execute("SELECT note FROM totp_accounts WHERE id=?", (acc_id,)).fetchone()
+            async async with get_db() as c:
+                r = await c.fetchrow("SELECT note FROM totp_accounts WHERE id=$1", acc_id)
                 current_note = (r["note"] or "").strip() if r else ""
         note_info = f"Current: _{em(current_note)}_\n\n" if current_note else ""
         await q.edit_message_text(
@@ -3941,7 +3724,7 @@ async def edit_action(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     else:  # delete
         name = ctx.user_data.get("edit_name", "")
         await q.edit_message_text(
-            f"🗑 Delete *{em(name)}*?\n\n_This cannot be undone\\._",
+            f"🗑 Delete *{em(name)}*$1\n\n_This cannot be undone\\._",
             parse_mode="MarkdownV2",
             reply_markup=kb_danger("edit_action_delete_confirm", "edit_totp"),
         )
@@ -3951,13 +3734,12 @@ async def edit_delete_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q      = update.callback_query
     await q.answer()
     uid    = update.effective_user.id
-    vault  = get_session(uid)
+    vault  = await get_session(uid)
     acc_id = ctx.user_data.pop("edit_id", None)
     name   = ctx.user_data.pop("edit_name", "")
     if acc_id:
-        with get_db() as c:
-            c.execute("DELETE FROM totp_accounts WHERE id=? AND vault_id=?", (acc_id, vault))
-            c.commit()
+        async async with get_db() as c:
+            await c.execute("DELETE FROM totp_accounts WHERE id=$1 AND vault_id=$2", acc_id, vault)
     await q.edit_message_text(
         f"✅ *{em(name)}* deleted\\.",
         parse_mode="MarkdownV2",
@@ -3968,15 +3750,14 @@ async def edit_delete_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def edit_rename_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     new_name = update.message.text.strip()
     uid      = update.effective_user.id
-    vault    = get_session(uid)
+    vault    = await get_session(uid)
     acc_id   = ctx.user_data.pop("edit_id", None)
     ctx.user_data.pop("edit_name", None)
     if not new_name or not acc_id:
         await update.message.reply_text("⚠️ Invalid\\.", parse_mode="MarkdownV2", reply_markup=kb_main())
         return TOTP_MENU
-    with get_db() as c:
-        c.execute("UPDATE totp_accounts SET name=? WHERE id=? AND vault_id=?", (new_name, acc_id, vault))
-        c.commit()
+    async async with get_db() as c:
+        await c.execute("UPDATE totp_accounts SET name=$1 WHERE id=$2 AND vault_id=$3", new_name, acc_id, vault)
     await update.message.reply_text(
         f"✅ Renamed to *{em(new_name)}*\\.",
         parse_mode="MarkdownV2",
@@ -3988,7 +3769,7 @@ async def note_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Save note (max NOTE_MAX_LEN chars) for a TOTP account."""
     raw    = update.message.text.strip()
     uid    = update.effective_user.id
-    vault  = get_session(uid)
+    vault  = await get_session(uid)
     acc_id = ctx.user_data.pop("edit_id", None)
     ctx.user_data.pop("edit_name", None)
     if not acc_id:
@@ -3996,9 +3777,8 @@ async def note_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return TOTP_MENU
     # Clear note if user sends space or dot
     note = "" if raw in (".", " ", "") else raw[:NOTE_MAX_LEN]
-    with get_db() as c:
-        c.execute("UPDATE totp_accounts SET note=? WHERE id=? AND vault_id=?", (note, acc_id, vault))
-        c.commit()
+    async async with get_db() as c:
+        await c.execute("UPDATE totp_accounts SET note=$1 WHERE id=$2 AND vault_id=$3", note, acc_id, vault)
     if note:
         msg = f"✅ Note saved: _{em(note)}_"
     else:
@@ -4014,15 +3794,16 @@ async def show_secret_pw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     except Exception:
         pass
     uid    = update.effective_user.id
-    vault  = get_session(uid)
+    vault  = await get_session(uid)
     acc_id = ctx.user_data.get("edit_id")
     name   = ctx.user_data.get("edit_name", "")
-    u = get_user(vault)
+    u = await get_user(vault)
     if not u:
         await update.message.reply_text("Session expired\\. /start", parse_mode="MarkdownV2", reply_markup=kb_auth())
         return AUTH_MENU
-    computed_ssp = await asyncio.to_thread(hash_pw, pw, bytes(u["pw_salt"]), u["kdf_type"] or "pbkdf2")
-    if not hmac.compare_digest(computed_ssp, bytes(u["password_hash"])):
+    # ✅ FIX 1: hash_pw (Argon2) in thread
+    computed = await asyncio.to_thread(hash_pw, pw, bytes(u["pw_salt"]), u["kdf_type"] or "pbkdf2")
+    if not hmac.compare_digest(computed, bytes(u["password_hash"])):
         await update.message.reply_text(
             "❌ *Wrong password\\.* Secret key not revealed\\.",
             parse_mode="MarkdownV2",
@@ -4031,11 +3812,11 @@ async def show_secret_pw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ctx.user_data.pop("edit_id", None)
         ctx.user_data.pop("edit_name", None)
         return TOTP_MENU
-    with get_db() as c:
-        row = c.execute(
-            "SELECT secret_enc, salt, iv FROM totp_accounts WHERE id=? AND vault_id=?",
-            (acc_id, vault),
-        ).fetchone()
+    async async async with get_db() as c:
+        row = await c.fetchrow(
+            "SELECT secret_enc, salt, iv FROM totp_accounts WHERE id=$1 AND vault_id=$2",
+            acc_id, vault,
+        )
     if not row:
         await update.message.reply_text(
             "⚠️ Account not found\\.",
@@ -4045,8 +3826,12 @@ async def show_secret_pw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ctx.user_data.pop("edit_id", None)
         ctx.user_data.pop("edit_name", None)
         return TOTP_MENU
+    # ✅ FIX 2: _get_vault_key (Argon2 unwrap) + decrypt — all in thread
+    vault_key = await _get_vault_key(vault, pw)
     try:
-        secret = decrypt(row["secret_enc"], row["salt"], row["iv"], _get_cached_vault_key(vault, pw), vault)
+        secret = await asyncio.to_thread(
+            decrypt, row["secret_enc"], row["salt"], row["iv"], vault_key, vault
+        )
     except Exception as e:
         logger.error(f"Decrypt for show_secret failed: {e}")
         await update.message.reply_text(
@@ -4083,7 +3868,7 @@ async def show_secret_pw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def export_vault_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-    if not get_session(update.effective_user.id):
+    if not await get_session(update.effective_user.id):
         await q.edit_message_text("Session expired\\.", parse_mode="MarkdownV2", reply_markup=kb_auth())
         return AUTH_MENU
     await q.edit_message_text(
@@ -4100,8 +3885,8 @@ async def export_pw1_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     except Exception:
         pass
     uid   = update.effective_user.id
-    vault = get_session(uid)
-    u     = get_user(vault)
+    vault = await get_session(uid)
+    u     = await get_user(vault)
     if not u:
         await update.message.reply_text(
             "❌ Wrong account password\\.",
@@ -4141,12 +3926,12 @@ async def export_pw2_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         return EXPORT_PW2_INPUT
     uid   = update.effective_user.id
-    vault = get_session(uid)
+    vault = await get_session(uid)
     pw    = ctx.user_data.get("password", "")
-    with get_db() as c:
-        rows = c.execute(
-            "SELECT name, issuer, secret_enc, salt, iv FROM totp_accounts WHERE vault_id=?", (vault,)
-        ).fetchall()
+    async async with get_db() as c:
+        rows = await c.fetch(
+            "SELECT name, issuer, secret_enc, salt, iv FROM totp_accounts WHERE vault_id=$1", (vault,)
+        )
     if not rows:
         await update.message.reply_text(
             "No TOTP accounts to export\\.",
@@ -4157,7 +3942,7 @@ async def export_pw2_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     processing_msg = await update.message.reply_text("⏳ Preparing export...")
 
     def _build_export():
-        vault_key = _get_vault_key(vault, pw)   # expensive once, reused for all entries
+        vault_key = await _get_vault_key(vault, pw)   # expensive once, reused for all entries
         _entries = []
         for row in rows:
             try:
@@ -4208,7 +3993,7 @@ async def export_pw2_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def import_vault_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-    if not get_session(update.effective_user.id):
+    if not await get_session(update.effective_user.id):
         await q.edit_message_text("Session expired\\.", parse_mode="MarkdownV2", reply_markup=kb_auth())
         return AUTH_MENU
     await q.edit_message_text(
@@ -4293,11 +4078,12 @@ async def import_pw_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return TOTP_MENU
     # Check for duplicates
     uid   = update.effective_user.id
-    vault = get_session(uid)
-    with get_db() as c:
-        existing_names = {r["name"] for r in c.execute(
-            "SELECT name FROM totp_accounts WHERE vault_id=?", (vault,)
-        ).fetchall()}
+    vault = await get_session(uid)
+    async async async with get_db() as c:
+        name_rows = await c.fetch(
+            "SELECT name FROM totp_accounts WHERE vault_id=$1", vault
+        )
+    existing_names = {r["name"] for r in name_rows}
     duplicates = [a["name"] for a in accounts if a["name"] in existing_names]
     ctx.user_data["import_accounts"] = accounts
     if duplicates:
@@ -4324,7 +4110,7 @@ async def import_override_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await q.answer()
     mode     = q.data.split("_")[2]   # "skip" or "replace"
     uid      = update.effective_user.id
-    vault    = get_session(uid)
+    vault    = await get_session(uid)
     accounts = ctx.user_data.pop("import_accounts", [])
     if not accounts:
         await q.edit_message_text("⚠️ Session expired\\. Please try again\\.",
@@ -4351,24 +4137,20 @@ async def _do_import(update_or_cb, ctx, vault: str, accounts: list, mode: str = 
 
     def _do_all_crypto():
         nonlocal imported, skipped, replaced
-        with get_db() as c:
-            existing_rows = c.execute(
-                "SELECT id, name, secret_enc, salt, iv, secret_hash FROM totp_accounts WHERE vault_id=?", (vault,)
-            ).fetchall()
+        async async with get_db() as c:
+            existing_rows = await c.fetch(
+                "SELECT id, name, secret_enc, salt, iv FROM totp_accounts WHERE vault_id=$1", (vault,)
+            )
             existing_by_name    = {r["name"]: r["id"] for r in existing_rows}
             existing_secrets    = set()
             undecryptable_names = set()
             for r in existing_rows:
-                # Use pre-stored hash if available (avoids Argon2 decrypt per entry)
-                if r["secret_hash"]:
-                    existing_secrets.add(r["secret_hash"])
-                else:
-                    try:
-                        plain = decrypt(r["secret_enc"], r["salt"], r["iv"], vault_key, vault)
-                        existing_secrets.add(hashlib.sha256(plain.encode()).hexdigest())
-                    except Exception as e:
-                        logger.warning(f"Import dup check: decrypt failed for '{r['name']}': {e}")
-                        undecryptable_names.add(r["name"])
+                try:
+                    plain = decrypt(r["secret_enc"], r["salt"], r["iv"], vault_key, vault)
+                    existing_secrets.add(hashlib.sha256(plain.encode()).hexdigest())
+                except Exception as e:
+                    logger.warning(f"Import dup check: decrypt failed for '{r['name']}': {e}")
+                    undecryptable_names.add(r["name"])
 
             for acc in accounts:
                 try:
@@ -4385,41 +4167,33 @@ async def _do_import(update_or_cb, ctx, vault: str, accounts: list, mode: str = 
                         sk_ct, sk_s, sk_iv = sk_encrypt_totp(secret.encode(), sk, vault)
                     name_exists   = acc["name"] in existing_by_name
                     secret_exists = secret_hash in existing_secrets
-                    # Count how many times this secret already exists in vault
-                    dup_count_in_vault = sum(
-                        1 for h in existing_secrets if h == secret_hash
-                    )
-                    if dup_count_in_vault >= MAX_TOTP_DUPLICATE:
-                        nonlocal_skip()   # silently skip — duplicate limit reached
-                        continue
                     if name_exists and acc["name"] in undecryptable_names:
                         nonlocal_skip()
                     elif name_exists and secret_exists:
                         if mode == "replace":
-                            c.execute(
-                                "UPDATE totp_accounts SET issuer=?, secret_enc=?, salt=?, iv=?, "
-                                "sk_enc=?, sk_salt=?, sk_iv=?, note=?, account_type='totp', hotp_counter=0, "
-                                "secret_hash=? WHERE id=?",
+                            await c.execute(
+                                "UPDATE totp_accounts SET issuer=$1, secret_enc=$2, salt=$3, iv=$4, "
+                                "sk_enc=$1, sk_salt=$2, sk_iv=$3, note=$4, account_type='totp', hotp_counter=0 "
+                                "WHERE id=$1",
                                 (acc.get("issuer", ""), ct, s, iv, sk_ct, sk_s, sk_iv,
-                                 note, secret_hash, existing_by_name[acc["name"]]),
+                                 note, existing_by_name[acc["name"]]),
                             )
                             nonlocal_replace()
                         else:
                             nonlocal_skip()
                     else:
-                        c.execute(
+                        await c.execute(
                             "INSERT INTO totp_accounts "
                             "(vault_id, name, issuer, secret_enc, salt, iv, sk_enc, sk_salt, sk_iv, "
-                            "note, account_type, hotp_counter, secret_hash) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                            "note, account_type, hotp_counter) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)",
                             (vault, acc["name"], acc.get("issuer", ""), ct, s, iv,
-                             sk_ct, sk_s, sk_iv, note, "totp", 0, secret_hash),
+                             sk_ct, sk_s, sk_iv, note, "totp", 0),
                         )
                         existing_secrets.add(secret_hash)
                         nonlocal_import()
                 except Exception as e:
-                    logger.error(f"Import entry '{acc.get('name','?')}': {e}")
+                    logger.error(f"Import entry '{acc.get('name','$1')}': {e}")
                     nonlocal_skip()
-            c.commit()
 
     # nonlocal helpers (closures can't assign to outer nonlocal in nested def easily)
     _counts = [0, 0, 0]  # [imported, skipped, replaced]
@@ -4448,7 +4222,7 @@ async def delete_account_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     uid = update.effective_user.id
-    if not get_session(uid):
+    if not await get_session(uid):
         await q.edit_message_text("Session expired\\.", parse_mode="MarkdownV2", reply_markup=kb_auth())
         return AUTH_MENU
     await q.edit_message_text(
@@ -4467,11 +4241,11 @@ async def delete_account_password(update: Update, ctx: ContextTypes.DEFAULT_TYPE
     except Exception:
         pass
     uid   = update.effective_user.id
-    vault = get_session(uid)
+    vault = await get_session(uid)
     if not vault:
         await update.message.reply_text("Session expired\\. /start", parse_mode="MarkdownV2", reply_markup=kb_auth())
         return AUTH_MENU
-    u = get_user(vault)
+    u = await get_user(vault)
     if not u:
         await update.message.reply_text("User not found\\.", parse_mode="MarkdownV2", reply_markup=kb_main())
         return TOTP_MENU
@@ -4511,20 +4285,19 @@ async def delete_account_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
         ctx.user_data.pop("delete_owner", None)
         return TOTP_MENU
     uid      = update.effective_user.id
-    vault    = ctx.user_data.pop("delete_vault", None) or get_session(uid)
+    vault    = ctx.user_data.pop("delete_vault", None) or await get_session(uid)
     owner_id = ctx.user_data.pop("delete_owner", None)
     if vault:
-        with get_db() as c:
-            c.execute("DELETE FROM totp_accounts WHERE vault_id=?",  (vault,))
-            c.execute("DELETE FROM reset_otps WHERE vault_id=?",     (vault,))
-            c.execute("DELETE FROM reset_attempts WHERE vault_id=?", (vault,))
-            c.execute("DELETE FROM sessions WHERE vault_id=?",       (vault,))
-            c.execute("DELETE FROM login_alerts WHERE vault_id=?",   (vault,))
-            c.execute("DELETE FROM share_links WHERE vault_id=?",    (vault,))
-            c.execute("DELETE FROM users WHERE vault_id=?",          (vault,))
-            c.commit()
-        record_stat("account_deleted", telegram_id=uid, vault_id=vault)
-    clear_session(uid)
+        async async with get_db() as c:
+            await c.execute("DELETE FROM totp_accounts WHERE vault_id=$1",  vault)
+            await c.execute("DELETE FROM reset_otps WHERE vault_id=$1",     vault)
+            await c.execute("DELETE FROM reset_attempts WHERE vault_id=$1", vault)
+            await c.execute("DELETE FROM sessions WHERE vault_id=$1",       vault)
+            await c.execute("DELETE FROM login_alerts WHERE vault_id=$1",   vault)
+            await c.execute("DELETE FROM share_links WHERE vault_id=$1",    vault)
+            await c.execute("DELETE FROM users WHERE vault_id=$1",          vault)
+        await record_stat("account_deleted", telegram_id=uid, vault_id=vault)
+    await clear_session(uid)
     ctx.user_data.clear()
     if owner_id:
         try:
@@ -4551,46 +4324,35 @@ async def delete_account_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
 async def global_auto_detect(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """
     Handles QR/secret detection outside conversation state.
-    Also auto-deletes ANY incoming private message (text, photo, document, etc.)
-    after 30 seconds to prevent sensitive data accumulating in chat.
+    Auto-deletes ANY incoming private message after 30 seconds.
     """
     if not update.message:
         return
     uid   = update.effective_user.id
-    # Silently ignore banned users
-    if is_telegram_banned(uid):
+    # ✅ FIX: async ban check
+    if await is_telegram_banned(uid):
         try:
             await update.message.delete()
         except Exception:
             pass
         return
-    vault = get_session(uid)
+    vault = await get_session(uid)
     pw    = ctx.user_data.get("password")
-    # Auto-delete the incoming message after 30s regardless of content
     asyncio.create_task(auto_delete_msg(update.message, delay=30))
-    # Update last_seen for every message interaction
     if vault:
-        update_last_seen(uid)
+        update_last_seen(uid)   # fire-and-forget task internally
     if not vault or not pw:
         return
 
-    # Block all actions during maintenance (QR scan, secret add, etc.)
-    if is_maintenance():
-        try:
-            await update.message.reply_text(MAINTENANCE_MSG, parse_mode="MarkdownV2")
-        except Exception:
-            pass
-        return
-
-    # ── # quick search (e.g. "#google") ────────────────────────
+    # ── # quick search (e.g. "#google") ───────────────────────
     if update.message.text and update.message.text.strip().startswith("#"):
         query = update.message.text.strip().lstrip("#").strip().lower()
         if query:
-            with get_db() as c:
-                rows = c.execute(
+            async async async with get_db() as c:
+                rows = await c.fetch(
                     "SELECT id, name, issuer, secret_enc, salt, iv, note, account_type, hotp_counter "
-                    "FROM totp_accounts WHERE vault_id=? ORDER BY name", (vault,)
-                ).fetchall()
+                    "FROM totp_accounts WHERE vault_id=$1 ORDER BY name", vault
+                )
             matched = [
                 r for r in rows
                 if query in (r["name"] or "").lower() or query in (r["note"] or "").lower()
@@ -4604,27 +4366,29 @@ async def global_auto_detect(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     ]),
                 )
                 return
-            entries = []
-            for i, row in enumerate(matched, 1):
-                try:
-                    secret   = decrypt(row["secret_enc"], row["salt"], row["iv"], _get_cached_vault_key(vault, pw), vault)
-                    note     = (row["note"] or "").strip()
-                    code, remain, next_code = generate_code(secret)
-                    code_fmt  = code
-                    time_line = f"{bar(remain)} {remain}s"
-                    nf = next_code if next_code else ""
-                    name_line = f"*{i}\\. {em(row['name'])}*"
-                    if row["issuer"]:
-                        name_line += f" \\| _{em(row['issuer'])}_"
-                    block = [name_line, f"Current Code: `{code}` {time_line}"]
-                    if nf:
-                        block.append(f"Next code: `{nf}`")
-                    if note:
-                        block.append(f"Note: {em(note)}")
-                    entries.append("\n".join(block))
-                except Exception as e:
-                    logger.error(f"Hash-search decrypt: {e}")
-                    entries.append(f"*{i}\\. {em(row['name'])}*\n_\\[Decrypt error\\]_")
+            # ✅ FIX: vault_key resolved once, decrypt loop in thread
+            vault_key = await _get_vault_key(vault, pw)
+            def _decrypt_matched():
+                result = []
+                for i, row in enumerate(matched, 1):
+                    try:
+                        secret = decrypt(row["secret_enc"], row["salt"], row["iv"], vault_key, vault)
+                        note   = (row["note"] or "").strip()
+                        code, remain, next_code = generate_code(secret)
+                        name_line = f"*{i}\\. {em(row['name'])}*"
+                        if row["issuer"]:
+                            name_line += f" \\| _{em(row['issuer'])}_"
+                        block = [name_line, f"Current Code: `{code}` {bar(remain)} {remain}s"]
+                        if next_code:
+                            block.append(f"Next code: `{next_code}`")
+                        if note:
+                            block.append(f"Note: {em(note)}")
+                        result.append("\n".join(block))
+                    except Exception as e:
+                        logger.error(f"Hash-search decrypt: {e}")
+                        result.append(f"*{i}\\. {em(row['name'])}*\n_\\[Decrypt error\\]_")
+                return result
+            entries = await asyncio.to_thread(_decrypt_matched)
             result_text = (
                 f"🔍 *\\#search:* `{em(query)}` — *{len(matched)} found*\n\n"
                 + "\n\n".join(entries)
@@ -4644,9 +4408,9 @@ async def global_auto_detect(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         secret   = ctx.user_data.pop("pending_secret", None)
         ctx.user_data.pop("_global_add", None)
         if raw_name and secret:
-            # Rate limit check
-            if not check_totp_add_rate(vault):
-                _eff_per_min2 = get_effective_per_min_limit(vault)
+            # ✅ FIX: async rate-limit checks
+            if not await check_totp_add_rate(vault):
+                _eff_per_min2 = await get_effective_per_min_limit(vault)
                 await update.message.reply_text(
                     f"⚠️ *Too many accounts added\\.*\n\n"
                     f"Maximum *{_eff_per_min2}* TOTP accounts can be added per minute\\.",
@@ -4654,7 +4418,6 @@ async def global_auto_detect(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     reply_markup=kb_main(),
                 )
                 return
-            # Name length check
             if len(raw_name) > TOTP_NAME_MAX_LEN:
                 await update.message.reply_text(
                     f"⚠️ Name too long\\. Maximum *{TOTP_NAME_MAX_LEN}* characters\\.\n\nPlease try again with a shorter name:",
@@ -4666,54 +4429,27 @@ async def global_auto_detect(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 ctx.user_data["pending_secret"] = secret
                 ctx.user_data["_global_add"]    = True
                 return
-            # ── Duplicate check (global add flow) ─────────────
-            _gad_secret_clean = secret.upper().replace(" ", "").replace("-", "")
-            _gad_secret_hash  = hashlib.sha256(_gad_secret_clean.encode()).hexdigest()
-            _gad_disabled, _gad_until = _is_vault_dup_disabled(vault)
-            if _gad_disabled:
-                _gad_remaining_h = max(1, round((_gad_until - int(time.time())) / 3600))
-                await update.message.reply_text(
-                    "🚫 *Vault temporarily disabled*\n\n"
-                    "Too many duplicate TOTP attempts\\.\n"
-                    f"Try again in *{_gad_remaining_h}h*\\.",
-                    parse_mode="MarkdownV2", reply_markup=kb_main(),
-                )
-                return
-            _gad_dup_count = _count_secret_duplicates(vault, _gad_secret_hash)
-            if _gad_dup_count >= MAX_TOTP_DUPLICATE:
-                _gad_ban = _record_dup_attempt(vault)
-                if _gad_ban:
-                    await update.message.reply_text(
-                        "🚫 *Vault disabled for 18 hours*\n\n"
-                        "Too many attempts to add a TOTP that has reached the duplicate limit\\.",
-                        parse_mode="MarkdownV2", reply_markup=kb_main(),
-                    )
+            name      = await _auto_suffix_name(vault, raw_name)
+            # ✅ FIX: vault_key + encrypt + sk ops in thread
+            vault_key = await _get_vault_key(vault, pw)
+            sk        = await load_user_secure_key(vault, pw)
+            def _encrypt_new():
+                ct, salt, iv = encrypt(secret, vault_key, vault)
+                if sk:
+                    sk_ct, sk_s, sk_iv = sk_encrypt_totp(secret.encode(), sk, vault)
                 else:
-                    await update.message.reply_text(
-                        f"⚠️ *Duplicate limit reached*\n\n"
-                        f"This secret already exists *{_gad_dup_count}* time\\(s\\)\\.\n"
-                        f"Maximum: *{MAX_TOTP_DUPLICATE}*\\.",
-                        parse_mode="MarkdownV2", reply_markup=kb_main(),
-                    )
-                return
-            # ── End duplicate check ──────────────────────────────
-            name = _auto_suffix_name(vault, raw_name)
-            vault_key = _get_cached_vault_key(vault, pw)
-            ct, salt, iv = encrypt(_gad_secret_clean, vault_key, vault)
-            sk = load_user_secure_key(vault, pw)
-            if sk:
-                sk_ct, sk_s, sk_iv = sk_encrypt_totp(_gad_secret_clean.encode(), sk, vault)
-            else:
-                sk_ct = sk_s = sk_iv = None
-            with get_db() as c:
-                c.execute(
+                    sk_ct = sk_s = sk_iv = None
+                return ct, salt, iv, sk_ct, sk_s, sk_iv
+            ct, salt, iv, sk_ct, sk_s, sk_iv = await asyncio.to_thread(_encrypt_new)
+            async async async with get_db() as c:
+                await c.execute(
                     "INSERT INTO totp_accounts (vault_id, name, issuer, secret_enc, salt, iv, "
-                    "sk_enc, sk_salt, sk_iv, note, account_type, hotp_counter, secret_hash) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                    (vault, name, "", ct, salt, iv, sk_ct, sk_s, sk_iv, "", "totp", 0, _gad_secret_hash),
+                    "sk_enc, sk_salt, sk_iv, note, account_type, hotp_counter) "
+                    "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)",
+                    vault, name, "", ct, salt, iv, sk_ct, sk_s, sk_iv, "", "totp", 0,
                 )
-                c.commit()
-            record_totp_add(vault)
-            record_stat("totp_added", vault_id=vault)
+            await record_totp_add(vault)
+            await record_stat("totp_added", vault_id=vault)
             try:
                 code, remain, _ = generate_code(secret)
             except Exception:
@@ -4755,7 +4491,7 @@ async def search_totp_open(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     uid   = update.effective_user.id
-    vault = get_session(uid)
+    vault = await get_session(uid)
     if not vault:
         await q.edit_message_text("Session expired\\. /start", parse_mode="MarkdownV2", reply_markup=kb_auth())
         return AUTH_MENU
@@ -4774,15 +4510,13 @@ async def search_totp_open(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def search_totp_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Handle the search query and show matching TOTP accounts."""
     text = update.message.text.strip()
-    # Auto-delete the user's search message after 30s
     asyncio.create_task(auto_delete_msg(update.message, delay=30))
     uid   = update.effective_user.id
-    vault = get_session(uid)
+    vault = await get_session(uid)
     pw    = ctx.user_data.get("password")
     if not vault or not pw:
         await update.message.reply_text("Session expired\\. /start", parse_mode="MarkdownV2")
         return AUTH_MENU
-    # Remove leading '#' and clean query
     query = text.lstrip("#").strip().lower()
     if not query:
         await update.message.reply_text(
@@ -4790,12 +4524,11 @@ async def search_totp_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             parse_mode="MarkdownV2", reply_markup=kb_cancel()
         )
         return SEARCH_TOTP_INPUT
-    with get_db() as c:
-        rows = c.execute(
+    async async async with get_db() as c:
+        rows = await c.fetch(
             "SELECT id, name, issuer, secret_enc, salt, iv, note, account_type, hotp_counter "
-            "FROM totp_accounts WHERE vault_id=? ORDER BY name", (vault,)
-        ).fetchall()
-    # Match against name and note (case-insensitive)
+            "FROM totp_accounts WHERE vault_id=$1 ORDER BY name", vault
+        )
     matched = [
         r for r in rows
         if query in (r["name"] or "").lower() or query in (r["note"] or "").lower()
@@ -4810,28 +4543,29 @@ async def search_totp_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             ]),
         )
         return TOTP_MENU
-    entries = []
-    for i, row in enumerate(matched, 1):
-        try:
-            secret = decrypt(row["secret_enc"], row["salt"], row["iv"], _get_cached_vault_key(vault, pw), vault)
-            note     = (row["note"] or "").strip()
-            code, remain, next_code = generate_code(secret)
-            code_fmt  = code
-            time_line = f"{bar(remain)} {remain}s"
-            next_line = f"Next code: `{next_code}`" if next_code else ""
-            note_line = f"Note: {em(note)}" if note else ""
-            name_line = f"*{i}\\. {em(row['name'])}*"
-            if row["issuer"]:
-                name_line += f" \\| _{em(row['issuer'])}_"
-            block = [name_line, f"Current Code: `{code}` {time_line}"]
-            if next_line:
-                block.append(next_line)
-            if note_line:
-                block.append(note_line)
-            entries.append("\n".join(block))
-        except Exception as e:
-            logger.error(f"Search TOTP decrypt error: {e}")
-            entries.append(f"*{i}\\. {em(row['name'])}*\n_\\[Decrypt error\\]_")
+    # ✅ FIX: vault_key resolved once (Argon2, async), decrypt loop in thread
+    vault_key = await _get_vault_key(vault, pw)
+    def _decrypt_search():
+        result = []
+        for i, row in enumerate(matched, 1):
+            try:
+                secret = decrypt(row["secret_enc"], row["salt"], row["iv"], vault_key, vault)
+                note   = (row["note"] or "").strip()
+                code, remain, next_code = generate_code(secret)
+                name_line = f"*{i}\\. {em(row['name'])}*"
+                if row["issuer"]:
+                    name_line += f" \\| _{em(row['issuer'])}_"
+                block = [name_line, f"Current Code: `{code}` {bar(remain)} {remain}s"]
+                if next_code:
+                    block.append(f"Next code: `{next_code}`")
+                if note:
+                    block.append(f"Note: {em(note)}")
+                result.append("\n".join(block))
+            except Exception as e:
+                logger.error(f"Search TOTP decrypt error: {e}")
+                result.append(f"*{i}\\. {em(row['name'])}*\n_\\[Decrypt error\\]_")
+        return result
+    entries = await asyncio.to_thread(_decrypt_search)
     result_text = (
         f"🔍 *Results for* `{em(query)}` *— {len(matched)} found*\n\n"
         + "\n\n".join(entries)
@@ -4905,7 +4639,7 @@ async def adm_maintenance_toggle_cb(update: Update, ctx: ContextTypes.DEFAULT_TY
     """Actually toggle the maintenance state when the toggle button is pressed."""
     q = update.callback_query; await q.answer()
     new_state = not is_maintenance()
-    _save_setting("maintenance", new_state)
+    _save_setting_async("maintenance", new_state)
 
     if new_state:
         status_text  = "🔧 *Maintenance Mode: ON*\\n\\nUsers are currently blocked\\."
@@ -4943,7 +4677,7 @@ async def adm_stats_today_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Show today's statistics (BDT 00:00 to now)."""
     q = update.callback_query; await q.answer()
     since   = _bdt_day_start(0)
-    text    = _build_stats_text("Today", since, include_active=True)
+    text    = await _build_stats_text("Today", since, include_active=True)
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="adm_statistics")]])
     msg = await q.message.reply_text(text, reply_markup=kb)
     asyncio.create_task(auto_delete_msg(msg, delay=300))
@@ -4953,7 +4687,7 @@ async def adm_stats_weekly_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Show weekly statistics (last Saturday BDT 00:00 to now)."""
     q = update.callback_query; await q.answer()
     since   = _bdt_week_start()
-    text    = _build_stats_text("Weekly", since, include_active=True)
+    text    = await _build_stats_text("Weekly", since, include_active=True)
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="adm_statistics")]])
     msg = await q.message.reply_text(text, reply_markup=kb)
     asyncio.create_task(auto_delete_msg(msg, delay=300))
@@ -4963,7 +4697,7 @@ async def adm_stats_monthly_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Show monthly statistics (1st of current month BDT 00:00 to now)."""
     q = update.callback_query; await q.answer()
     since   = _bdt_month_start()
-    text    = _build_stats_text("Monthly", since, include_active=True)
+    text    = await _build_stats_text("Monthly", since, include_active=True)
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="adm_statistics")]])
     msg = await q.message.reply_text(text, reply_markup=kb)
     asyncio.create_task(auto_delete_msg(msg, delay=300))
@@ -4974,10 +4708,10 @@ async def adm_stats_lifetime_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
     since = 0  # all time
     # Lifetime active = distinct users who ever had a session
-    with get_db() as c:
-        row = c.execute(
+    async async with get_db() as c:
+        row = await c.fetchrow(
             "SELECT COUNT(DISTINCT telegram_id) AS n FROM vault_login_history"
-        ).fetchone()
+        )
     lifetime_active = row["n"] if row else 0
 
     new_join   = _count_stat("signup",             since)
@@ -5051,11 +4785,11 @@ async def adm_uc_disabled_list_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE
     """Export list of disabled accounts as txt file."""
     q = update.callback_query; await q.answer()
     chat_id = update.effective_chat.id
-    with get_db() as c:
-        rows = c.execute(
+    async async with get_db() as c:
+        rows = await c.fetch(
             "SELECT vault_id, telegram_id, tg_username, account_disabled FROM users "
             "WHERE account_disabled=1 ORDER BY vault_id"
-        ).fetchall()
+        )
     if not rows:
         msg = await q.message.reply_text("No disabled accounts found.")
         asyncio.create_task(auto_delete_msg(msg, delay=60))
@@ -5096,7 +4830,7 @@ async def adm_uc_ban_list_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Export list of banned Telegram IDs as txt file."""
     q = update.callback_query; await q.answer()
     chat_id  = update.effective_chat.id
-    banned   = get_all_banned_users()
+    banned   = await get_all_banned_users()
     if not banned:
         msg = await q.message.reply_text("No banned users found.")
         asyncio.create_task(auto_delete_msg(msg, delay=60))
@@ -5185,8 +4919,7 @@ async def adm_totp_limit_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await q.message.reply_text(
         f"TOTP Limit Settings\n\nGlobal Vault Max: {MAX_TOTP_PER_VAULT} per vault\n"
         f"Global Per-Minute: {MAX_TOTP_PER_MINUTE} per vault/min\n"
-        f"Duplicate Limit: {MAX_TOTP_DUPLICATE} per vault\n"
-        f"After limit: 20 attempts → vault banned 18h\n\n"
+        f"Duplicate Limit: {MAX_TOTP_DUPLICATE} per vault\n\n"
         f"Use Specific User buttons to override limits for individual vaults.",
         reply_markup=kb,
     )
@@ -5281,7 +5014,7 @@ async def adm_signup_public_toggle_cb(update: Update, ctx: ContextTypes.DEFAULT_
     """Toggle global public signup on/off."""
     q = update.callback_query; await q.answer()
     new_state = not is_signup_enabled()
-    _save_setting("signup_enabled", new_state)
+    _save_setting_async("signup_enabled", new_state)
     pub_status = "ON" if new_state else "OFF"
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton(f"🌐 Public Sign-Up  (currently {pub_status})", callback_data="adm_signup_public_toggle")],
@@ -5337,18 +5070,18 @@ async def adm_signup_off_list_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
     """Send a .txt file listing all users with specific signup disabled."""
     q = update.callback_query; await q.answer()
     chat_id    = update.effective_chat.id
-    disabled_ids = get_all_signup_disabled_users()
+    disabled_ids = await get_all_signup_disabled_users()
     if not disabled_ids:
         msg = await q.message.reply_text("No users with specific signup disabled.")
         asyncio.create_task(auto_delete_msg(msg, delay=60))
         return
     # Fetch usernames from DB
     lines_out = []
-    with get_db() as c:
+    async async with get_db() as c:
         for tid in disabled_ids:
-            row = c.execute(
-                "SELECT tg_username, telegram_id FROM users WHERE telegram_id=?", (tid,)
-            ).fetchone()
+            row = await c.fetchrow(
+                "SELECT tg_username, telegram_id FROM users WHERE telegram_id=$1", (tid,)
+            )
             if row:
                 uname = f"@{row['tg_username']}" if row["tg_username"] else "(no username)"
                 lines_out.append(f"{row['telegram_id']}  {uname}")
@@ -5404,7 +5137,7 @@ async def adm_login_public_toggle_cb(update: Update, ctx: ContextTypes.DEFAULT_T
     """Toggle global public login on/off."""
     q = update.callback_query; await q.answer()
     new_state = not is_login_enabled()
-    _save_setting("login_enabled", new_state)
+    _save_setting_async("login_enabled", new_state)
     pub_status = "ON" if new_state else "OFF"
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton(f"🌐 Public Login  (currently {pub_status})", callback_data="adm_login_public_toggle")],
@@ -5460,17 +5193,17 @@ async def adm_login_off_list_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Send a .txt file listing all users with specific login disabled."""
     q = update.callback_query; await q.answer()
     chat_id      = update.effective_chat.id
-    disabled_ids = get_all_login_disabled_users()
+    disabled_ids = await get_all_login_disabled_users()
     if not disabled_ids:
         msg = await q.message.reply_text("No users with specific login disabled.")
         asyncio.create_task(auto_delete_msg(msg, delay=60))
         return
     lines_out = []
-    with get_db() as c:
+    async async with get_db() as c:
         for tid in disabled_ids:
-            row = c.execute(
-                "SELECT tg_username, telegram_id FROM users WHERE telegram_id=?", (tid,)
-            ).fetchone()
+            row = await c.fetchrow(
+                "SELECT tg_username, telegram_id FROM users WHERE telegram_id=$1", (tid,)
+            )
             if row:
                 uname = f"@{row['tg_username']}" if row["tg_username"] else "(no username)"
                 lines_out.append(f"{row['telegram_id']}  {uname}")
@@ -5513,22 +5246,20 @@ async def adm_account_action_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if len(parts) != 2:
         return
     action, vault_id = parts[0], parts[1]
-    with get_db() as c:
-        u = c.execute("SELECT * FROM users WHERE vault_id=?", (vault_id,)).fetchone()
+    async async with get_db() as c:
+        u = await c.fetchrow("SELECT * FROM users WHERE vault_id=$1", vault_id)
         if not u:
             await q.message.reply_text("User not found.")
             return
         flag = 1 if action == "adm_account_disable" else 0
-        c.execute("UPDATE users SET account_disabled=? WHERE vault_id=?", (flag, vault_id))
+        await c.execute("UPDATE users SET account_disabled=$1 WHERE vault_id=$2", flag, vault_id)
         if flag:
-            c.execute("DELETE FROM sessions WHERE vault_id=?", (vault_id,))
-        c.commit()
+            await c.execute("DELETE FROM sessions WHERE vault_id=$1", vault_id)
     if flag:
         _session_pw_cache.pop(vault_id, None)
-        _vault_key_cache.pop(vault_id, None)
     # Record stats event
     _tid_acct = u["telegram_id"] if u else 0
-    record_stat("account_disabled" if flag else "account_enabled",
+    await record_stat("account_disabled" if flag else "account_enabled",
                 telegram_id=_tid_acct, vault_id=vault_id)
     word = "DISABLED" if flag else "ENABLED"
     note = " All active sessions cleared." if flag else ""
@@ -5589,19 +5320,19 @@ def _admin_decrypt(payload: bytes, password: str) -> bytes:
 def _get_user_by_username(username: str):
     """Resolve @username -> user row using stored tg_username column."""
     uname = username.lstrip("@").lower()
-    with get_db() as c:
-        return c.execute(
-            "SELECT * FROM users WHERE LOWER(tg_username)=?", (uname,)
-        ).fetchone()
+    async async with get_db() as c:
+        return await c.fetchrow(
+            "SELECT * FROM users WHERE LOWER(tg_username)=$1", (uname,)
+        )
 
 def _resolve_user(raw: str):
     """Resolve vault_id, telegram_id, or @username to a user row."""
     raw = raw.strip()
-    u   = get_user(raw.lower())           # vault_id
+    u   = await get_user(raw.lower())           # vault_id
     if u: return u
     if raw.isdigit():
-        with get_db() as c:
-            u = c.execute("SELECT * FROM users WHERE telegram_id=?", (int(raw),)).fetchone()
+        async async with get_db() as c:
+            u = await c.fetchrow("SELECT * FROM users WHERE telegram_id=$1", int(raw))
         if u: return u
     if raw.startswith("@") or not raw.isdigit():
         u = _get_user_by_username(raw)
@@ -5643,28 +5374,28 @@ def _fmt_user_info(u) -> str:
             status = "Disabled" if u["account_disabled"] else "Active"
         except (KeyError, TypeError):
             status = "Active"
-        with get_db() as c:
-            totp_cnt = c.execute(
-                "SELECT COUNT(*) AS n FROM totp_accounts WHERE vault_id=?", (vault_id,)
-            ).fetchone()["n"]
+        async async with get_db() as c:
+            totp_cnt = await c.fetchval(
+                "SELECT COUNT(*) AS n FROM totp_accounts WHERE vault_id=$1", (vault_id,)
+            )
             # Count duplicate TOTP entries (same name appearing more than once)
-            dup_cnt = c.execute(
+            dup_cnt = await c.fetchval(
                 "SELECT SUM(cnt - 1) AS n FROM "
-                "(SELECT COUNT(*) AS cnt FROM totp_accounts WHERE vault_id=? GROUP BY name HAVING cnt > 1)",
+                "(SELECT COUNT(*) AS cnt FROM totp_accounts WHERE vault_id=$1 GROUP BY name HAVING cnt > 1)",
                 (vault_id,)
-            ).fetchone()["n"] or 0
-            br = c.execute(
-                "SELECT frequency, enabled FROM backup_reminders WHERE telegram_id=?", (tid,)
-            ).fetchone()
-            ab = c.execute(
-                "SELECT enabled, frequency FROM auto_backup_settings WHERE telegram_id=?", (tid,)
-            ).fetchone()
-            la = c.execute(
-                "SELECT attempts FROM login_attempts WHERE vault_id=?", (vault_id,)
-            ).fetchone()
-            ra = c.execute(
-                "SELECT attempts FROM reset_attempts WHERE vault_id=?", (vault_id,)
-            ).fetchone()
+            ) or 0
+            br = await c.fetchrow(
+                "SELECT frequency, enabled FROM backup_reminders WHERE telegram_id=$1", (tid,)
+            )
+            ab = await c.fetchrow(
+                "SELECT enabled, frequency FROM auto_backup_settings WHERE telegram_id=$1", (tid,)
+            )
+            la = await c.fetchrow(
+                "SELECT attempts FROM login_attempts WHERE vault_id=$1", (vault_id,)
+            )
+            ra = await c.fetchrow(
+                "SELECT attempts FROM reset_attempts WHERE vault_id=$1", (vault_id,)
+            )
         # Backup Reminder status — default is ON/Weekly if no row exists
         if br is None:
             reminder_status = "On - Weekly (default)"
@@ -5763,8 +5494,8 @@ async def admin_group_message_handler(update: Update, ctx: ContextTypes.DEFAULT_
     if step == "adm_broadcast_wait":
         _admin_import_pending.pop(chat_id, None)
         asyncio.create_task(auto_delete_msg(update.message, delay=10))
-        with get_db() as c:
-            users = c.execute("SELECT telegram_id FROM users").fetchall()
+        async async with get_db() as c:
+            users = await c.fetch("SELECT telegram_id FROM users")
         total    = len(users)
         sent     = 0
         failed   = 0
@@ -5829,10 +5560,10 @@ async def admin_group_message_handler(update: Update, ctx: ContextTypes.DEFAULT_
             "auto_backup_settings",
         ]
         dump = {}
-        with get_db() as c:
+        async async with get_db() as c:
             for tbl in _backup_tables:
                 try:
-                    rows = c.execute(f"SELECT * FROM {tbl}").fetchall()
+                    rows = await c.fetch(f"SELECT * FROM {tbl}")
                     dump[tbl] = [dict(r) for r in rows]
                 except Exception as e:
                     logger.warning(f"Backup table {tbl}: {e}")
@@ -5895,25 +5626,24 @@ async def admin_group_message_handler(update: Update, ctx: ContextTypes.DEFAULT_
             "auto_backup_settings",
         ]
         restored = []
-        with get_db() as c:
+        async async with get_db() as c:
             for tbl in _restore_tables:
                 if tbl not in dump:
                     continue
                 try:
-                    c.execute(f"DELETE FROM {tbl}")
+                    await c.execute(f"DELETE FROM {tbl}")
                     rows = dump[tbl]
                     if rows:
                         cols = ", ".join(rows[0].keys())
-                        placeholders = ", ".join("?" for _ in rows[0])
+                        placeholders = ", ".join("$1" for _ in rows[0])
                         for row in rows:
-                            c.execute(
-                                f"INSERT OR REPLACE INTO {tbl} ({cols}) VALUES ({placeholders})",
+                            await c.execute(
+                                f"INSERT INTO {tbl} ({cols}) VALUES ({placeholders})",
                                 list(row.values()),
                             )
                     restored.append(tbl)
                 except Exception as e:
                     logger.warning(f"Restore table {tbl}: {e}")
-            c.commit()
         _load_bot_settings()
         try:
             await progress.delete()
@@ -5936,11 +5666,11 @@ async def admin_group_message_handler(update: Update, ctx: ContextTypes.DEFAULT_
             return
         vault_id = u["vault_id"]
         # Export user's TOTP vault same way user self-exports (password = user's current vault password)
-        with get_db() as c:
-            totp_rows = c.execute(
-                "SELECT name, issuer, secret_enc, salt, iv FROM totp_accounts WHERE vault_id=?",
+        async async with get_db() as c:
+            totp_rows = await c.fetch(
+                "SELECT name, issuer, secret_enc, salt, iv FROM totp_accounts WHERE vault_id=$1",
                 (vault_id,)
-            ).fetchall()
+            )
         if not totp_rows:
             msg = await update.message.reply_text(f"No TOTP accounts found for vault {vault_id}.")
             asyncio.create_task(auto_delete_msg(msg, delay=60))
@@ -5956,7 +5686,7 @@ async def admin_group_message_handler(update: Update, ctx: ContextTypes.DEFAULT_
             return
         progress = await update.message.reply_text("⏳ Building vault export...")
         def _build_specific_export():
-            vault_key = _get_cached_vault_key(vault_id, live_pw)
+            vault_key = await _get_vault_key(vault_id, live_pw)
             entries = []
             for row in totp_rows:
                 try:
@@ -6060,10 +5790,9 @@ async def admin_group_message_handler(update: Update, ctx: ContextTypes.DEFAULT_
             )
             asyncio.create_task(auto_delete_msg(msg, delay=60))
             return
-        with get_db() as c:
-            c.execute("UPDATE users SET account_disabled=0 WHERE vault_id=?", (vault_id,))
-            c.commit()
-        record_stat("account_enabled", telegram_id=u["telegram_id"], vault_id=vault_id)
+        async async with get_db() as c:
+            await c.execute("UPDATE users SET account_disabled=0 WHERE vault_id=$1", vault_id)
+        await record_stat("account_enabled", telegram_id=u["telegram_id"], vault_id=vault_id)
         try:
             await ctx.bot.send_message(
                 chat_id=u["telegram_id"],
@@ -6093,13 +5822,11 @@ async def admin_group_message_handler(update: Update, ctx: ContextTypes.DEFAULT_
             )
             asyncio.create_task(auto_delete_msg(msg, delay=60))
             return
-        with get_db() as c:
-            c.execute("UPDATE users SET account_disabled=1 WHERE vault_id=?", (vault_id,))
-            c.execute("DELETE FROM sessions WHERE vault_id=?", (vault_id,))
-            c.commit()
+        async async with get_db() as c:
+            await c.execute("UPDATE users SET account_disabled=1 WHERE vault_id=$1", vault_id)
+            await c.execute("DELETE FROM sessions WHERE vault_id=$1", vault_id)
         _session_pw_cache.pop(vault_id, None)
-        _vault_key_cache.pop(vault_id, None)
-        record_stat("account_disabled", telegram_id=u["telegram_id"], vault_id=vault_id)
+        await record_stat("account_disabled", telegram_id=u["telegram_id"], vault_id=vault_id)
         try:
             await ctx.bot.send_message(
                 chat_id=u["telegram_id"],
@@ -6124,16 +5851,16 @@ async def admin_group_message_handler(update: Update, ctx: ContextTypes.DEFAULT_
         if raw.isdigit():
             tid_resolved = int(raw)
             # try to get username from users table
-            with get_db() as c:
-                row = c.execute(
-                    "SELECT tg_username FROM users WHERE telegram_id=?", (tid_resolved,)
-                ).fetchone()
+            async async with get_db() as c:
+                row = await c.fetchrow(
+                    "SELECT tg_username FROM users WHERE telegram_id=$1", (tid_resolved,)
+                )
             uname_resolved = row["tg_username"] if row else ""
         else:
-            with get_db() as c:
-                row = c.execute(
-                    "SELECT telegram_id, tg_username FROM users WHERE tg_username=?", (raw_strip,)
-                ).fetchone()
+            async async with get_db() as c:
+                row = await c.fetchrow(
+                    "SELECT telegram_id, tg_username FROM users WHERE tg_username=$1", (raw_strip,)
+                )
             if row:
                 tid_resolved   = row["telegram_id"]
                 uname_resolved = row["tg_username"]
@@ -6143,13 +5870,13 @@ async def admin_group_message_handler(update: Update, ctx: ContextTypes.DEFAULT_
             )
             asyncio.create_task(auto_delete_msg(msg, delay=60))
             return
-        if is_telegram_banned(tid_resolved):
+        if await is_telegram_banned(tid_resolved):
             msg = await update.message.reply_text(
                 f"Telegram ID {tid_resolved} is already banned."
             )
             asyncio.create_task(auto_delete_msg(msg, delay=60))
             return
-        set_telegram_ban(tid_resolved, uname_resolved, True)
+        await set_telegram_ban(tid_resolved, uname_resolved, True)
         # Notify the user
         try:
             await ctx.bot.send_message(
@@ -6174,20 +5901,20 @@ async def admin_group_message_handler(update: Update, ctx: ContextTypes.DEFAULT_
         if raw.isdigit():
             tid_resolved = int(raw)
         else:
-            with get_db() as c:
-                row = c.execute(
-                    "SELECT telegram_id, tg_username FROM users WHERE tg_username=?", (raw_strip,)
-                ).fetchone()
+            async async with get_db() as c:
+                row = await c.fetchrow(
+                    "SELECT telegram_id, tg_username FROM users WHERE tg_username=$1", (raw_strip,)
+                )
             if row:
                 tid_resolved   = row["telegram_id"]
                 uname_resolved = row["tg_username"]
             else:
                 # also check banned table directly
-                with get_db() as c:
-                    row = c.execute(
-                        "SELECT telegram_id, tg_username FROM telegram_banned WHERE tg_username=?",
+                async async with get_db() as c:
+                    row = await c.fetchrow(
+                        "SELECT telegram_id, tg_username FROM telegram_banned WHERE tg_username=$1",
                         (raw_strip,)
-                    ).fetchone()
+                    )
                 if row:
                     tid_resolved   = row["telegram_id"]
                     uname_resolved = row["tg_username"]
@@ -6195,13 +5922,13 @@ async def admin_group_message_handler(update: Update, ctx: ContextTypes.DEFAULT_
             msg = await update.message.reply_text(f"User not found: {raw}")
             asyncio.create_task(auto_delete_msg(msg, delay=60))
             return
-        if not is_telegram_banned(tid_resolved):
+        if not await is_telegram_banned(tid_resolved):
             msg = await update.message.reply_text(
                 f"Telegram ID {tid_resolved} is not currently banned."
             )
             asyncio.create_task(auto_delete_msg(msg, delay=60))
             return
-        set_telegram_ban(tid_resolved, uname_resolved, False)
+        await set_telegram_ban(tid_resolved, uname_resolved, False)
         uname_str = f"@{uname_resolved}" if uname_resolved else str(tid_resolved)
         msg = await update.message.reply_text(
             f"✅ Telegram ID {tid_resolved} ({uname_str}) has been UNBANNED."
@@ -6217,10 +5944,10 @@ async def admin_group_message_handler(update: Update, ctx: ContextTypes.DEFAULT_
         if raw.isdigit():
             tid_resolved = int(raw)
         else:
-            with get_db() as c:
-                row = c.execute(
-                    "SELECT telegram_id FROM users WHERE tg_username=?", (raw_strip,)
-                ).fetchone()
+            async async with get_db() as c:
+                row = await c.fetchrow(
+                    "SELECT telegram_id FROM users WHERE tg_username=$1", (raw_strip,)
+                )
             if row:
                 tid_resolved = row["telegram_id"]
         if not tid_resolved:
@@ -6229,7 +5956,7 @@ async def admin_group_message_handler(update: Update, ctx: ContextTypes.DEFAULT_
             )
             asyncio.create_task(auto_delete_msg(msg, delay=60))
             return
-        set_user_login_disabled(tid_resolved, False)
+        await set_user_login_disabled(tid_resolved, False)
         msg = await update.message.reply_text(
             f"✅ Login enabled for Telegram ID {tid_resolved}."
         )
@@ -6244,10 +5971,10 @@ async def admin_group_message_handler(update: Update, ctx: ContextTypes.DEFAULT_
         if raw.isdigit():
             tid_resolved = int(raw)
         else:
-            with get_db() as c:
-                row = c.execute(
-                    "SELECT telegram_id FROM users WHERE tg_username=?", (raw_strip,)
-                ).fetchone()
+            async async with get_db() as c:
+                row = await c.fetchrow(
+                    "SELECT telegram_id FROM users WHERE tg_username=$1", (raw_strip,)
+                )
             if row:
                 tid_resolved = row["telegram_id"]
         if not tid_resolved:
@@ -6256,7 +5983,7 @@ async def admin_group_message_handler(update: Update, ctx: ContextTypes.DEFAULT_
             )
             asyncio.create_task(auto_delete_msg(msg, delay=60))
             return
-        set_user_login_disabled(tid_resolved, True)
+        await set_user_login_disabled(tid_resolved, True)
         msg = await update.message.reply_text(
             f"🚫 Login disabled for Telegram ID {tid_resolved}."
         )
@@ -6273,10 +6000,10 @@ async def admin_group_message_handler(update: Update, ctx: ContextTypes.DEFAULT_
             tid_resolved = int(raw)
         else:
             # Try to find by username in users table
-            with get_db() as c:
-                row = c.execute(
-                    "SELECT telegram_id FROM users WHERE tg_username=?", (raw_strip,)
-                ).fetchone()
+            async async with get_db() as c:
+                row = await c.fetchrow(
+                    "SELECT telegram_id FROM users WHERE tg_username=$1", (raw_strip,)
+                )
             if row:
                 tid_resolved = row["telegram_id"]
         if not tid_resolved:
@@ -6285,7 +6012,7 @@ async def admin_group_message_handler(update: Update, ctx: ContextTypes.DEFAULT_
             )
             asyncio.create_task(auto_delete_msg(msg, delay=60))
             return
-        set_user_signup_disabled(tid_resolved, False)
+        await set_user_signup_disabled(tid_resolved, False)
         msg = await update.message.reply_text(
             f"✅ Signup enabled for Telegram ID {tid_resolved}."
         )
@@ -6300,10 +6027,10 @@ async def admin_group_message_handler(update: Update, ctx: ContextTypes.DEFAULT_
         if raw.isdigit():
             tid_resolved = int(raw)
         else:
-            with get_db() as c:
-                row = c.execute(
-                    "SELECT telegram_id FROM users WHERE tg_username=?", (raw_strip,)
-                ).fetchone()
+            async async with get_db() as c:
+                row = await c.fetchrow(
+                    "SELECT telegram_id FROM users WHERE tg_username=$1", (raw_strip,)
+                )
             if row:
                 tid_resolved = row["telegram_id"]
         if not tid_resolved:
@@ -6312,7 +6039,7 @@ async def admin_group_message_handler(update: Update, ctx: ContextTypes.DEFAULT_
             )
             asyncio.create_task(auto_delete_msg(msg, delay=60))
             return
-        set_user_signup_disabled(tid_resolved, True)
+        await set_user_signup_disabled(tid_resolved, True)
         msg = await update.message.reply_text(
             f"🚫 Signup disabled for Telegram ID {tid_resolved}."
         )
@@ -6369,10 +6096,10 @@ async def admin_group_message_handler(update: Update, ctx: ContextTypes.DEFAULT_
             asyncio.create_task(auto_delete_msg(msg, delay=60))
             return
         globals()["MAX_TOTP_PER_VAULT"] = int(raw)
-        with get_db() as _c:
-            custom_count = _c.execute(
+        async with get_db() as _c:
+            custom_count = _await c.fetchval(
                 "SELECT COUNT(*) AS n FROM vault_custom_limits WHERE max_per_vault IS NOT NULL"
-            ).fetchone()["n"]
+            )
         note = f" ({custom_count} vault(s) with custom limit are not affected.)" if custom_count else ""
         msg = await update.message.reply_text(
             f"Global vault max TOTP limit updated to {raw} per vault.{note}"
@@ -6388,10 +6115,10 @@ async def admin_group_message_handler(update: Update, ctx: ContextTypes.DEFAULT_
             asyncio.create_task(auto_delete_msg(msg, delay=60))
             return
         globals()["MAX_TOTP_PER_MINUTE"] = int(raw)
-        with get_db() as _c:
-            custom_count = _c.execute(
+        async with get_db() as _c:
+            custom_count = _await c.fetchval(
                 "SELECT COUNT(*) AS n FROM vault_custom_limits WHERE max_per_min IS NOT NULL"
-            ).fetchone()["n"]
+            )
         note = f" ({custom_count} vault(s) with custom per-minute limit are not affected.)" if custom_count else ""
         msg = await update.message.reply_text(
             f"Global per-minute TOTP limit updated to {raw} per vault/min.{note}"
@@ -6408,7 +6135,7 @@ async def admin_group_message_handler(update: Update, ctx: ContextTypes.DEFAULT_
             asyncio.create_task(auto_delete_msg(msg, delay=60))
             return
         vault_id  = u["vault_id"]
-        cur_limit = get_effective_vault_max(vault_id)
+        cur_limit = await get_effective_vault_max(vault_id)
         _admin_import_pending[chat_id] = {"step": "adm_specific_vault_max_wait", "vault_id": vault_id}
         msg = await update.message.reply_text(
             f"Set Maximum TOTP Limit for This Vault\n\n"
@@ -6427,7 +6154,7 @@ async def admin_group_message_handler(update: Update, ctx: ContextTypes.DEFAULT_
             msg = await update.message.reply_text("Invalid. Send a positive integer.")
             asyncio.create_task(auto_delete_msg(msg, delay=60))
             return
-        set_vault_max_limit(vault_id, int(raw))
+        await set_vault_max_limit(vault_id, int(raw))
         msg = await update.message.reply_text(
             f"Custom vault max limit set to {raw} TOTP entries for vault {vault_id}."
         )
@@ -6443,7 +6170,7 @@ async def admin_group_message_handler(update: Update, ctx: ContextTypes.DEFAULT_
             asyncio.create_task(auto_delete_msg(msg, delay=60))
             return
         vault_id  = u["vault_id"]
-        cur_limit = get_effective_per_min_limit(vault_id)
+        cur_limit = await get_effective_per_min_limit(vault_id)
         _admin_import_pending[chat_id] = {"step": "adm_specific_vault_min_wait", "vault_id": vault_id}
         msg = await update.message.reply_text(
             f"Set Maximum Per minute TOTP Limit for This Vault\n\n"
@@ -6462,7 +6189,7 @@ async def admin_group_message_handler(update: Update, ctx: ContextTypes.DEFAULT_
             msg = await update.message.reply_text("Invalid. Send a positive integer.")
             asyncio.create_task(auto_delete_msg(msg, delay=60))
             return
-        set_vault_per_min_limit(vault_id, int(raw))
+        await set_vault_per_min_limit(vault_id, int(raw))
         msg = await update.message.reply_text(
             f"Custom per-minute limit set to {raw} TOTP/min for vault {vault_id}."
         )
@@ -6491,24 +6218,23 @@ async def admin_group_message_handler(update: Update, ctx: ContextTypes.DEFAULT_
         "login_attempts", "backup_reminders", "bot_settings",
         "auto_backup_settings",
     ]
-    with get_db() as c:
+    async async with get_db() as c:
         for tbl in tables:
             if tbl not in dump:
                 continue
             try:
-                c.execute(f"DELETE FROM {tbl}")
+                await c.execute(f"DELETE FROM {tbl}")
                 rows = dump[tbl]
                 if rows:
                     cols = ", ".join(rows[0].keys())
-                    placeholders = ", ".join("?" for _ in rows[0])
+                    placeholders = ", ".join("$1" for _ in rows[0])
                     for row in rows:
-                        c.execute(
-                            f"INSERT OR REPLACE INTO {tbl} ({cols}) VALUES ({placeholders})",
+                        await c.execute(
+                            f"INSERT INTO {tbl} ({cols}) VALUES ({placeholders})",
                             list(row.values()),
                         )
             except Exception as e:
                 logger.warning(f"Admin import table {tbl}: {e}")
-        c.commit()
     _load_bot_settings()
     await ctx.bot.send_message(
         chat_id=chat_id,
@@ -6520,13 +6246,13 @@ async def admin_userall_export(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not _is_admin_msg(update):
         return
     asyncio.create_task(auto_delete_msg(update.message, delay=60))
-    with get_db() as c:
-        rows = c.execute(
+    async async with get_db() as c:
+        rows = await c.fetch(
             "SELECT u.telegram_id, u.tg_name, u.tg_username, u.vault_id, u.account_disabled, "
             "COUNT(t.id) AS totp_cnt "
             "FROM users u LEFT JOIN totp_accounts t ON u.vault_id=t.vault_id "
             "GROUP BY u.vault_id ORDER BY u.created_at",
-        ).fetchall()
+        )
     if not rows:
         msg = await update.message.reply_text("No users found.")
         asyncio.create_task(auto_delete_msg(msg, delay=60))
@@ -6555,10 +6281,10 @@ async def offline_auto_backup_menu(update: Update, ctx: ContextTypes.DEFAULT_TYP
     q   = update.callback_query
     await q.answer()
     uid = update.effective_user.id
-    with get_db() as c:
-        row = c.execute(
-            "SELECT enabled, frequency FROM auto_backup_settings WHERE telegram_id=?", (uid,)
-        ).fetchone()
+    async async with get_db() as c:
+        row = await c.fetchrow(
+            "SELECT enabled, frequency FROM auto_backup_settings WHERE telegram_id=$1", (uid,)
+        )
     enabled = bool(row["enabled"]) if row else False
     freq    = row["frequency"] if row else "weekly"
     status_icon = "🟢 ON" if enabled else "🔴 OFF"
@@ -6590,23 +6316,22 @@ async def oab_toggle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q   = update.callback_query
     await q.answer()
     uid = update.effective_user.id
-    with get_db() as c:
-        row = c.execute(
-            "SELECT enabled FROM auto_backup_settings WHERE telegram_id=?", (uid,)
-        ).fetchone()
+    async async with get_db() as c:
+        row = await c.fetchrow(
+            "SELECT enabled FROM auto_backup_settings WHERE telegram_id=$1", (uid,)
+        )
         new_enabled = 0 if (row and row["enabled"]) else 1
-        c.execute(
-            "INSERT INTO auto_backup_settings (telegram_id, enabled) VALUES (?,?) "
+        await c.execute(
+            "INSERT INTO auto_backup_settings (telegram_id, enabled) VALUES ($1,$2) "
             "ON CONFLICT(telegram_id) DO UPDATE SET enabled=excluded.enabled",
             (uid, new_enabled),
         )
-        c.commit()
     # When enabling, immediately store the current password so backup works from this session
     if new_enabled == 1:
         pw    = ctx.user_data.get("password")
-        vault = get_session(uid)
+        vault = await get_session(uid)
         if pw and vault:
-            _oab_store_password(uid, vault, pw)
+            await _oab_store_password(uid, vault, pw)
     return await offline_auto_backup_menu(update, ctx)
 
 async def oab_freq(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -6614,18 +6339,17 @@ async def oab_freq(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q   = update.callback_query
     await q.answer()
     uid = update.effective_user.id
-    with get_db() as c:
-        row = c.execute(
-            "SELECT frequency FROM auto_backup_settings WHERE telegram_id=?", (uid,)
-        ).fetchone()
+    async async with get_db() as c:
+        row = await c.fetchrow(
+            "SELECT frequency FROM auto_backup_settings WHERE telegram_id=$1", (uid,)
+        )
         cur     = row["frequency"] if row else "weekly"
         new_frq = "monthly" if cur == "weekly" else "weekly"
-        c.execute(
-            "INSERT INTO auto_backup_settings (telegram_id, frequency) VALUES (?,?) "
+        await c.execute(
+            "INSERT INTO auto_backup_settings (telegram_id, frequency) VALUES ($1,$2) "
             "ON CONFLICT(telegram_id) DO UPDATE SET frequency=excluded.frequency",
             (uid, new_frq),
         )
-        c.commit()
     return await offline_auto_backup_menu(update, ctx)
 
 
@@ -6636,7 +6360,7 @@ async def run_auto_backup_for_user(bot, tid: int, vault_id: str, freq_label: str
     """
     try:
         # Load password: prefer RAM cache (fresher), fall back to DB store
-        live_pw = _session_pw_cache.get(vault_id) or _oab_load_password(tid, vault_id)
+        live_pw = _session_pw_cache.get(vault_id) or await _oab_load_password(tid, vault_id)
 
         if not live_pw:
             # Password not available at all — user never logged in after feature was added
@@ -6659,21 +6383,20 @@ async def run_auto_backup_for_user(bot, tid: int, vault_id: str, freq_label: str
             )
             # Mark as attempted so we don't spam every hour
             col = "last_weekly" if freq_label == "weekly" else "last_monthly"
-            with get_db() as c:
-                c.execute(
-                    f"INSERT INTO auto_backup_settings (telegram_id, {col}) VALUES (?,?) "
+            async async with get_db() as c:
+                await c.execute(
+                    f"INSERT INTO auto_backup_settings (telegram_id, {col}) VALUES ($1,$2) "
                     f"ON CONFLICT(telegram_id) DO UPDATE SET {col}=excluded.{col}",
                     (tid, int(time.time())),
                 )
-                c.commit()
             return
 
-        with get_db() as c:
-            totp_rows = c.execute(
+        async async with get_db() as c:
+            totp_rows = await c.fetch(
                 "SELECT name, issuer, secret_enc, salt, iv, note, account_type, hotp_counter "
-                "FROM totp_accounts WHERE vault_id=?",
+                "FROM totp_accounts WHERE vault_id=$1",
                 (vault_id,)
-            ).fetchall()
+            )
 
         if not totp_rows:
             logger.info(f"Auto-backup: no TOTP accounts for vault {vault_id}, skipping.")
@@ -6698,12 +6421,11 @@ async def run_auto_backup_for_user(bot, tid: int, vault_id: str, freq_label: str
             logger.warning(f"Auto-backup: all decrypt failed for vault {vault_id} — password may have changed")
             # Password mismatch means user changed password without triggering a new store.
             # Clear the stale DB password so next login re-stores the correct one.
-            with get_db() as c:
-                c.execute(
+            async async with get_db() as c:
+                await c.execute(
                     "UPDATE auto_backup_settings SET pw_enc=NULL, pw_salt=NULL, pw_iv=NULL "
-                    "WHERE telegram_id=?", (tid,)
+                    "WHERE telegram_id=$1", (tid,)
                 )
-                c.commit()
             return
 
         plain = json.dumps({
@@ -6755,13 +6477,12 @@ async def run_auto_backup_for_user(bot, tid: int, vault_id: str, freq_label: str
 
         # Update last sent timestamp
         col = "last_weekly" if freq_label == "weekly" else "last_monthly"
-        with get_db() as c:
-            c.execute(
-                f"INSERT INTO auto_backup_settings (telegram_id, {col}) VALUES (?,?) "
+        async async with get_db() as c:
+            await c.execute(
+                f"INSERT INTO auto_backup_settings (telegram_id, {col}) VALUES ($1,$2) "
                 f"ON CONFLICT(telegram_id) DO UPDATE SET {col}=excluded.{col}",
                 (tid, int(time.time())),
             )
-            c.commit()
         logger.info(f"Auto-backup sent to {tid} (vault {vault_id}, {freq_label})")
 
     except Exception as e:
@@ -6795,17 +6516,17 @@ async def send_auto_backups(app):
         return
 
     now_ts = int(time.time())
-    with get_db() as c:
-        rows = c.execute(
+    async async with get_db() as c:
+        rows = await c.fetch(
             "SELECT telegram_id, frequency, last_weekly, last_monthly "
             "FROM auto_backup_settings WHERE enabled=1"
-        ).fetchall()
+        )
 
     for row in rows:
         owner_tid = row["telegram_id"]
         freq      = row["frequency"]
-        with get_db() as c:
-            u = c.execute("SELECT vault_id FROM users WHERE telegram_id=?", (owner_tid,)).fetchone()
+        async async with get_db() as c:
+            u = await c.fetchrow("SELECT vault_id FROM users WHERE telegram_id=$1", owner_tid)
         if not u:
             continue
         vault_id = u["vault_id"]
@@ -6831,10 +6552,10 @@ async def backup_reminder_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q   = update.callback_query
     await q.answer()
     uid = update.effective_user.id
-    with get_db() as c:
-        row = c.execute(
-            "SELECT frequency, enabled FROM backup_reminders WHERE telegram_id=?", (uid,)
-        ).fetchone()
+    async async with get_db() as c:
+        row = await c.fetchrow(
+            "SELECT frequency, enabled FROM backup_reminders WHERE telegram_id=$1", (uid,)
+        )
     freq    = row["frequency"] if row else BACKUP_REMINDER_WEEKLY
     enabled = bool(row["enabled"]) if row else True
     status  = "🟢 Enabled" if enabled else "🔴 Disabled"
@@ -6863,33 +6584,31 @@ async def backup_rem_toggle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q   = update.callback_query
     await q.answer()
     uid = update.effective_user.id
-    with get_db() as c:
-        row = c.execute("SELECT enabled FROM backup_reminders WHERE telegram_id=?", (uid,)).fetchone()
+    async async with get_db() as c:
+        row = await c.fetchrow("SELECT enabled FROM backup_reminders WHERE telegram_id=$1", uid)
         # Default is enabled=1 (on). If no row, current state is ON, so toggling means OFF.
         current = bool(row["enabled"]) if row else True
         new_enabled = 0 if current else 1
-        c.execute(
-            "INSERT INTO backup_reminders (telegram_id, enabled) VALUES (?,?) "
+        await c.execute(
+            "INSERT INTO backup_reminders (telegram_id, enabled) VALUES ($1,$2) "
             "ON CONFLICT(telegram_id) DO UPDATE SET enabled=excluded.enabled",
             (uid, new_enabled),
         )
-        c.commit()
     return await backup_reminder_menu(update, ctx)
 
 async def backup_rem_freq(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q   = update.callback_query
     await q.answer()
     uid = update.effective_user.id
-    with get_db() as c:
-        row     = c.execute("SELECT frequency FROM backup_reminders WHERE telegram_id=?", (uid,)).fetchone()
+    async async with get_db() as c:
+        row     = await c.fetchrow("SELECT frequency FROM backup_reminders WHERE telegram_id=$1", uid)
         cur     = row["frequency"] if row else BACKUP_REMINDER_WEEKLY
         new_frq = BACKUP_REMINDER_MONTHLY if cur == BACKUP_REMINDER_WEEKLY else BACKUP_REMINDER_WEEKLY
-        c.execute(
-            "INSERT INTO backup_reminders (telegram_id, frequency) VALUES (?,?) "
+        await c.execute(
+            "INSERT INTO backup_reminders (telegram_id, frequency) VALUES ($1,$2) "
             "ON CONFLICT(telegram_id) DO UPDATE SET frequency=excluded.frequency",
             (uid, new_frq),
         )
-        c.commit()
     return await backup_reminder_menu(update, ctx)
 
 async def send_backup_reminders(app):
@@ -6902,16 +6621,15 @@ async def send_backup_reminders(app):
     week_s  = 7  * 24 * 3600
     month_s = 30 * 24 * 3600
 
-    # Get all users; LEFT JOIN with backup_reminders to include users with no preference row
-    with get_db() as c:
-        rows = c.execute("""
+    async async async with get_db() as c:
+        rows = await c.fetch("""
             SELECT u.telegram_id,
                    COALESCE(br.frequency, 'weekly')  AS frequency,
                    COALESCE(br.enabled,  1)           AS enabled,
                    COALESCE(br.last_sent, 0)          AS last_sent
             FROM users u
             LEFT JOIN backup_reminders br ON br.telegram_id = u.telegram_id
-        """).fetchall()
+        """)
 
     for row in rows:
         if not row["enabled"]:
@@ -6932,13 +6650,12 @@ async def send_backup_reminders(app):
                 ),
                 parse_mode="MarkdownV2",
             )
-            with get_db() as c:
-                c.execute(
-                    "INSERT INTO backup_reminders (telegram_id, last_sent) VALUES (?,?) "
+            async async with get_db() as c:
+                await c.execute(
+                    "INSERT INTO backup_reminders (telegram_id, last_sent) VALUES ($1,$2) "
                     "ON CONFLICT(telegram_id) DO UPDATE SET last_sent=excluded.last_sent",
                     (tid, now),
                 )
-                c.commit()
         except Exception as e:
             logger.warning(f"Backup reminder failed for {tid}: {e}")
 
@@ -6954,7 +6671,7 @@ async def cancel_to_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ]:
         ctx.user_data.pop(k, None)
     uid   = update.effective_user.id
-    vault = get_session(uid)
+    vault = await get_session(uid)
     if vault:
         await q.edit_message_text("Choose an option:", reply_markup=kb_main())
         return TOTP_MENU
@@ -6974,18 +6691,18 @@ async def main_menu_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     return TOTP_MENU
 
 # ── MAIN ────────────────────────────────────────────────────
-def main():
+async def main():
     if not SERVER_KEY:
         raise RuntimeError("ENCRYPTION_KEY environment variable is not set")
-    init_db()
-    purge_expired_share_links()
-    token   = os.environ["BOT_TOKEN"]
+    # ── Startup: init PostgreSQL pool + create tables ──────────
+    await init_db()
+    await purge_expired_share_links()
+    token = os.environ["BOT_TOKEN"]
     app = (
         ApplicationBuilder()
         .token(token)
-        # Allow multiple updates to be processed concurrently (different users don't block each other)
+        # concurrent_updates=True lets different users be served simultaneously
         .concurrent_updates(True)
-        # More worker threads for concurrent handler execution
         .pool_timeout(30.0)
         .connect_timeout(30.0)
         .read_timeout(30.0)
@@ -7305,4 +7022,4 @@ def main():
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
