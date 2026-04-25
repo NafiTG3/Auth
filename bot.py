@@ -3205,33 +3205,20 @@ async def _process_input(update, ctx, vault, pw):
         await file_obj.download_to_memory(bio)
         bio.seek(0)
         try:
-            img = Image.open(bio)
-            # Try original first, then RGB conversion for better pyzbar compat
-            decoded = qr_decode(img)
-            if not decoded:
-                decoded = qr_decode(img.convert("RGB"))
-            if not decoded and img.mode not in ("L", "RGB"):
-                decoded = qr_decode(img.convert("L"))   # grayscale fallback
+            decoded = qr_decode(Image.open(bio))
             if decoded:
-                for symbol in decoded:
-                    try:
-                        raw_uri = symbol.data.decode("utf-8")
-                    except Exception:
-                        continue
-                    data = parse_otpauth(raw_uri)
-                    if data:
-                        return await _do_save_totp(update, vault, data, pw), True
+                data = parse_otpauth(decoded[0].data.decode("utf-8"))
+                if data:
+                    return await _do_save_totp(update, vault, data, pw), True
             await update.message.reply_text(
-                "⚠️ *No valid TOTP QR found*\n\n"
-                "_Make sure the image contains a valid `otpauth://` QR code_\\.",
+                "⚠️ No valid TOTP QR found in image\\.",
                 parse_mode="MarkdownV2",
                 reply_markup=kb_cancel(),
             )
         except Exception as e:
             logger.error(f"QR decode error: {e}")
             await update.message.reply_text(
-                "⚠️ *Could not read image*\n\n"
-                "_Try sending a clearer photo or the `otpauth://` URI directly_\\.",
+                "⚠️ Could not read image\\.",
                 parse_mode="MarkdownV2",
                 reply_markup=kb_cancel(),
             )
