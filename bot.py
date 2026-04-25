@@ -2998,10 +2998,10 @@ async def change_pw_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             master_key = await asyncio.to_thread(unwrap_master_key, u["mk_enc"], u["mk_salt"], u["mk_iv"], old_pw)
             new_mk_enc, new_mk_salt, new_mk_iv = wrap_master_key(master_key, new_pw)
             ns = os.urandom(16)
+            new_pw_hash = await asyncio.to_thread(hash_pw, new_pw, ns, "argon2id")
             with get_db() as c:
                 c.execute(
                     "UPDATE users SET password_hash=?, pw_salt=?, kdf_type=?, "
-            new_pw_hash = await asyncio.to_thread(hash_pw, new_pw, ns, "argon2id")
                     "mk_enc=?, mk_salt=?, mk_iv=? WHERE vault_id=?",
                     (new_pw_hash, ns, "argon2id",
                      new_mk_enc, new_mk_salt, new_mk_iv, vault),
@@ -3029,9 +3029,9 @@ async def change_pw_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 except Exception as e:
                     logger.error(f"Re-encrypt TOTP during change_pw (legacy): {e}")
             ns = os.urandom(16)
+            new_pw_hash_leg = await asyncio.to_thread(hash_pw, new_pw, ns, "argon2id")
             c.execute(
                 "UPDATE users SET password_hash=?, pw_salt=? WHERE vault_id=?",
-            new_pw_hash_leg = await asyncio.to_thread(hash_pw, new_pw, ns, "argon2id")
                 (new_pw_hash_leg, ns, vault),
             )
             sk = load_user_secure_key(vault, old_pw)
