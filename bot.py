@@ -520,6 +520,81 @@ def record_totp_add(vault_id: str):
             )
         c.commit()
 
+# ── Duplicate TOTP secret enforcement ───────────────────────
+
+def _count_secret_duplicates(vault_id: str, secret_hash: str) -> int:
+    """Count how many TOTP entries in this vault share the same secret hash."""
+    with get_db() as c:
+        row = c.execute(
+            "SELECT COUNT(*) AS n FROM totp_accounts WHERE vault_id=? AND secret_hash=?",
+            (vault_id, secret_hash)
+        ).fetchone()
+    return row["n"] if row else 0
+
+def _is_vault_dup_disabled(vault_id: str) -> tuple:
+    """Return (is_disabled, disabled_until_unix). True if vault is in 18h ban."""
+    with get_db() as c:
+        row = c.execute(
+            "SELECT disabled_until FROM dup_attempts WHERE vault_id=?", (vault_id,)
+        ).fetchone()
+    if not row:
+        return False, 0
+    now = int(time.time())
+    if row["disabled_until"] > now:
+        return True, row["disabled_until"]
+    return False, 0
+
+def _record_dup_attempt(vault_id: str) -> bool:
+    """Record a duplicate attempt beyond the limit.
+    Returns True if vault should now be banned (18h).
+    After MAX_TOTP_DUPLICATE exceeded: 20 more tries -> 18h ban, counter resets."""
+    now          = int(time.time())
+    WINDOW       = 3600 * 24   # 24h sliding window for the 20-attempt counter
+    BAN_DURATION = 3600 * 18   # 18h ban
+    BAN_THRESHOLD = 20         # attempts-after-limit before ban
+    with get_db() as c:
+        row = c.execute(
+            "SELECT attempt_count, window_start, disabled_until FROM dup_attempts WHERE vault_id=?",
+            (vault_id,)
+        ).fetchone()
+        if not row:
+            c.execute(
+                "INSERT INTO dup_attempts (vault_id, attempt_count, window_start, disabled_until) "
+                "VALUES (?,1,?,0)",
+                (vault_id, now)
+            )
+            c.commit()
+            return False
+        count        = row["attempt_count"]
+        window_start = row["window_start"]
+        # Reset window if older than 24h
+        if now - window_start > WINDOW:
+            count        = 0
+            window_start = now
+        count += 1
+        should_ban     = count >= BAN_THRESHOLD
+        disabled_until = (now + BAN_DURATION) if should_ban else row["disabled_until"]
+        if should_ban:
+            count        = 0   # reset counter after ban triggers
+            window_start = now
+        c.execute(
+            "INSERT INTO dup_attempts (vault_id, attempt_count, window_start, disabled_until) "
+            "VALUES (?,?,?,?) ON CONFLICT(vault_id) DO UPDATE SET "
+            "attempt_count=excluded.attempt_count, window_start=excluded.window_start, "
+            "disabled_until=excluded.disabled_until",
+            (vault_id, count, window_start, disabled_until)
+        )
+        c.commit()
+    return should_ban
+
+def _reset_dup_attempts(vault_id: str):
+    """Clear duplicate attempt counter for a vault (admin use)."""
+    with get_db() as c:
+        c.execute("DELETE FROM dup_attempts WHERE vault_id=?", (vault_id,))
+        c.commit()
+
+# ── Name suffix helper ───────────────────────────────────────
+
 def _auto_suffix_name(vault_id: str, requested_name: str) -> str:
     """If 'Google' already exists, return 'Google 1', 'Google 2', etc."""
     base = requested_name.strip()[:TOTP_NAME_MAX_LEN]
@@ -824,6 +899,19 @@ def init_db():
                 c.execute(f"ALTER TABLE users ADD COLUMN {col} {coltype} DEFAULT {default}")
             except Exception:
                 pass
+
+        # Duplicate attempt tracking per vault (for duplicate limit enforcement)
+        c.execute("""CREATE TABLE IF NOT EXISTS dup_attempts (
+            vault_id       TEXT    PRIMARY KEY,
+            attempt_count  INTEGER DEFAULT 0,
+            window_start   INTEGER DEFAULT 0,
+            disabled_until INTEGER DEFAULT 0)""")
+
+        # Migration: add disabled_until to existing dup_attempts rows
+        try:
+            c.execute("ALTER TABLE dup_attempts ADD COLUMN disabled_until INTEGER DEFAULT 0")
+        except Exception:
+            pass
 
         c.commit()
 
