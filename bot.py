@@ -639,6 +639,7 @@ def init_db():
             note       TEXT DEFAULT '',
             account_type TEXT DEFAULT 'totp',
             hotp_counter INTEGER DEFAULT 0,
+            secret_hash  TEXT DEFAULT '',
             created_at INTEGER DEFAULT (strftime('%s','now')))""")
         c.execute("""CREATE TABLE IF NOT EXISTS reset_otps (
             vault_id   TEXT    NOT NULL,
@@ -807,6 +808,7 @@ def init_db():
             ("note",         "TEXT",    "''"),
             ("account_type", "TEXT",    "'totp'"),
             ("hotp_counter", "INTEGER", "0"),
+            ("secret_hash",  "TEXT",    "''"),
         ]:
             try:
                 c.execute(f"ALTER TABLE totp_accounts ADD COLUMN {col} {coltype} DEFAULT {default}")
@@ -3100,22 +3102,64 @@ async def _do_save_totp(update, vault, data, pw):
         )
         return TOTP_MENU
 
+    # ── Duplicate secret check ──────────────────────────────────
+    # Hash the raw secret (uppercase, stripped) for comparison.
+    # Only the hash is stored/compared — never the plaintext secret.
+    secret_clean = data["secret"].upper().replace(" ", "").replace("-", "")
+    secret_hash  = hashlib.sha256(secret_clean.encode()).hexdigest()
+
+    # Check if vault is already banned for too many duplicate attempts
+    is_disabled, disabled_until = _is_vault_dup_disabled(vault)
+    if is_disabled:
+        remaining_h = max(1, round((disabled_until - int(time.time())) / 3600))
+        await update.message.reply_text(
+            f"🚫 *Vault temporarily disabled*\n\n"
+            f"Too many duplicate TOTP attempts\\.\n"
+            f"Try again in *{remaining_h}h*\\.",
+            parse_mode="MarkdownV2",
+            reply_markup=kb_main(),
+        )
+        return TOTP_MENU
+
+    # Count how many times this exact secret already exists in this vault
+    existing_dup_count = _count_secret_duplicates(vault, secret_hash)
+    if existing_dup_count >= MAX_TOTP_DUPLICATE:
+        # Secret already at limit — record attempt and possibly ban
+        should_ban = _record_dup_attempt(vault)
+        if should_ban:
+            await update.message.reply_text(
+                "🚫 *Vault disabled for 18 hours*\n\n"
+                "Too many attempts to add a TOTP secret that has reached the duplicate limit\\.",
+                parse_mode="MarkdownV2",
+                reply_markup=kb_main(),
+            )
+        else:
+            await update.message.reply_text(
+                f"⚠️ *Duplicate limit reached*\n\n"
+                f"This TOTP secret already exists *{existing_dup_count}* time\\(s\\) in your vault\\.\n"
+                f"Maximum allowed duplicates: *{MAX_TOTP_DUPLICATE}*\\.",
+                parse_mode="MarkdownV2",
+                reply_markup=kb_main(),
+            )
+        return TOTP_MENU
+    # ── End duplicate check ─────────────────────────────────────
+
     # Auto-suffix name if duplicate, enforce max 20 chars
     final_name = _auto_suffix_name(vault, data["name"])
 
     vault_key = _get_cached_vault_key(vault, pw)
-    ct, salt, iv = encrypt(data["secret"], vault_key, vault)
+    ct, salt, iv = encrypt(secret_clean, vault_key, vault)
     sk = load_user_secure_key(vault, pw)
     if sk:
-        sk_ct, sk_s, sk_iv = sk_encrypt_totp(data["secret"].encode(), sk, vault)
+        sk_ct, sk_s, sk_iv = sk_encrypt_totp(secret_clean.encode(), sk, vault)
     else:
         sk_ct = sk_s = sk_iv = None
     with get_db() as c:
         c.execute(
             "INSERT INTO totp_accounts (vault_id, name, issuer, secret_enc, salt, iv, "
-            "sk_enc, sk_salt, sk_iv, note, account_type, hotp_counter) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            "sk_enc, sk_salt, sk_iv, note, account_type, hotp_counter, secret_hash) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (vault, final_name, data.get("issuer", ""), ct, salt, iv,
-             sk_ct, sk_s, sk_iv, note, acc_type, hotp_ctr),
+             sk_ct, sk_s, sk_iv, note, acc_type, hotp_ctr, secret_hash),
         )
         c.commit()
 
@@ -4218,18 +4262,22 @@ async def _do_import(update_or_cb, ctx, vault: str, accounts: list, mode: str = 
         nonlocal imported, skipped, replaced
         with get_db() as c:
             existing_rows = c.execute(
-                "SELECT id, name, secret_enc, salt, iv FROM totp_accounts WHERE vault_id=?", (vault,)
+                "SELECT id, name, secret_enc, salt, iv, secret_hash FROM totp_accounts WHERE vault_id=?", (vault,)
             ).fetchall()
             existing_by_name    = {r["name"]: r["id"] for r in existing_rows}
             existing_secrets    = set()
             undecryptable_names = set()
             for r in existing_rows:
-                try:
-                    plain = decrypt(r["secret_enc"], r["salt"], r["iv"], vault_key, vault)
-                    existing_secrets.add(hashlib.sha256(plain.encode()).hexdigest())
-                except Exception as e:
-                    logger.warning(f"Import dup check: decrypt failed for '{r['name']}': {e}")
-                    undecryptable_names.add(r["name"])
+                # Use pre-stored hash if available (avoids Argon2 decrypt per entry)
+                if r["secret_hash"]:
+                    existing_secrets.add(r["secret_hash"])
+                else:
+                    try:
+                        plain = decrypt(r["secret_enc"], r["salt"], r["iv"], vault_key, vault)
+                        existing_secrets.add(hashlib.sha256(plain.encode()).hexdigest())
+                    except Exception as e:
+                        logger.warning(f"Import dup check: decrypt failed for '{r['name']}': {e}")
+                        undecryptable_names.add(r["name"])
 
             for acc in accounts:
                 try:
@@ -4246,16 +4294,23 @@ async def _do_import(update_or_cb, ctx, vault: str, accounts: list, mode: str = 
                         sk_ct, sk_s, sk_iv = sk_encrypt_totp(secret.encode(), sk, vault)
                     name_exists   = acc["name"] in existing_by_name
                     secret_exists = secret_hash in existing_secrets
+                    # Count how many times this secret already exists in vault
+                    dup_count_in_vault = sum(
+                        1 for h in existing_secrets if h == secret_hash
+                    )
+                    if dup_count_in_vault >= MAX_TOTP_DUPLICATE:
+                        nonlocal_skip()   # silently skip — duplicate limit reached
+                        continue
                     if name_exists and acc["name"] in undecryptable_names:
                         nonlocal_skip()
                     elif name_exists and secret_exists:
                         if mode == "replace":
                             c.execute(
                                 "UPDATE totp_accounts SET issuer=?, secret_enc=?, salt=?, iv=?, "
-                                "sk_enc=?, sk_salt=?, sk_iv=?, note=?, account_type='totp', hotp_counter=0 "
-                                "WHERE id=?",
+                                "sk_enc=?, sk_salt=?, sk_iv=?, note=?, account_type='totp', hotp_counter=0, "
+                                "secret_hash=? WHERE id=?",
                                 (acc.get("issuer", ""), ct, s, iv, sk_ct, sk_s, sk_iv,
-                                 note, existing_by_name[acc["name"]]),
+                                 note, secret_hash, existing_by_name[acc["name"]]),
                             )
                             nonlocal_replace()
                         else:
@@ -4264,9 +4319,9 @@ async def _do_import(update_or_cb, ctx, vault: str, accounts: list, mode: str = 
                         c.execute(
                             "INSERT INTO totp_accounts "
                             "(vault_id, name, issuer, secret_enc, salt, iv, sk_enc, sk_salt, sk_iv, "
-                            "note, account_type, hotp_counter) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                            "note, account_type, hotp_counter, secret_hash) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
                             (vault, acc["name"], acc.get("issuer", ""), ct, s, iv,
-                             sk_ct, sk_s, sk_iv, note, "totp", 0),
+                             sk_ct, sk_s, sk_iv, note, "totp", 0, secret_hash),
                         )
                         existing_secrets.add(secret_hash)
                         nonlocal_import()
@@ -4512,19 +4567,50 @@ async def global_auto_detect(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 ctx.user_data["pending_secret"] = secret
                 ctx.user_data["_global_add"]    = True
                 return
+            # ── Duplicate check (global add flow) ─────────────
+            _gad_secret_clean = secret.upper().replace(" ", "").replace("-", "")
+            _gad_secret_hash  = hashlib.sha256(_gad_secret_clean.encode()).hexdigest()
+            _gad_disabled, _gad_until = _is_vault_dup_disabled(vault)
+            if _gad_disabled:
+                _gad_remaining_h = max(1, round((_gad_until - int(time.time())) / 3600))
+                await update.message.reply_text(
+                    "🚫 *Vault temporarily disabled*\n\n"
+                    "Too many duplicate TOTP attempts\\.\n"
+                    f"Try again in *{_gad_remaining_h}h*\\.",
+                    parse_mode="MarkdownV2", reply_markup=kb_main(),
+                )
+                return
+            _gad_dup_count = _count_secret_duplicates(vault, _gad_secret_hash)
+            if _gad_dup_count >= MAX_TOTP_DUPLICATE:
+                _gad_ban = _record_dup_attempt(vault)
+                if _gad_ban:
+                    await update.message.reply_text(
+                        "🚫 *Vault disabled for 18 hours*\n\n"
+                        "Too many attempts to add a TOTP that has reached the duplicate limit\\.",
+                        parse_mode="MarkdownV2", reply_markup=kb_main(),
+                    )
+                else:
+                    await update.message.reply_text(
+                        f"⚠️ *Duplicate limit reached*\n\n"
+                        f"This secret already exists *{_gad_dup_count}* time\\(s\\)\\.\n"
+                        f"Maximum: *{MAX_TOTP_DUPLICATE}*\\.",
+                        parse_mode="MarkdownV2", reply_markup=kb_main(),
+                    )
+                return
+            # ── End duplicate check ──────────────────────────────
             name = _auto_suffix_name(vault, raw_name)
             vault_key = _get_cached_vault_key(vault, pw)
-            ct, salt, iv = encrypt(secret, vault_key, vault)
+            ct, salt, iv = encrypt(_gad_secret_clean, vault_key, vault)
             sk = load_user_secure_key(vault, pw)
             if sk:
-                sk_ct, sk_s, sk_iv = sk_encrypt_totp(secret.encode(), sk, vault)
+                sk_ct, sk_s, sk_iv = sk_encrypt_totp(_gad_secret_clean.encode(), sk, vault)
             else:
                 sk_ct = sk_s = sk_iv = None
             with get_db() as c:
                 c.execute(
                     "INSERT INTO totp_accounts (vault_id, name, issuer, secret_enc, salt, iv, "
-                    "sk_enc, sk_salt, sk_iv, note, account_type, hotp_counter) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-                    (vault, name, "", ct, salt, iv, sk_ct, sk_s, sk_iv, "", "totp", 0),
+                    "sk_enc, sk_salt, sk_iv, note, account_type, hotp_counter, secret_hash) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (vault, name, "", ct, salt, iv, sk_ct, sk_s, sk_iv, "", "totp", 0, _gad_secret_hash),
                 )
                 c.commit()
             record_totp_add(vault)
@@ -5000,7 +5086,8 @@ async def adm_totp_limit_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await q.message.reply_text(
         f"TOTP Limit Settings\n\nGlobal Vault Max: {MAX_TOTP_PER_VAULT} per vault\n"
         f"Global Per-Minute: {MAX_TOTP_PER_MINUTE} per vault/min\n"
-        f"Duplicate Limit: {MAX_TOTP_DUPLICATE} per vault\n\n"
+        f"Duplicate Limit: {MAX_TOTP_DUPLICATE} per vault\n"
+        f"After limit: 20 attempts → vault banned 18h\n\n"
         f"Use Specific User buttons to override limits for individual vaults.",
         reply_markup=kb,
     )
