@@ -329,7 +329,7 @@ async def record_stat(event_type: str, telegram_id: int = 0, vault_id: str = "")
                     event_type, telegram_id, vault_id,
                 )
         except Exception as e:
-            logger.warning(f"await record_stat({event_type}): {e}")
+            logger.warning(f"record_stat({event_type}): {e}")
     asyncio.create_task(_do())
 
 async def _count_stat(event_type: str, since_ts: int) -> int:
@@ -735,16 +735,6 @@ def _load_bot_settings(conn=None):
     """Sync shim — kept for call-sites that haven't been converted yet.
     Safe to call; silently does nothing (settings already loaded async)."""
     pass
-
-async def _save_setting_async(key: str, value):
-    _bot_settings[key] = value
-    str_val = "true" if value is True else ("false" if value is False else str(value))
-    async with get_db() as c:
-        await c.execute(
-            "INSERT INTO bot_settings (key, value) VALUES ($1, $2) "
-            "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
-            key, str_val,
-        )
 
 def _save_setting_async(key: str, value):
     """Sync shim — fire-and-forget. Updates in-memory dict immediately, schedules DB write."""
@@ -1215,7 +1205,7 @@ def parse_tz(raw: str):
     """Parse user timezone input like +6, -5:30, +5:45 into a valid IANA tz string.
     Uses fixed-offset IANA names: Etc/GMT signs are INVERTED (POSIX convention),
     so we use a direct UTC±HH:MM approach via zoneinfo fixed offsets instead."""
-    m = re.match(r"^([+-])(\d{1,2})($1::(\d{2}))$2$", raw.strip())
+    m = re.match(r"^([+-])(\d{1,2})(?::(\d{2}))?$", raw.strip())
     if not m:
         return None
     sign, h, mn = m.group(1), int(m.group(2)), int(m.group(3) or 0)
@@ -1757,7 +1747,7 @@ async def login_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("📱 Login with My Telegram",            callback_data="login_auto")],
             [InlineKeyboardButton("🔑 Login with Vault/Telegram User ID", callback_data="login_manual")],
-            [InlineKeyboardButton("🔓 Forgot Password$1",                   callback_data="reset_pw_start")],
+            [InlineKeyboardButton("🔓 Forgot Password",                   callback_data="reset_pw_start")],
             [InlineKeyboardButton("❌ Cancel",                              callback_data="cancel_to_menu")],
         ]),
     )
@@ -3495,7 +3485,7 @@ async def share_generate(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         async with get_db() as c2:
             await c2.execute("DELETE FROM share_links WHERE token=$1", token)
     asyncio.create_task(_cleanup())
-    share_url  = f"https://t.me/{BOT_USERNAME}$1start={token}"
+    share_url  = f"https://t.me/{BOT_USERNAME}?start={token}"
     names_text = ", ".join(em(n) for n in final_names)
     exp_min    = SHARE_LINK_TTL // 60
     await q.edit_message_text(
@@ -3556,7 +3546,7 @@ async def handle_share_view(update: Update, token: str):
         except Exception as e:
             logger.error(f"Share view decrypt error idx={i}: {e}")
             lines.append(f"*{em(name)}*\n_\\[Unavailable\\]_")
-    refresh_url = f"https://t.me/{BOT_USERNAME}$1start={token}"
+    refresh_url = f"https://t.me/{BOT_USERNAME}?start={token}"
     text = (
         "📋 *Shared TOTP Codes*\n\n"
         + "\n\n".join(lines)
@@ -3674,7 +3664,7 @@ async def edit_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data["edit_id"]   = acc_id
     ctx.user_data["edit_name"] = row["name"]
     await q.edit_message_text(
-        f"✏️ *{em(row['name'])}*\n\nWhat would you like to do$1",
+        f"✏️ *{em(row['name'])}*\n\nWhat would you like to do?",
         parse_mode="MarkdownV2",
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("✏️ Rename",         callback_data="edit_action_rename")],
@@ -3733,7 +3723,7 @@ async def edit_action(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     else:  # delete
         name = ctx.user_data.get("edit_name", "")
         await q.edit_message_text(
-            f"🗑 Delete *{em(name)}*$1\n\n_This cannot be undone\\._",
+            f"🗑 Delete *{em(name)}*\n\n_This cannot be undone\\._",
             parse_mode="MarkdownV2",
             reply_markup=kb_danger("edit_action_delete_confirm", "edit_totp"),
         )
@@ -5663,7 +5653,7 @@ async def admin_group_message_handler(update: Update, ctx: ContextTypes.DEFAULT_
                     rows = dump[tbl]
                     if rows:
                         cols = ", ".join(rows[0].keys())
-                        placeholders = ", ".join("$1" for _ in rows[0])
+                        placeholders = ", ".join(str(i) for i in range(1, len(rows[0])+1))
                         for row in rows:
                             await c.execute(
                                 f"INSERT INTO {tbl} ({cols}) VALUES ({placeholders})",
@@ -6255,7 +6245,7 @@ async def admin_group_message_handler(update: Update, ctx: ContextTypes.DEFAULT_
                 rows = dump[tbl]
                 if rows:
                     cols = ", ".join(rows[0].keys())
-                    placeholders = ", ".join("$1" for _ in rows[0])
+                    placeholders = ", ".join(str(i) for i in range(1, len(rows[0])+1))
                     for row in rows:
                         await c.execute(
                             f"INSERT INTO {tbl} ({cols}) VALUES ({placeholders})",
