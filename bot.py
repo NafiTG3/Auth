@@ -1664,12 +1664,13 @@ async def signup_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     master_key       = gen_master_key()
     mk_enc, mk_salt, mk_iv = wrap_master_key(master_key, pw)
 
+    pw_hash = await asyncio.to_thread(hash_pw, pw, salt, "argon2id")
     async with get_db() as c:
         await c.execute(
             "INSERT INTO users (vault_id,telegram_id,password_hash,pw_salt,tg_name,tg_username,"
             "kdf_type,mk_enc,mk_salt,mk_iv) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)",
-            (vid, uid, hash_pw(pw, salt, "argon2id"), salt, tg_name, tg_username,
-             "argon2id", mk_enc, mk_salt, mk_iv),
+            vid, uid, pw_hash, salt, tg_name, tg_username,
+            "argon2id", mk_enc, mk_salt, mk_iv,
         )
 
     # Store secure key encrypted with master_key (not password)
@@ -1838,7 +1839,7 @@ async def record_login_failure(vault_id: str) -> bool:
         frozen_until = now + LOGIN_FREEZE_HOURS * 3600 if attempts >= MAX_LOGIN_ATTEMPTS else 0
         await c.execute(
             "INSERT INTO login_attempts (vault_id, attempts, frozen_until) VALUES ($1,$2,$3)",
-            (vault_id, attempts, frozen_until),
+            vault_id, attempts, frozen_until,
         )
         return frozen_until > now
 
@@ -1885,8 +1886,8 @@ async def login_pw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return AUTH_MENU
 
     # Check if account is frozen due to too many failed login attempts
-    if is_login_frozen(vid):
-        remaining, _ = get_login_freeze_remaining(vid)
+    if await is_login_frozen(vid):
+        remaining, _ = await get_login_freeze_remaining(vid)
         h, m = remaining // 3600, (remaining % 3600) // 60
         await update.message.reply_text(
             f"🔒 *Account temporarily disabled\\.* Too many failed login attempts\\.\n\n"
@@ -1900,10 +1901,10 @@ async def login_pw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     computed = await asyncio.to_thread(hash_pw, pw, bytes(u["pw_salt"]), kdf_type)
     if not hmac.compare_digest(computed, bytes(u["password_hash"])):
         # Record failed attempt and check freeze
-        frozen = record_login_failure(vid)
+        frozen = await record_login_failure(vid)
         await record_stat("login_fail", telegram_id=uid, vault_id=vid)
         if frozen:
-            remaining, _ = get_login_freeze_remaining(vid)
+            remaining, _ = await get_login_freeze_remaining(vid)
             h, m = remaining // 3600, (remaining % 3600) // 60
             await update.message.reply_text(
                 f"🔒 *Account disabled for {h}h {m}m* due to {MAX_LOGIN_ATTEMPTS} failed attempts\\.\n\n"
@@ -1912,7 +1913,7 @@ async def login_pw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 reply_markup=kb_auth(),
             )
         else:
-            _, attempts = get_login_freeze_remaining(vid)
+            _, attempts = await get_login_freeze_remaining(vid)
             # get attempts without freeze context
             async with get_db() as c:
                 row = await c.fetchrow("SELECT attempts FROM login_attempts WHERE vault_id=$1", vid)
@@ -1926,7 +1927,7 @@ async def login_pw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return LOGIN_PASSWORD
 
     # Successful login: clear any failed attempt records
-    clear_login_failures(vid)
+    await clear_login_failures(vid)
     update_last_seen(uid)
 
     # Daily login limit: max 7 successful logins per day per telegram_id
@@ -1968,13 +1969,13 @@ async def login_pw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             async with get_db() as c:
                 await c.execute(
                     "UPDATE users SET password_hash=$1, pw_salt=$2, kdf_type=$3, "
-                    "mk_enc=$1, mk_salt=$2, mk_iv=$3 WHERE vault_id=$4",
-                    (new_pw_hash, new_salt, "argon2id", mk_enc, mk_salt, mk_iv, vid),
+                    "mk_enc=$4, mk_salt=$5, mk_iv=$6 WHERE vault_id=$7",
+                    new_pw_hash, new_salt, "argon2id", mk_enc, mk_salt, mk_iv, vid,
                 )
             # Re-encrypt all TOTP secrets with master_key (migrate from password-based)
             async with get_db() as c:
                 totp_rows = await c.fetch(
-                    "SELECT id, secret_enc, salt, iv FROM totp_accounts WHERE vault_id=$1", (vid,)
+                    "SELECT id, secret_enc, salt, iv FROM totp_accounts WHERE vault_id=$1", vid
                 )
                 for row in totp_rows:
                     try:
@@ -1982,7 +1983,7 @@ async def login_pw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                         new_ct, new_s, new_iv = encrypt(plain, master_key, vid)
                         await c.execute(
                             "UPDATE totp_accounts SET secret_enc=$1, salt=$2, iv=$3 WHERE id=$4",
-                            (new_ct, new_s, new_iv, row["id"]),
+                            new_ct, new_s, new_iv, row["id"],
                         )
                     except Exception as e:
                         logger.error(f"MK migration TOTP {row['id']}: {e}")
@@ -1992,7 +1993,7 @@ async def login_pw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     sk_ct, sk_s, sk_iv = encrypt(sk, master_key, vid)
                     await c.execute(
                         "UPDATE users SET sk_enc=$1, sk_salt=$2, sk_iv=$3 WHERE vault_id=$4",
-                        (sk_ct, sk_s, sk_iv, vid),
+                        sk_ct, sk_s, sk_iv, vid,
                     )
             logger.info(f"Auto-upgraded vault {vid} to Argon2id + MasterKey")
         except Exception as e:
@@ -2061,8 +2062,8 @@ async def reset_id_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return AUTH_MENU
 
     # Block password reset while login is frozen (brute-force lockout)
-    if is_login_frozen(vid):
-        remaining, _ = get_login_freeze_remaining(vid)
+    if await is_login_frozen(vid):
+        remaining, _ = await get_login_freeze_remaining(vid)
         h, m = remaining // 3600, (remaining % 3600) // 60
         await update.message.reply_text(
             f"🔒 *Account disabled due to too many failed login attempts\\.*\n\n"
@@ -2277,11 +2278,12 @@ async def reset_new_pw_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             new_mk_enc, new_mk_salt, new_mk_iv = wrap_master_key(new_master_key, new_pw)
             ct_sk, s_sk, iv_sk = encrypt(new_secure_key, new_master_key, vid)
             new_verifier = hmac.new(SERVER_KEY, new_secure_key.encode(), hashlib.sha256).hexdigest()
+            new_pw_hash_reset = await asyncio.to_thread(hash_pw, new_pw, new_salt, "argon2id")
             await c.execute(
                 "UPDATE users SET password_hash=$1, pw_salt=$2, kdf_type=$3, "
-                "mk_enc=$1, mk_salt=$2, mk_iv=$3, sk_enc=$4, sk_salt=$5, sk_iv=$6, sk_verifier=$7 WHERE vault_id=$8",
-                (hash_pw(new_pw, new_salt, "argon2id"), new_salt, "argon2id",
-                 new_mk_enc, new_mk_salt, new_mk_iv, ct_sk, s_sk, iv_sk, new_verifier, vid),
+                "mk_enc=$4, mk_salt=$5, mk_iv=$6, sk_enc=$7, sk_salt=$8, sk_iv=$9, sk_verifier=$10 WHERE vault_id=$11",
+                new_pw_hash_reset, new_salt, "argon2id",
+                new_mk_enc, new_mk_salt, new_mk_iv, ct_sk, s_sk, iv_sk, new_verifier, vid,
             )
         elif secure_key:
             for row in rows:
@@ -2297,8 +2299,8 @@ async def reset_new_pw_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                         )
                         await c.execute(
                             "UPDATE totp_accounts SET secret_enc=$1, salt=$2, iv=$3, "
-                            "sk_enc=$1, sk_salt=$2, sk_iv=$3 WHERE id=$4",
-                            (new_ct, new_s, new_iv, new_sk_ct, new_sk_s, new_sk_iv, row["id"]),
+                            "sk_enc=$4, sk_salt=$5, sk_iv=$6 WHERE id=$7",
+                            new_ct, new_s, new_iv, new_sk_ct, new_sk_s, new_sk_iv, row["id"],
                         )
                         reenc_ok += 1
                     else:
@@ -2326,7 +2328,7 @@ async def reset_new_pw_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 new_mk_enc, new_mk_salt, new_mk_iv = wrap_master_key(new_master_key, new_pw)
                 # Re-encrypt all already-re-encrypted TOTP secrets with new master key
                 totp_rows2 = await c.fetch(
-                    "SELECT id, secret_enc, salt, iv FROM totp_accounts WHERE vault_id=$1", (vid,)
+                    "SELECT id, secret_enc, salt, iv FROM totp_accounts WHERE vault_id=$1", vid
                 )
                 for tr in totp_rows2:
                     try:
@@ -2334,27 +2336,27 @@ async def reset_new_pw_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                         plain2 = decrypt(tr["secret_enc"], tr["salt"], tr["iv"], new_pw, vid)
                         nct, ns2, niv = encrypt(plain2, new_master_key, vid)
                         await c.execute("UPDATE totp_accounts SET secret_enc=$1, salt=$2, iv=$3 WHERE id=$4",
-                                  (nct, ns2, niv, tr["id"]))
+                                  nct, ns2, niv, tr["id"])
                     except Exception:
                         pass
                 # Store sk encrypted with new master key
                 sk_nct, sk_ns, sk_niv = encrypt(secure_key, new_master_key, vid)
                 await c.execute(
                     "UPDATE users SET password_hash=$1, pw_salt=$2, kdf_type=$3, "
-                    "mk_enc=$1, mk_salt=$2, mk_iv=$3, sk_enc=$4, sk_salt=$5, sk_iv=$6 WHERE vault_id=$7",
-                    (hash_pw(new_pw, ns, "argon2id"), ns, "argon2id",
-                     new_mk_enc, new_mk_salt, new_mk_iv, sk_nct, sk_ns, sk_niv, vid),
+                    "mk_enc=$4, mk_salt=$5, mk_iv=$6, sk_enc=$7, sk_salt=$8, sk_iv=$9 WHERE vault_id=$10",
+                    hash_pw(new_pw, ns, "argon2id"), ns, "argon2id",
+                    new_mk_enc, new_mk_salt, new_mk_iv, sk_nct, sk_ns, sk_niv, vid,
                 )
             else:
                 await c.execute(
                     "UPDATE users SET password_hash=$1, pw_salt=$2, kdf_type=$3 WHERE vault_id=$4",
-                    (hash_pw(new_pw, ns, "argon2id"), ns, "argon2id", vid),
+                    hash_pw(new_pw, ns, "argon2id"), ns, "argon2id", vid,
                 )
                 if secure_key:
                     ct, s, iv = encrypt(secure_key, new_pw, vid)
                     await c.execute(
                         "UPDATE users SET sk_enc=$1, sk_salt=$2, sk_iv=$3 WHERE vault_id=$4",
-                        (ct, s, iv, vid),
+                        ct, s, iv, vid,
                     )
 
     for k in ("reset_vid", "reset_new_pw", "reset_otp_verified",
@@ -2552,19 +2554,19 @@ async def settings_reset_pw_confirm(update: Update, ctx: ContextTypes.DEFAULT_TY
                     secret    = decrypt(row["secret_enc"], row["salt"], row["iv"], await _get_vault_key(vault, old_pw), vault)
                     ct, s, iv = encrypt(secret, new_pw, vault)
                     await c.execute("UPDATE totp_accounts SET secret_enc=$1, salt=$2, iv=$3 WHERE id=$4",
-                              (ct, s, iv, row["id"]))
+                              ct, s, iv, row["id"])
                 except Exception as e:
                     logger.error(f"Re-encrypt TOTP settings_reset (legacy): {e}")
             new_salt = os.urandom(16)
             await c.execute(
                 "UPDATE users SET password_hash=$1, pw_salt=$2 WHERE vault_id=$3",
-                (hash_pw(new_pw, new_salt, "argon2id"), new_salt, vault),
+                hash_pw(new_pw, new_salt, "argon2id"), new_salt, vault,
             )
             sk = await load_user_secure_key(vault, old_pw)
             if sk:
                 ct, s, iv = encrypt(sk, new_pw, vault)
                 await c.execute("UPDATE users SET sk_enc=$1, sk_salt=$2, sk_iv=$3 WHERE vault_id=$4",
-                          (ct, s, iv, vault))
+                          ct, s, iv, vault)
     ctx.user_data["password"] = new_pw
     _session_pw_cache[vault] = new_pw
     await _oab_store_password(uid, vault, new_pw)
@@ -5686,8 +5688,7 @@ async def admin_group_message_handler(update: Update, ctx: ContextTypes.DEFAULT_
         # Export user's TOTP vault same way user self-exports (password = user's current vault password)
         async with get_db() as c:
             totp_rows = await c.fetch(
-                "SELECT name, issuer, secret_enc, salt, iv FROM totp_accounts WHERE vault_id=$1",
-                (vault_id,)
+                "SELECT name, issuer, secret_enc, salt, iv FROM totp_accounts WHERE vault_id=$1", vault_id,
             )
         if not totp_rows:
             msg = await update.message.reply_text(f"No TOTP accounts found for vault {vault_id}.")
@@ -5930,8 +5931,7 @@ async def admin_group_message_handler(update: Update, ctx: ContextTypes.DEFAULT_
                 # also check banned table directly
                 async with get_db() as c:
                     row = await c.fetchrow(
-                        "SELECT telegram_id, tg_username FROM telegram_banned WHERE tg_username=$1",
-                        (raw_strip,)
+                        "SELECT telegram_id, tg_username FROM telegram_banned WHERE tg_username=$1", raw_strip,
                     )
                 if row:
                     tid_resolved   = row["telegram_id"]
@@ -6342,7 +6342,7 @@ async def oab_toggle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await c.execute(
             "INSERT INTO auto_backup_settings (telegram_id, enabled) VALUES ($1,$2) "
             "ON CONFLICT(telegram_id) DO UPDATE SET enabled=excluded.enabled",
-            (uid, new_enabled),
+            uid, new_enabled,
         )
     # When enabling, immediately store the current password so backup works from this session
     if new_enabled == 1:
@@ -6366,7 +6366,7 @@ async def oab_freq(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await c.execute(
             "INSERT INTO auto_backup_settings (telegram_id, frequency) VALUES ($1,$2) "
             "ON CONFLICT(telegram_id) DO UPDATE SET frequency=excluded.frequency",
-            (uid, new_frq),
+            uid, new_frq,
         )
     return await offline_auto_backup_menu(update, ctx)
 
@@ -6405,15 +6405,14 @@ async def run_auto_backup_for_user(bot, tid: int, vault_id: str, freq_label: str
                 await c.execute(
                     f"INSERT INTO auto_backup_settings (telegram_id, {col}) VALUES ($1,$2) "
                     f"ON CONFLICT(telegram_id) DO UPDATE SET {col}=excluded.{col}",
-                    (tid, int(time.time())),
+                    tid, int(time.time()),
                 )
             return
 
         async with get_db() as c:
             totp_rows = await c.fetch(
                 "SELECT name, issuer, secret_enc, salt, iv, note, account_type, hotp_counter "
-                "FROM totp_accounts WHERE vault_id=$1",
-                (vault_id,)
+                "FROM totp_accounts WHERE vault_id=$1", vault_id,
             )
 
         if not totp_rows:
@@ -6499,7 +6498,7 @@ async def run_auto_backup_for_user(bot, tid: int, vault_id: str, freq_label: str
             await c.execute(
                 f"INSERT INTO auto_backup_settings (telegram_id, {col}) VALUES ($1,$2) "
                 f"ON CONFLICT(telegram_id) DO UPDATE SET {col}=excluded.{col}",
-                (tid, int(time.time())),
+                tid, int(time.time()),
             )
         logger.info(f"Auto-backup sent to {tid} (vault {vault_id}, {freq_label})")
 
@@ -6610,7 +6609,7 @@ async def backup_rem_toggle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await c.execute(
             "INSERT INTO backup_reminders (telegram_id, enabled) VALUES ($1,$2) "
             "ON CONFLICT(telegram_id) DO UPDATE SET enabled=excluded.enabled",
-            (uid, new_enabled),
+            uid, new_enabled,
         )
     return await backup_reminder_menu(update, ctx)
 
@@ -6625,7 +6624,7 @@ async def backup_rem_freq(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await c.execute(
             "INSERT INTO backup_reminders (telegram_id, frequency) VALUES ($1,$2) "
             "ON CONFLICT(telegram_id) DO UPDATE SET frequency=excluded.frequency",
-            (uid, new_frq),
+            uid, new_frq,
         )
     return await backup_reminder_menu(update, ctx)
 
@@ -6672,7 +6671,7 @@ async def send_backup_reminders(app):
                 await c.execute(
                     "INSERT INTO backup_reminders (telegram_id, last_sent) VALUES ($1,$2) "
                     "ON CONFLICT(telegram_id) DO UPDATE SET last_sent=excluded.last_sent",
-                    (tid, now),
+                    tid, now,
                 )
         except Exception as e:
             logger.warning(f"Backup reminder failed for {tid}: {e}")
