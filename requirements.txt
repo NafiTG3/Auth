@@ -1,4 +1,4 @@
-python-telegram-bot==21.6
+python-telegram-bot[job-queue]==21.6
 cryptography==43.0.3
 Pillow==10.4.0
 pyzbar==0.1.9
