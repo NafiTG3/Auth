@@ -6719,17 +6719,22 @@ async def main_menu_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     return TOTP_MENU
 
 # ── MAIN ────────────────────────────────────────────────────
-async def main():
+def main():
     if not SERVER_KEY:
         raise RuntimeError("ENCRYPTION_KEY environment variable is not set")
-    # ── Startup: init PostgreSQL pool + create tables ──────────
-    await init_db()
-    await purge_expired_share_links()
+
     token = os.environ["BOT_TOKEN"]
+
+    # post_init runs inside PTB's own event loop — safe place for async startup
+    async def _post_init(application):
+        await init_db()
+        await purge_expired_share_links()
+        logger.info("BV Authenticator Bot started.")
+
     app = (
         ApplicationBuilder()
         .token(token)
-        # concurrent_updates=True lets different users be served simultaneously
+        .post_init(_post_init)
         .concurrent_updates(True)
         .pool_timeout(30.0)
         .connect_timeout(30.0)
@@ -7046,8 +7051,8 @@ async def main():
             name="auto_backup_job",
         )
 
-    logger.info("BV Authenticator Bot started.")
+    logger.info("Bot polling started.")
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
