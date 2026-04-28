@@ -65,6 +65,19 @@ BACKUP_REMINDER_WEEKLY  = "weekly"
 BACKUP_REMINDER_MONTHLY = "monthly"
 BD_TZ = "Asia/Dhaka"       # Bangladesh timezone for admin panel
 
+# Admin-configurable defaults for offline backup schedule (weekday: Monday=0..Sunday=6)
+DEFAULT_OFFLINE_BACKUP_WEEKDAY      = 5    # Saturday (default)
+DEFAULT_OFFLINE_BACKUP_MONTHLY_DATE = 1    # 1st of each month (default)
+
+# Admin-configurable defaults for backup reminder schedule
+DEFAULT_REMINDER_WEEKDAY      = 5    # Saturday (default)
+DEFAULT_REMINDER_MONTHLY_DATE = 1    # 1st of each month (default)
+
+_WEEKDAY_MAP = {
+    "monday": 0, "tuesday": 1, "wednesday": 2, "thursday": 3,
+    "friday": 4, "saturday": 5, "sunday": 6,
+}
+
 # ── Rate limit constants ────────────────────────────────────
 TOTP_NAME_MAX_LEN      = 20    # max TOTP account name length
 MAX_DAILY_LOGINS       = 7     # max successful logins per day per telegram_id
@@ -4270,6 +4283,7 @@ async def _do_import(update_or_cb, ctx, vault: str, accounts: list, mode: str = 
                         )
                         existing_secrets.add(secret_hash)
                         nonlocal_import()
+                        record_stat("totp_added", vault_id=vault)  # count imports same as manual adds
                 except Exception as e:
                     logger.error(f"Import entry '{acc.get('name','?')}': {e}")
                     nonlocal_skip()
@@ -4940,7 +4954,7 @@ async def adm_backup_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("💾 Backup All Data",          callback_data="adm_backup_all")],
         [InlineKeyboardButton("📥 Restore All Data",         callback_data="adm_backup_restore")],
         [InlineKeyboardButton("👤 Backup Specific User Data",callback_data="adm_backup_specific")],
-        [InlineKeyboardButton("🔧 User Backup Control",      callback_data="adm_noop")],
+        [InlineKeyboardButton("🔧 User Backup Control",      callback_data="adm_backup_user_control")],
         [InlineKeyboardButton("⬅️ Back",                     callback_data="adm_back")],
     ])
     msg = await q.message.reply_text(
@@ -4973,6 +4987,105 @@ async def adm_backup_specific_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
     _admin_import_pending[update.effective_chat.id] = {"step": "adm_backup_specific_wait"}
     msg = await q.message.reply_text(
         "Provide the Telegram user ID or vault ID of the user whose vault you want to export."
+    )
+    asyncio.create_task(auto_delete_msg(msg, delay=120))
+
+
+async def adm_backup_user_control_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """User Backup Control: Offline Backup / Backup Reminder / Back."""
+    q = update.callback_query; await q.answer()
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("💾 Offline Backup",   callback_data="adm_buc_offline")],
+        [InlineKeyboardButton("🔔 Backup Reminder",  callback_data="adm_buc_reminder")],
+        [InlineKeyboardButton("⬅️ Back",             callback_data="adm_backup")],
+    ])
+    msg = await q.message.reply_text(
+        "🔧 User Backup Control\n\nManage default schedules for all users.",
+        reply_markup=kb,
+    )
+    asyncio.create_task(auto_delete_msg(msg, delay=300))
+
+
+async def adm_buc_offline_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Offline Backup sub-menu: Weekly Day / Monthly Date / Back."""
+    q = update.callback_query; await q.answer()
+    wd  = list(_WEEKDAY_MAP.keys())[DEFAULT_OFFLINE_BACKUP_WEEKDAY].capitalize()
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"📅 Weekly Offline Backup Day  ({wd})",       callback_data="adm_buc_offline_weekly")],
+        [InlineKeyboardButton(f"📆 Monthly Offline Backup Date  ({DEFAULT_OFFLINE_BACKUP_MONTHLY_DATE}th)", callback_data="adm_buc_offline_monthly")],
+        [InlineKeyboardButton("⬅️ Back", callback_data="adm_backup_user_control")],
+    ])
+    msg = await q.message.reply_text(
+        f"💾 Offline Backup Schedule\n\n"
+        f"Weekly backup day: {wd}\n"
+        f"Monthly backup date: {DEFAULT_OFFLINE_BACKUP_MONTHLY_DATE}\n\n"
+        f"Backups run at 20:00 BDT for users with offline backup enabled.",
+        reply_markup=kb,
+    )
+    asyncio.create_task(auto_delete_msg(msg, delay=300))
+
+
+async def adm_buc_offline_weekly_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Ask for weekly offline backup day."""
+    q = update.callback_query; await q.answer()
+    _admin_import_pending[update.effective_chat.id] = {"step": "adm_buc_offline_weekly_wait"}
+    msg = await q.message.reply_text(
+        "Which day would you like to set as the default for weekly offline backups? "
+        "Please write the full name of the day in English. "
+        "For example: 'Saturday', 'Sunday'"
+    )
+    asyncio.create_task(auto_delete_msg(msg, delay=120))
+
+
+async def adm_buc_offline_monthly_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Ask for monthly offline backup date."""
+    q = update.callback_query; await q.answer()
+    _admin_import_pending[update.effective_chat.id] = {"step": "adm_buc_offline_monthly_wait"}
+    msg = await q.message.reply_text(
+        "Which Date would you like to set as the default for monthly backups? "
+        "Please write in integer."
+    )
+    asyncio.create_task(auto_delete_msg(msg, delay=120))
+
+
+async def adm_buc_reminder_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Backup Reminder sub-menu: Weekly Day / Monthly Date / Back."""
+    q = update.callback_query; await q.answer()
+    wd  = list(_WEEKDAY_MAP.keys())[DEFAULT_REMINDER_WEEKDAY].capitalize()
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"📅 Weekly Reminder Day  ({wd})",        callback_data="adm_buc_reminder_weekly")],
+        [InlineKeyboardButton(f"📆 Monthly Reminder Date  ({DEFAULT_REMINDER_MONTHLY_DATE}th)", callback_data="adm_buc_reminder_monthly")],
+        [InlineKeyboardButton("⬅️ Back", callback_data="adm_backup_user_control")],
+    ])
+    msg = await q.message.reply_text(
+        f"🔔 Backup Reminder Schedule\n\n"
+        f"Weekly reminder day: {wd}\n"
+        f"Monthly reminder date: {DEFAULT_REMINDER_MONTHLY_DATE}\n\n"
+        f"Reminders sent at 20:00 BDT for users with reminders enabled.",
+        reply_markup=kb,
+    )
+    asyncio.create_task(auto_delete_msg(msg, delay=300))
+
+
+async def adm_buc_reminder_weekly_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Ask for weekly reminder day."""
+    q = update.callback_query; await q.answer()
+    _admin_import_pending[update.effective_chat.id] = {"step": "adm_buc_reminder_weekly_wait"}
+    msg = await q.message.reply_text(
+        "Which day would you like to set as the default for weekly reminders? "
+        "Please write the full name of the day in English. "
+        "For example: 'Saturday', 'Sunday'"
+    )
+    asyncio.create_task(auto_delete_msg(msg, delay=120))
+
+
+async def adm_buc_reminder_monthly_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Ask for monthly reminder date."""
+    q = update.callback_query; await q.answer()
+    _admin_import_pending[update.effective_chat.id] = {"step": "adm_buc_reminder_monthly_wait"}
+    msg = await q.message.reply_text(
+        "Which Date would you like to set as the default for monthly reminders? "
+        "Please write in integer."
     )
     asyncio.create_task(auto_delete_msg(msg, delay=120))
 
@@ -6164,6 +6277,68 @@ async def admin_group_message_handler(update: Update, ctx: ContextTypes.DEFAULT_
         asyncio.create_task(auto_delete_msg(msg, delay=60))
         return
 
+    if step == "adm_buc_offline_weekly_wait":
+        _admin_import_pending.pop(chat_id, None)
+        asyncio.create_task(auto_delete_msg(update.message, delay=5))
+        day_lower = raw.strip().lower()
+        if day_lower not in _WEEKDAY_MAP:
+            msg = await update.message.reply_text(
+                "Invalid day. Please write the full English name, e.g. 'Saturday'."
+            )
+            asyncio.create_task(auto_delete_msg(msg, delay=60))
+            return
+        globals()["DEFAULT_OFFLINE_BACKUP_WEEKDAY"] = _WEEKDAY_MAP[day_lower]
+        msg = await update.message.reply_text(
+            f"✅ Weekly offline backup day set to {raw.strip().capitalize()}."
+        )
+        asyncio.create_task(auto_delete_msg(msg, delay=60))
+        return
+
+    if step == "adm_buc_offline_monthly_wait":
+        _admin_import_pending.pop(chat_id, None)
+        asyncio.create_task(auto_delete_msg(update.message, delay=5))
+        if not raw.isdigit() or not (1 <= int(raw) <= 28):
+            msg = await update.message.reply_text("Invalid date. Enter a number between 1 and 28.")
+            asyncio.create_task(auto_delete_msg(msg, delay=60))
+            return
+        globals()["DEFAULT_OFFLINE_BACKUP_MONTHLY_DATE"] = int(raw)
+        msg = await update.message.reply_text(
+            f"✅ Monthly offline backup date set to {raw}."
+        )
+        asyncio.create_task(auto_delete_msg(msg, delay=60))
+        return
+
+    if step == "adm_buc_reminder_weekly_wait":
+        _admin_import_pending.pop(chat_id, None)
+        asyncio.create_task(auto_delete_msg(update.message, delay=5))
+        day_lower = raw.strip().lower()
+        if day_lower not in _WEEKDAY_MAP:
+            msg = await update.message.reply_text(
+                "Invalid day. Please write the full English name, e.g. 'Saturday'."
+            )
+            asyncio.create_task(auto_delete_msg(msg, delay=60))
+            return
+        globals()["DEFAULT_REMINDER_WEEKDAY"] = _WEEKDAY_MAP[day_lower]
+        msg = await update.message.reply_text(
+            f"✅ Weekly reminder day set to {raw.strip().capitalize()}."
+        )
+        asyncio.create_task(auto_delete_msg(msg, delay=60))
+        return
+
+    if step == "adm_buc_reminder_monthly_wait":
+        _admin_import_pending.pop(chat_id, None)
+        asyncio.create_task(auto_delete_msg(update.message, delay=5))
+        if not raw.isdigit() or not (1 <= int(raw) <= 28):
+            msg = await update.message.reply_text("Invalid date. Enter a number between 1 and 28.")
+            asyncio.create_task(auto_delete_msg(msg, delay=60))
+            return
+        globals()["DEFAULT_REMINDER_MONTHLY_DATE"] = int(raw)
+        msg = await update.message.reply_text(
+            f"✅ Monthly reminder date set to {raw}."
+        )
+        asyncio.create_task(auto_delete_msg(msg, delay=60))
+        return
+
     if step == "adm_weekly_signup_limit_wait":
         _admin_import_pending.pop(chat_id, None)
         asyncio.create_task(auto_delete_msg(update.message, delay=5))
@@ -6631,10 +6806,10 @@ async def send_auto_backups(app):
     minute  = now_bd.minute
     day     = now_bd.day
 
-    # Weekly window:  Saturday 20:00-20:09 BDT
-    is_weekly_window  = (weekday == 5 and hour == 20 and minute < 10)
-    # Monthly window: first Sunday (day<=7) 18:00-18:09 BDT
-    is_monthly_window = (weekday == 6 and day <= 7 and hour == 18 and minute < 10)
+    # Weekly window: admin-configured day at 20:00 BDT
+    is_weekly_window  = (weekday == DEFAULT_OFFLINE_BACKUP_WEEKDAY and hour == 20 and minute < 10)
+    # Monthly window: admin-configured date at 20:00 BDT
+    is_monthly_window = (day == DEFAULT_OFFLINE_BACKUP_MONTHLY_DATE and hour == 20 and minute < 10)
 
     if not is_weekly_window and not is_monthly_window:
         return
@@ -6740,14 +6915,28 @@ async def backup_rem_freq(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def send_backup_reminders(app):
     """
     Job callback: send backup reminders to users who are due.
-    Called by job queue once per day.
-    Default state: enabled=1, weekly. Users with no row in backup_reminders get weekly reminders.
+    Runs every 5 minutes. Fires on admin-configured day/date at 20:00 BDT.
+    Only sends to users with reminders enabled.
     """
-    now     = int(time.time())
-    week_s  = 7  * 24 * 3600
-    month_s = 30 * 24 * 3600
+    try:
+        now_bd = _dt.datetime.now(_BDT)
+    except Exception:
+        now_bd = _dt.datetime.utcnow() + _dt.timedelta(hours=6)
 
-    # Get all users; LEFT JOIN with backup_reminders to include users with no preference row
+    weekday = now_bd.weekday()
+    hour    = now_bd.hour
+    minute  = now_bd.minute
+    day     = now_bd.day
+
+    # Weekly window: admin-configured day at 20:00 BDT
+    is_weekly_window  = (weekday == DEFAULT_REMINDER_WEEKDAY and hour == 20 and minute < 10)
+    # Monthly window: admin-configured date at 20:00 BDT
+    is_monthly_window = (day == DEFAULT_REMINDER_MONTHLY_DATE and hour == 20 and minute < 10)
+
+    if not is_weekly_window and not is_monthly_window:
+        return
+
+    now_ts = int(time.time())
     with get_db() as c:
         rows = c.execute("""
             SELECT u.telegram_id,
@@ -6761,9 +6950,14 @@ async def send_backup_reminders(app):
     for row in rows:
         if not row["enabled"]:
             continue
-        freq     = row["frequency"]
-        interval = week_s if freq == BACKUP_REMINDER_WEEKLY else month_s
-        if now - row["last_sent"] < interval:
+        freq = row["frequency"]
+        # Only fire on the matching window
+        if freq == BACKUP_REMINDER_WEEKLY and not is_weekly_window:
+            continue
+        if freq == BACKUP_REMINDER_MONTHLY and not is_monthly_window:
+            continue
+        # Don't double-send within 6 hours
+        if now_ts - (row["last_sent"] or 0) < 6 * 3600:
             continue
         tid = row["telegram_id"]
         try:
@@ -6781,7 +6975,7 @@ async def send_backup_reminders(app):
                 c.execute(
                     "INSERT INTO backup_reminders (telegram_id, last_sent) VALUES (?,?) "
                     "ON CONFLICT(telegram_id) DO UPDATE SET last_sent=excluded.last_sent",
-                    (tid, now),
+                    (tid, now_ts),
                 )
                 c.commit()
         except Exception as e:
@@ -7076,10 +7270,17 @@ def main():
             return _guarded
 
         app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_noop_cb),                  pattern="^adm_noop$"))
-        app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_backup_cb),              pattern="^adm_backup$"))
-        app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_backup_all_cb),          pattern="^adm_backup_all$"))
-        app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_backup_restore_cb),      pattern="^adm_backup_restore$"))
-        app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_backup_specific_cb),     pattern="^adm_backup_specific$"))
+        app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_backup_cb),                   pattern="^adm_backup$"))
+        app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_backup_all_cb),               pattern="^adm_backup_all$"))
+        app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_backup_restore_cb),           pattern="^adm_backup_restore$"))
+        app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_backup_specific_cb),          pattern="^adm_backup_specific$"))
+        app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_backup_user_control_cb),      pattern="^adm_backup_user_control$"))
+        app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_buc_offline_cb),              pattern="^adm_buc_offline$"))
+        app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_buc_offline_weekly_cb),       pattern="^adm_buc_offline_weekly$"))
+        app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_buc_offline_monthly_cb),      pattern="^adm_buc_offline_monthly$"))
+        app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_buc_reminder_cb),             pattern="^adm_buc_reminder$"))
+        app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_buc_reminder_weekly_cb),      pattern="^adm_buc_reminder_weekly$"))
+        app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_buc_reminder_monthly_cb),     pattern="^adm_buc_reminder_monthly$"))
         app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_user_control_cb),        pattern="^adm_user_control$"))
         app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_uc_enable_cb),           pattern="^adm_uc_enable$"))
         app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_uc_disable_cb),          pattern="^adm_uc_disable$"))
