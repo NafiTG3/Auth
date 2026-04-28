@@ -59,6 +59,7 @@ LOGIN_FREEZE_HOURS  = 18    # freeze duration
 TOTP_PER_PAGE       = 5     # TOTP entries per page in list view
 MAX_TOTP_PER_VAULT  = 200   # max TOTP accounts per vault
 MAX_TOTP_DUPLICATE  = 15    # max duplicate TOTP entries allowed per vault
+TOTP_ADD_ENABLED    = True  # global toggle: False = no user can add new TOTP accounts
 NOTE_MAX_LEN        = 10    # max note characters
 BACKUP_REMINDER_WEEKLY  = "weekly"
 BACKUP_REMINDER_MONTHLY = "monthly"
@@ -2696,14 +2697,12 @@ async def view_secure_key_pw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not u:
         await update.message.reply_text("Session expired\\. /start", parse_mode="MarkdownV2", reply_markup=kb_auth())
         return AUTH_MENU
-    if not hmac.compare_digest(hash_pw(pw, bytes(u["pw_salt"]), u["kdf_type"] or "pbkdf2"), bytes(u["password_hash"])):
-        await update.message.reply_text(
-            "❌ *Wrong password\\.*",
-            parse_mode="MarkdownV2",
-            reply_markup=kb_main(),
-        )
+    _kdf_vsk = u["kdf_type"] or "pbkdf2"
+    _comp_vsk = await asyncio.to_thread(hash_pw, pw, bytes(u["pw_salt"]), _kdf_vsk)
+    if not hmac.compare_digest(_comp_vsk, bytes(u["password_hash"])):
+        await update.message.reply_text("❌ *Wrong password\\.*", parse_mode="MarkdownV2", reply_markup=kb_main())
         return TOTP_MENU
-    sk = load_user_secure_key(vault, pw)
+    sk = await asyncio.to_thread(load_user_secure_key, vault, pw)
     if not sk:
         await update.message.reply_text(
             "⚠️ *Secure Key not found\\.* Your account may have been created before this feature\\.",
@@ -2920,12 +2919,13 @@ async def change_pw_old(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid   = update.effective_user.id
     vault = get_session(uid)
     u     = get_user(vault)
-    if not u or not hmac.compare_digest(hash_pw(pw, bytes(u["pw_salt"]), u["kdf_type"] or "pbkdf2"), bytes(u["password_hash"])):
-        await update.message.reply_text(
-            "❌ Wrong password\\.",
-            parse_mode="MarkdownV2",
-            reply_markup=kb_cancel(),
-        )
+    if not u:
+        await update.message.reply_text("❌ Wrong password\\.", parse_mode="MarkdownV2", reply_markup=kb_cancel())
+        return CHANGE_PW_OLD
+    _kdf_cpw = u["kdf_type"] or "pbkdf2"
+    _computed_cpw = await asyncio.to_thread(hash_pw, pw, bytes(u["pw_salt"]), _kdf_cpw)
+    if not hmac.compare_digest(_computed_cpw, bytes(u["password_hash"])):
+        await update.message.reply_text("❌ Wrong password\\.", parse_mode="MarkdownV2", reply_markup=kb_cancel())
         return CHANGE_PW_OLD
     await update.message.reply_text(
         "✅ Verified\\. Enter *new password* \\(min 6 chars\\):",
@@ -2978,15 +2978,18 @@ async def change_pw_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if u and u["mk_enc"]:
         # New architecture: only re-wrap the master key with new password
         try:
-            master_key = unwrap_master_key(u["mk_enc"], u["mk_salt"], u["mk_iv"], old_pw)
-            new_mk_enc, new_mk_salt, new_mk_iv = wrap_master_key(master_key, new_pw)
-            ns = os.urandom(16)
+            def _rewrap():
+                mk  = unwrap_master_key(u["mk_enc"], u["mk_salt"], u["mk_iv"], old_pw)
+                enc, salt, iv = wrap_master_key(mk, new_pw)
+                ns  = os.urandom(16)
+                new_hash = hash_pw(new_pw, ns, "argon2id")
+                return enc, salt, iv, ns, new_hash
+            new_mk_enc, new_mk_salt, new_mk_iv, ns, new_hash = await asyncio.to_thread(_rewrap)
             with get_db() as c:
                 c.execute(
                     "UPDATE users SET password_hash=?, pw_salt=?, kdf_type=?, "
                     "mk_enc=?, mk_salt=?, mk_iv=? WHERE vault_id=?",
-                    (hash_pw(new_pw, ns, "argon2id"), ns, "argon2id",
-                     new_mk_enc, new_mk_salt, new_mk_iv, vault),
+                    (new_hash, ns, "argon2id", new_mk_enc, new_mk_salt, new_mk_iv, vault),
                 )
                 c.commit()
         except Exception as e:
@@ -2998,29 +3001,37 @@ async def change_pw_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return TOTP_MENU
     else:
         # Legacy path: re-encrypt all TOTP secrets and sk with new password
-        with get_db() as c:
-            rows = c.execute(
-                "SELECT id, secret_enc, salt, iv FROM totp_accounts WHERE vault_id=?", (vault,)
-            ).fetchall()
-            for row in rows:
-                try:
-                    secret    = decrypt(row["secret_enc"], row["salt"], row["iv"], _get_vault_key(vault, old_pw), vault)
-                    ct, s, iv = encrypt(secret, new_pw, vault)
-                    c.execute("UPDATE totp_accounts SET secret_enc=?, salt=?, iv=? WHERE id=?",
-                              (ct, s, iv, row["id"]))
-                except Exception as e:
-                    logger.error(f"Re-encrypt TOTP during change_pw (legacy): {e}")
-            ns = os.urandom(16)
-            c.execute(
-                "UPDATE users SET password_hash=?, pw_salt=? WHERE vault_id=?",
-                (hash_pw(new_pw, ns, "argon2id"), ns, vault),
-            )
-            sk = load_user_secure_key(vault, old_pw)
-            if sk:
-                ct, s, iv = encrypt(sk, new_pw, vault)
-                c.execute("UPDATE users SET sk_enc=?, sk_salt=?, sk_iv=? WHERE vault_id=?",
-                          (ct, s, iv, vault))
-            c.commit()
+        processing_msg = await update.message.reply_text("⏳ Updating password, please wait...")
+        def _legacy_reencrypt():
+            old_vk = _get_vault_key(vault, old_pw)   # compute once
+            with get_db() as c:
+                rows = c.execute(
+                    "SELECT id, secret_enc, salt, iv FROM totp_accounts WHERE vault_id=?", (vault,)
+                ).fetchall()
+                for row in rows:
+                    try:
+                        secret    = decrypt(row["secret_enc"], row["salt"], row["iv"], old_vk, vault)
+                        ct, s, iv = encrypt(secret, new_pw, vault)
+                        c.execute("UPDATE totp_accounts SET secret_enc=?, salt=?, iv=? WHERE id=?",
+                                  (ct, s, iv, row["id"]))
+                    except Exception as e:
+                        logger.error(f"Re-encrypt TOTP during change_pw (legacy): {e}")
+                ns = os.urandom(16)
+                c.execute(
+                    "UPDATE users SET password_hash=?, pw_salt=? WHERE vault_id=?",
+                    (hash_pw(new_pw, ns, "argon2id"), ns, vault),
+                )
+                sk = load_user_secure_key(vault, old_pw)
+                if sk:
+                    ct, s, iv = encrypt(sk, new_pw, vault)
+                    c.execute("UPDATE users SET sk_enc=?, sk_salt=?, sk_iv=? WHERE vault_id=?",
+                              (ct, s, iv, vault))
+                c.commit()
+        await asyncio.to_thread(_legacy_reencrypt)
+        try:
+            await processing_msg.delete()
+        except Exception:
+            pass
     ctx.user_data["password"] = new_pw
     _session_pw_cache[vault] = new_pw
     _oab_store_password(uid, vault, new_pw)
@@ -3038,6 +3049,18 @@ async def add_totp_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not get_session(update.effective_user.id):
         await q.edit_message_text("Session expired\\. /start", parse_mode="MarkdownV2", reply_markup=kb_auth())
         return AUTH_MENU
+    # Maintenance mode blocks TOTP add too
+    if is_maintenance():
+        await q.edit_message_text(MAINTENANCE_MSG, parse_mode="MarkdownV2", reply_markup=kb_main())
+        return TOTP_MENU
+    # Global TOTP add toggle check
+    if not TOTP_ADD_ENABLED:
+        await q.edit_message_text(
+            "⚠️ *Adding new TOTP accounts is currently disabled\\.*",
+            parse_mode="MarkdownV2",
+            reply_markup=kb_main(),
+        )
+        return TOTP_MENU
     await q.edit_message_text(
         "➕ *Add New TOTP*\n\n"
         "Send any of the following:\n"
@@ -3126,6 +3149,14 @@ async def _do_save_totp(update, vault, data, pw):
     return TOTP_MENU
 
 async def _process_input(update, ctx, vault, pw):
+    # If TOTP add is disabled globally, block all input methods
+    if not TOTP_ADD_ENABLED:
+        await update.message.reply_text(
+            "⚠️ *Adding new TOTP accounts is currently disabled\\.*",
+            parse_mode="MarkdownV2",
+            reply_markup=kb_main(),
+        )
+        return TOTP_MENU, True
     file_obj = None
     if update.message.photo:
         file_obj = await update.message.photo[-1].get_file()
@@ -3331,36 +3362,29 @@ async def _render_list_page(q_or_msg, vault: str, pw: str, page: int, is_edit: b
     page        = max(0, min(page, total_pages - 1))
     chunk       = rows[page * TOTP_PER_PAGE : (page + 1) * TOTP_PER_PAGE]
 
-    entries = []
-    for i, row in enumerate(chunk, start=page * TOTP_PER_PAGE + 1):
-        try:
-            secret = decrypt(row["secret_enc"], row["salt"], row["iv"], _get_vault_key(vault, pw), vault)
-            note     = (row["note"] or "").strip()
-            code, remain, next_code = generate_code(secret)
-
-            # Format TOTP code: "123 456"
-            code_fmt  = code
-            time_line = f"{bar(remain)} {remain}s"
-
-            # Next code display
-            next_line = f"Next code: `{next_code}`" if next_code else ""
-
-            note_line = f"Note: {em(note)}" if note else ""
-
-            # Build entry block
-            name_line = f"*{i}\\. {em(row['name'])}*"
-            if row["issuer"]:
-                name_line += f" \\| _{em(row['issuer'])}_"
-
-            block = [name_line, f"Current Code: `{code}` {time_line}"]
-            if next_line:
-                block.append(next_line)
-            if note_line:
-                block.append(note_line)
-            entries.append("\n".join(block))
-        except Exception as e:
-            logger.error(f"List TOTP error: {e}")
-            entries.append(f"*{i}\\. {em(row['name'])}*\n_\\[Decrypt error\\]_")
+    def _decrypt_page():
+        vault_key = _get_vault_key(vault, pw)   # one Argon2/PBKDF2 call for whole page
+        _entries  = []
+        for i, row in enumerate(chunk, start=page * TOTP_PER_PAGE + 1):
+            try:
+                secret    = decrypt(row["secret_enc"], row["salt"], row["iv"], vault_key, vault)
+                note      = (row["note"] or "").strip()
+                code, remain, next_code = generate_code(secret)
+                time_line = f"{bar(remain)} {remain}s"
+                next_line = f"Next code: `{next_code}`" if next_code else ""
+                note_line = f"Note: {em(note)}" if note else ""
+                name_line = f"*{i}\\. {em(row['name'])}*"
+                if row["issuer"]:
+                    name_line += f" \\| _{em(row['issuer'])}_"
+                block = [name_line, f"Current Code: `{code}` {time_line}"]
+                if next_line: block.append(next_line)
+                if note_line: block.append(note_line)
+                _entries.append("\n".join(block))
+            except Exception as e:
+                logger.error(f"List TOTP error: {e}")
+                _entries.append(f"*{i}\\. {em(row['name'])}*\n_\\[Decrypt error\\]_")
+        return _entries
+    entries = await asyncio.to_thread(_decrypt_page)
 
     header = f"📋 *Your TOTP Codes* \\({page+1}/{total_pages}\\)\n\n"
     text   = header + "\n\n".join(entries)
@@ -3521,9 +3545,10 @@ async def share_generate(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     secrets_enc = []
     final_ids   = []
     final_names = []
+    _vk_share = await asyncio.to_thread(_get_vault_key, vault, pw)
     for db_row in db_rows:
         try:
-            plain = decrypt(db_row["secret_enc"], db_row["salt"], db_row["iv"], _get_vault_key(vault, pw), vault)
+            plain = decrypt(db_row["secret_enc"], db_row["salt"], db_row["iv"], _vk_share, vault)
             enc   = share_encrypt_secret(plain, token)
             secrets_enc.append(enc)
             final_ids.append(db_row["id"])
@@ -3866,14 +3891,14 @@ async def show_secret_pw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not u:
         await update.message.reply_text("Session expired\\. /start", parse_mode="MarkdownV2", reply_markup=kb_auth())
         return AUTH_MENU
-    if not hmac.compare_digest(hash_pw(pw, bytes(u["pw_salt"]), u["kdf_type"] or "pbkdf2"), bytes(u["password_hash"])):
+    _kdf_ssp = u["kdf_type"] or "pbkdf2"
+    _comp_ssp = await asyncio.to_thread(hash_pw, pw, bytes(u["pw_salt"]), _kdf_ssp)
+    if not hmac.compare_digest(_comp_ssp, bytes(u["password_hash"])):
         await update.message.reply_text(
             "❌ *Wrong password\\.* Secret key not revealed\\.",
-            parse_mode="MarkdownV2",
-            reply_markup=kb_main(),
+            parse_mode="MarkdownV2", reply_markup=kb_main(),
         )
-        ctx.user_data.pop("edit_id", None)
-        ctx.user_data.pop("edit_name", None)
+        ctx.user_data.pop("edit_id", None); ctx.user_data.pop("edit_name", None)
         return TOTP_MENU
     with get_db() as c:
         row = c.execute(
@@ -3881,16 +3906,12 @@ async def show_secret_pw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             (acc_id, vault),
         ).fetchone()
     if not row:
-        await update.message.reply_text(
-            "⚠️ Account not found\\.",
-            parse_mode="MarkdownV2",
-            reply_markup=kb_main(),
-        )
-        ctx.user_data.pop("edit_id", None)
-        ctx.user_data.pop("edit_name", None)
+        await update.message.reply_text("⚠️ Account not found\\.", parse_mode="MarkdownV2", reply_markup=kb_main())
+        ctx.user_data.pop("edit_id", None); ctx.user_data.pop("edit_name", None)
         return TOTP_MENU
     try:
-        secret = decrypt(row["secret_enc"], row["salt"], row["iv"], _get_vault_key(vault, pw), vault)
+        _vk_ssp = await asyncio.to_thread(_get_vault_key, vault, pw)
+        secret  = decrypt(row["secret_enc"], row["salt"], row["iv"], _vk_ssp, vault)
     except Exception as e:
         logger.error(f"Decrypt for show_secret failed: {e}")
         await update.message.reply_text(
@@ -4404,6 +4425,9 @@ async def global_auto_detect(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # Update last_seen for every message interaction
     if vault:
         update_last_seen(uid)
+    # If TOTP add is globally disabled, block QR/otpauth detection here too
+    if not TOTP_ADD_ENABLED and vault and pw:
+        return
     if not vault or not pw:
         return
 
@@ -4429,27 +4453,27 @@ async def global_auto_detect(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     ]),
                 )
                 return
-            entries = []
-            for i, row in enumerate(matched, 1):
-                try:
-                    secret   = decrypt(row["secret_enc"], row["salt"], row["iv"], _get_vault_key(vault, pw), vault)
-                    note     = (row["note"] or "").strip()
-                    code, remain, next_code = generate_code(secret)
-                    code_fmt  = code
-                    time_line = f"{bar(remain)} {remain}s"
-                    nf = next_code if next_code else ""
-                    name_line = f"*{i}\\. {em(row['name'])}*"
-                    if row["issuer"]:
-                        name_line += f" \\| _{em(row['issuer'])}_"
-                    block = [name_line, f"Current Code: `{code}` {time_line}"]
-                    if nf:
-                        block.append(f"Next code: `{nf}`")
-                    if note:
-                        block.append(f"Note: {em(note)}")
-                    entries.append("\n".join(block))
-                except Exception as e:
-                    logger.error(f"Hash-search decrypt: {e}")
-                    entries.append(f"*{i}\\. {em(row['name'])}*\n_\\[Decrypt error\\]_")
+            def _hash_search_decrypt():
+                vk = _get_vault_key(vault, pw)
+                _entries = []
+                for i, row in enumerate(matched, 1):
+                    try:
+                        secret    = decrypt(row["secret_enc"], row["salt"], row["iv"], vk, vault)
+                        note      = (row["note"] or "").strip()
+                        code, remain, next_code = generate_code(secret)
+                        time_line = f"{bar(remain)} {remain}s"
+                        name_line = f"*{i}\\. {em(row['name'])}*"
+                        if row["issuer"]:
+                            name_line += f" \\| _{em(row['issuer'])}_"
+                        block = [name_line, f"Current Code: `{code}` {time_line}"]
+                        if next_code: block.append(f"Next code: `{next_code}`")
+                        if note:      block.append(f"Note: {em(note)}")
+                        _entries.append("\n".join(block))
+                    except Exception as e:
+                        logger.error(f"Hash-search decrypt: {e}")
+                        _entries.append(f"*{i}\\. {em(row['name'])}*\n_\\[Decrypt error\\]_")
+                return _entries
+            entries = await asyncio.to_thread(_hash_search_decrypt)
             result_text = (
                 f"🔍 *\\#search:* `{em(query)}` — *{len(matched)} found*\n\n"
                 + "\n\n".join(entries)
@@ -4604,28 +4628,29 @@ async def search_totp_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             ]),
         )
         return TOTP_MENU
-    entries = []
-    for i, row in enumerate(matched, 1):
-        try:
-            secret = decrypt(row["secret_enc"], row["salt"], row["iv"], _get_vault_key(vault, pw), vault)
-            note     = (row["note"] or "").strip()
-            code, remain, next_code = generate_code(secret)
-            code_fmt  = code
-            time_line = f"{bar(remain)} {remain}s"
-            next_line = f"Next code: `{next_code}`" if next_code else ""
-            note_line = f"Note: {em(note)}" if note else ""
-            name_line = f"*{i}\\. {em(row['name'])}*"
-            if row["issuer"]:
-                name_line += f" \\| _{em(row['issuer'])}_"
-            block = [name_line, f"Current Code: `{code}` {time_line}"]
-            if next_line:
-                block.append(next_line)
-            if note_line:
-                block.append(note_line)
-            entries.append("\n".join(block))
-        except Exception as e:
-            logger.error(f"Search TOTP decrypt error: {e}")
-            entries.append(f"*{i}\\. {em(row['name'])}*\n_\\[Decrypt error\\]_")
+    def _search_decrypt():
+        vk = _get_vault_key(vault, pw)
+        _entries = []
+        for i, row in enumerate(matched, 1):
+            try:
+                secret    = decrypt(row["secret_enc"], row["salt"], row["iv"], vk, vault)
+                note      = (row["note"] or "").strip()
+                code, remain, next_code = generate_code(secret)
+                time_line = f"{bar(remain)} {remain}s"
+                next_line = f"Next code: `{next_code}`" if next_code else ""
+                note_line = f"Note: {em(note)}" if note else ""
+                name_line = f"*{i}\\. {em(row['name'])}*"
+                if row["issuer"]:
+                    name_line += f" \\| _{em(row['issuer'])}_"
+                block = [name_line, f"Current Code: `{code}` {time_line}"]
+                if next_line: block.append(next_line)
+                if note_line: block.append(note_line)
+                _entries.append("\n".join(block))
+            except Exception as e:
+                logger.error(f"Search TOTP decrypt error: {e}")
+                _entries.append(f"*{i}\\. {em(row['name'])}*\n_\\[Decrypt error\\]_")
+        return _entries
+    entries = await asyncio.to_thread(_search_decrypt)
     result_text = (
         f"🔍 *Results for* `{em(query)}` *— {len(matched)} found*\n\n"
         + "\n\n".join(entries)
@@ -4968,21 +4993,50 @@ async def adm_user_info_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def adm_totp_limit_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
+    totp_add_label = "✅ TOTP Add: ON" if TOTP_ADD_ENABLED else "🚫 TOTP Add: OFF"
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("🔢 Vault Max Limit",              callback_data="adm_vault_limit")],
         [InlineKeyboardButton("⏱ Per Minute Limit",              callback_data="adm_min_limit")],
         [InlineKeyboardButton("👤 Specific User Vault Max Limit",callback_data="adm_specific_vault_max")],
         [InlineKeyboardButton("⏱ Specific User Vault Per Minute Limit", callback_data="adm_specific_vault_min")],
         [InlineKeyboardButton(f"🔁 TOTP Duplicate Limit  (currently {MAX_TOTP_DUPLICATE})", callback_data="adm_totp_dup_limit")],
+        [InlineKeyboardButton(totp_add_label,                    callback_data="adm_totp_onoff")],
         [InlineKeyboardButton("⬅️ Back",                         callback_data="adm_back")],
     ])
+    totp_status = "ON (users can add TOTP)" if TOTP_ADD_ENABLED else "OFF (no new TOTP allowed)"
     await q.message.reply_text(
         f"TOTP Limit Settings\n\nGlobal Vault Max: {MAX_TOTP_PER_VAULT} per vault\n"
         f"Global Per-Minute: {MAX_TOTP_PER_MINUTE} per vault/min\n"
-        f"Duplicate Limit: {MAX_TOTP_DUPLICATE} per vault\n\n"
+        f"Duplicate Limit: {MAX_TOTP_DUPLICATE} per vault\n"
+        f"TOTP Add: {totp_status}\n\n"
         f"Use Specific User buttons to override limits for individual vaults.",
         reply_markup=kb,
     )
+
+
+async def adm_totp_onoff_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Toggle TOTP add on/off globally. When OFF, no user can add new TOTP accounts
+    via any method (button, QR code, otpauth URI, manual entry)."""
+    q = update.callback_query; await q.answer()
+    new_state = not TOTP_ADD_ENABLED
+    globals()["TOTP_ADD_ENABLED"] = new_state
+    status    = "ON" if new_state else "OFF"
+    action    = "enabled" if new_state else "disabled"
+    totp_add_label = "✅ TOTP Add: ON" if new_state else "🚫 TOTP Add: OFF"
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔢 Vault Max Limit",              callback_data="adm_vault_limit")],
+        [InlineKeyboardButton("⏱ Per Minute Limit",              callback_data="adm_min_limit")],
+        [InlineKeyboardButton("👤 Specific User Vault Max Limit",callback_data="adm_specific_vault_max")],
+        [InlineKeyboardButton("⏱ Specific User Vault Per Minute Limit", callback_data="adm_specific_vault_min")],
+        [InlineKeyboardButton(f"🔁 TOTP Duplicate Limit  (currently {MAX_TOTP_DUPLICATE})", callback_data="adm_totp_dup_limit")],
+        [InlineKeyboardButton(totp_add_label,                    callback_data="adm_totp_onoff")],
+        [InlineKeyboardButton("⬅️ Back",                         callback_data="adm_back")],
+    ])
+    msg = await q.message.reply_text(
+        f"✅ TOTP Add has been {action}.\n\nTOTP Add is now: {status}",
+        reply_markup=kb,
+    )
+    asyncio.create_task(auto_delete_msg(msg, delay=300))
 
 
 async def adm_totp_dup_limit_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -7057,6 +7111,7 @@ def main():
         app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_user_info_cb),           pattern="^adm_user_info$"))
         app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_totp_limit_cb),        pattern="^adm_totp_limit$"))
         app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_totp_dup_limit_cb),   pattern="^adm_totp_dup_limit$"))
+        app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_totp_onoff_cb),      pattern="^adm_totp_onoff$"))
         app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_weekly_signup_limit_cb), pattern="^adm_weekly_signup_limit$"))
         app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_daily_login_limit_cb),   pattern="^adm_daily_login_limit$"))
         app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_vault_limit_cb),       pattern="^adm_vault_limit$"))
