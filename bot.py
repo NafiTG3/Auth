@@ -817,9 +817,10 @@ def init_db():
             except Exception:
                 pass
 
-        # Migrate users table: account_disabled, last_seen
+        # Migrate users table: account_disabled, last_seen, total_disabled_count
         for col, coltype, default in [
             ("account_disabled", "INTEGER", "0"),
+            ("total_disabled_count", "INTEGER", "0"),
             ("last_seen",        "INTEGER", "0"),
         ]:
             try:
@@ -1403,9 +1404,12 @@ def kb_reset_secure_key():
 
 
 def build_share_selection_kb(
-    rows: list, selected: set, page: int = 0, total_pages: int = 1
+    rows: list, selected: set, page: int = 0, total_pages: int = 1,
+    all_rows: list = None
 ) -> InlineKeyboardMarkup:
-    """Paginated checkbox keyboard for Share Codes (5 items per page)."""
+    """Paginated checkbox keyboard for Share Codes (5 items per page).
+    Shows Select All / Unselect All and navigation buttons.
+    """
     buttons = []
     for row in rows:
         tid   = row["id"]
@@ -1414,6 +1418,7 @@ def build_share_selection_kb(
             f"{check}{row['name']}",
             callback_data=f"share_toggle_{tid}",
         )])
+    # Navigation row
     if total_pages > 1:
         nav = []
         if page > 0:
@@ -1422,6 +1427,15 @@ def build_share_selection_kb(
         if page < total_pages - 1:
             nav.append(InlineKeyboardButton("➡️", callback_data=f"share_pg_{page+1}"))
         buttons.append(nav)
+    # Select All / Unselect All row
+    _all = all_rows or rows
+    all_ids = {r["id"] for r in _all}
+    if selected >= all_ids:
+        # All selected → show Unselect All
+        buttons.append([InlineKeyboardButton("☐ Unselect All", callback_data="share_unselect_all")])
+    else:
+        buttons.append([InlineKeyboardButton("✅ Select All", callback_data="share_select_all")])
+    # Action row
     action_row = []
     if selected:
         action_row.append(InlineKeyboardButton(
@@ -3117,10 +3131,33 @@ async def _do_save_totp(update, vault, data, pw):
         )
         return TOTP_MENU
 
-    # Auto-suffix name if duplicate, enforce max 20 chars
-    final_name = _auto_suffix_name(vault, data["name"])
-
+    # Block duplicate by SECRET KEY (same secret = duplicate regardless of name)
+    _new_secret = data["secret"]
+    with get_db() as _dc:
+        _existing = _dc.execute(
+            "SELECT secret_enc, salt, iv FROM totp_accounts WHERE vault_id=?", (vault,)
+        ).fetchall()
+    # We need vault_key to decrypt and compare - compute once
     vault_key = _get_vault_key(vault, pw)
+    _new_secret_hash = hashlib.sha256(_new_secret.encode()).hexdigest()
+    _dup_count = 0
+    for _row in _existing:
+        try:
+            _existing_secret = decrypt(_row["secret_enc"], _row["salt"], _row["iv"], vault_key, vault)
+            if hashlib.sha256(_existing_secret.encode()).hexdigest() == _new_secret_hash:
+                _dup_count += 1
+        except Exception:
+            pass
+    if _dup_count >= MAX_TOTP_DUPLICATE:
+        await update.message.reply_text(
+            f"⚠️ This TOTP secret key already exists {_dup_count} time(s) in your vault.\n"
+            f"Maximum {MAX_TOTP_DUPLICATE} duplicate(s) allowed per secret key.",
+            reply_markup=kb_main(),
+        )
+        return TOTP_MENU
+
+    # Auto-suffix name if duplicate name, enforce max 20 chars
+    final_name = _auto_suffix_name(vault, data["name"])
     ct, salt, iv = encrypt(data["secret"], vault_key, vault)
     sk = load_user_secure_key(vault, pw)
     if sk:
@@ -3443,7 +3480,7 @@ async def list_page_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 # ── SHARE CODES: Open folder ─────────────────────────────────
 async def share_codes_open(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Open the Share Codes folder with checkbox selection."""
+    """Open the Share Codes folder with checkbox selection (paginated, 5/page)."""
     q     = update.callback_query
     await q.answer()
     uid   = update.effective_user.id
@@ -3453,17 +3490,23 @@ async def share_codes_open(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text("Session expired\\. /start", parse_mode="MarkdownV2", reply_markup=kb_auth())
         return AUTH_MENU
     with get_db() as c:
-        rows = c.execute(
+        all_rows_raw = c.execute(
             "SELECT id, name FROM totp_accounts WHERE vault_id=? ORDER BY name", (vault,)
         ).fetchall()
-    if not rows:
+    if not all_rows_raw:
         await q.edit_message_text(
             "📁 *Share Codes*\n\n⚠️ No TOTP accounts to share\\.",
             parse_mode="MarkdownV2",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")]]),
         )
         return TOTP_MENU
-    ctx.user_data["share_rows"]     = [{"id": r["id"], "name": r["name"]} for r in rows]
+    all_rows  = [{"id": r["id"], "name": r["name"]} for r in all_rows_raw]
+    per_pg    = 5
+    tpg       = max(1, (len(all_rows) + per_pg - 1) // per_pg)
+    ctx.user_data["share_all"]      = all_rows
+    ctx.user_data["share_rows"]     = all_rows[:per_pg]
+    ctx.user_data["share_pg"]       = 0
+    ctx.user_data["share_tpg"]      = tpg
     ctx.user_data["share_selected"] = set()
     await q.edit_message_text(
         "📁 *Share Codes*\n\n"
@@ -3472,7 +3515,10 @@ async def share_codes_open(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "_The generated link is valid for *10 minutes*\\.\n"
         "Only the TOTP code is visible \\(no secret keys\\)\\._",
         parse_mode="MarkdownV2",
-        reply_markup=build_share_selection_kb(ctx.user_data["share_rows"], ctx.user_data["share_selected"]),
+        reply_markup=build_share_selection_kb(
+            all_rows[:per_pg], ctx.user_data["share_selected"],
+            page=0, total_pages=tpg, all_rows=all_rows
+        ),
     )
     return TOTP_MENU
 
@@ -3485,7 +3531,7 @@ async def share_toggle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     except (IndexError, ValueError):
         return TOTP_MENU
     selected: set = ctx.user_data.get("share_selected", set())
-    rows           = ctx.user_data.get("share_rows", [])
+    rows           = ctx.user_data.get("share_all", ctx.user_data.get("share_rows", []))
     if totp_id in selected:
         selected.discard(totp_id)
     else:
@@ -3493,9 +3539,10 @@ async def share_toggle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data["share_selected"] = selected
     _pg  = ctx.user_data.get("share_pg", 0)
     _tpg = ctx.user_data.get("share_tpg", 1)
+    all_rows = ctx.user_data.get("share_all", rows)
     try:
         await q.edit_message_reply_markup(
-            reply_markup=build_share_selection_kb(rows, selected, page=_pg, total_pages=_tpg),
+            reply_markup=build_share_selection_kb(rows, selected, page=_pg, total_pages=_tpg, all_rows=all_rows),
         )
     except Exception:
         pass
@@ -3517,9 +3564,58 @@ async def share_pg_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data["share_rows"] = chunk
     ctx.user_data["share_pg"]   = pg
     selected = ctx.user_data.get("share_selected", set())
+    all_rows = ctx.user_data.get("share_all", chunk)
     try:
         await q.edit_message_reply_markup(
-            reply_markup=build_share_selection_kb(chunk, selected, page=pg, total_pages=tpg),
+            reply_markup=build_share_selection_kb(chunk, selected, page=pg, total_pages=tpg, all_rows=all_rows),
+        )
+    except Exception:
+        pass
+    return TOTP_MENU
+
+
+async def share_select_all(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Select all TOTP accounts for sharing."""
+    q = update.callback_query
+    await q.answer()
+    all_rows = ctx.user_data.get("share_all", ctx.user_data.get("share_rows", []))
+    ctx.user_data["share_all"]  = all_rows
+    ctx.user_data["share_selected"] = {r["id"] for r in all_rows}
+    pg  = ctx.user_data.get("share_pg", 0)
+    tpg = ctx.user_data.get("share_tpg", 1)
+    per_pg = 5
+    chunk = all_rows[pg * per_pg:(pg + 1) * per_pg]
+    ctx.user_data["share_rows"] = chunk
+    try:
+        await q.edit_message_reply_markup(
+            reply_markup=build_share_selection_kb(
+                chunk, ctx.user_data["share_selected"],
+                page=pg, total_pages=tpg, all_rows=all_rows
+            )
+        )
+    except Exception:
+        pass
+    return TOTP_MENU
+
+
+async def share_unselect_all(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Deselect all TOTP accounts."""
+    q = update.callback_query
+    await q.answer()
+    all_rows = ctx.user_data.get("share_all", ctx.user_data.get("share_rows", []))
+    ctx.user_data["share_all"]      = all_rows
+    ctx.user_data["share_selected"] = set()
+    pg  = ctx.user_data.get("share_pg", 0)
+    tpg = ctx.user_data.get("share_tpg", 1)
+    per_pg = 5
+    chunk = all_rows[pg * per_pg:(pg + 1) * per_pg]
+    ctx.user_data["share_rows"] = chunk
+    try:
+        await q.edit_message_reply_markup(
+            reply_markup=build_share_selection_kb(
+                chunk, ctx.user_data["share_selected"],
+                page=pg, total_pages=tpg, all_rows=all_rows
+            )
         )
     except Exception:
         pass
@@ -3587,11 +3683,21 @@ async def share_generate(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             c2.commit()
     asyncio.create_task(_cleanup())
     share_url  = f"https://t.me/{BOT_USERNAME}?start={token}"
-    names_text = ", ".join(em(n) for n in final_names)
-    exp_min    = SHARE_LINK_TTL // 60
+    exp_min = SHARE_LINK_TTL // 60
+    # Show names in groups of 5 if more than 5
+    if len(final_names) > 5:
+        name_lines = []
+        for i in range(0, len(final_names), 5):
+            chunk_names = final_names[i:i+5]
+            name_lines.append(", ".join(em(n) for n in chunk_names))
+        names_text = "\n".join(name_lines)
+        acct_block = f"📋 *Accounts \\({len(final_names)}\\):*\n{names_text}"
+    else:
+        names_text = ", ".join(em(n) for n in final_names)
+        acct_block = f"📋 *Accounts:* {names_text}"
     await q.edit_message_text(
         f"🔗 *Share Link Generated\\!*\n\n"
-        f"📋 *Accounts:* {names_text}\n"
+        f"{acct_block}\n"
         f"⏳ *Expires in:* {exp_min} minutes\n\n"
         f"`{em(share_url)}`\n\n"
         "_Anyone with this link can view the TOTP codes for 10 minutes\\.\n"
@@ -5479,9 +5585,15 @@ async def adm_account_action_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await q.message.reply_text("User not found.")
             return
         flag = 1 if action == "adm_account_disable" else 0
-        c.execute("UPDATE users SET account_disabled=? WHERE vault_id=?", (flag, vault_id))
         if flag:
+            c.execute(
+                "UPDATE users SET account_disabled=1, "
+                "total_disabled_count=COALESCE(total_disabled_count,0)+1 WHERE vault_id=?",
+                (vault_id,)
+            )
             c.execute("DELETE FROM sessions WHERE vault_id=?", (vault_id,))
+        else:
+            c.execute("UPDATE users SET account_disabled=0 WHERE vault_id=?", (vault_id,))
         c.commit()
     if flag:
         _session_pw_cache.pop(vault_id, None)
@@ -5599,19 +5711,44 @@ def _fmt_user_info(u) -> str:
         except (KeyError, TypeError):
             last_seen = "Never"
         try:
-            status = "Disabled" if u["account_disabled"] else "Active"
+            acct_disabled = bool(u["account_disabled"])
         except (KeyError, TypeError):
+            acct_disabled = False
+        # Check temporary freeze (login or reset)
+        now_ts = int(time.time())
+        with get_db() as _fc:
+            _li = _fc.execute("SELECT frozen_until FROM login_attempts WHERE vault_id=?", (vault_id,)).fetchone()
+            _ri = _fc.execute("SELECT frozen_until FROM reset_attempts WHERE vault_id=?", (vault_id,)).fetchone()
+        login_frozen_until  = (_li["frozen_until"]  if _li  and _li["frozen_until"]  > now_ts else 0)
+        reset_frozen_until  = (_ri["frozen_until"]  if _ri  and _ri["frozen_until"]  > now_ts else 0)
+        is_temp_frozen      = (login_frozen_until > 0 or reset_frozen_until > 0)
+        if acct_disabled:
+            status = "ID Disabled"
+        elif is_temp_frozen:
+            # Show which type of freeze and remaining time
+            if login_frozen_until > 0:
+                rem = login_frozen_until - now_ts
+                h, m = rem // 3600, (rem % 3600) // 60
+                status = f"ID Disabled (login freeze, {h}h {m}m remaining)"
+            else:
+                rem = reset_frozen_until - now_ts
+                h, m = rem // 3600, (rem % 3600) // 60
+                status = f"ID Disabled (reset freeze, {h}h {m}m remaining)"
+        else:
             status = "Active"
+        try:
+            total_disabled = u["total_disabled_count"] or 0
+        except (KeyError, TypeError):
+            total_disabled = 0
         with get_db() as c:
             totp_cnt = c.execute(
                 "SELECT COUNT(*) AS n FROM totp_accounts WHERE vault_id=?", (vault_id,)
             ).fetchone()["n"]
-            # Count duplicate TOTP entries (same name appearing more than once)
+            # Count duplicate TOTP entries (same SECRET KEY — not just same name)
             dup_cnt = c.execute(
-                "SELECT SUM(cnt - 1) AS n FROM "
-                "(SELECT COUNT(*) AS cnt FROM totp_accounts WHERE vault_id=? GROUP BY name HAVING cnt > 1)",
-                (vault_id,)
-            ).fetchone()["n"] or 0
+                "SELECT COUNT(*) AS n FROM totp_accounts WHERE vault_id=?", (vault_id,)
+            ).fetchone()["n"]
+            # We'll compute secret-based duplicates below after decryption
             br = c.execute(
                 "SELECT frequency, enabled FROM backup_reminders WHERE telegram_id=?", (tid,)
             ).fetchone()
@@ -5624,6 +5761,17 @@ def _fmt_user_info(u) -> str:
             ra = c.execute(
                 "SELECT attempts FROM reset_attempts WHERE vault_id=?", (vault_id,)
             ).fetchone()
+            # Count secret-based duplicates: same secret_enc (before decryption we count same salt+iv pairs)
+            # Fast approach: count distinct (name,issuer) pairs that share same secret_enc bytes
+            rows_for_dup = c.execute(
+                "SELECT secret_enc FROM totp_accounts WHERE vault_id=?", (vault_id,)
+            ).fetchall()
+        # Duplicate = same secret_enc content (identical ciphertext = identical secret key)
+        _secret_counts = {}
+        for r in rows_for_dup:
+            k = bytes(r["secret_enc"])
+            _secret_counts[k] = _secret_counts.get(k, 0) + 1
+        dup_cnt = sum(v - 1 for v in _secret_counts.values() if v > 1)
         # Backup Reminder status — default is ON/Weekly if no row exists
         if br is None:
             reminder_status = "On - Weekly (default)"
@@ -5646,7 +5794,8 @@ def _fmt_user_info(u) -> str:
             f"Duplicate TOTP : {dup_cnt} TOTP\n\n"
             f"Created        : {created_at}\n\n"
             f"Last Online    : {last_seen}\n\n"
-            f"Account Status : {status}\n\n"
+            f"Account Status : {status}\n"
+            f"Total Disabled : {total_disabled}\n\n"
             f"Reminder       : {reminder_status}\n"
             f"Auto Backup    : {auto_backup_status}\n\n"
             f"Failed Logins  : {failed_login}\n\n"
@@ -6021,6 +6170,9 @@ async def admin_group_message_handler(update: Update, ctx: ContextTypes.DEFAULT_
             return
         with get_db() as c:
             c.execute("UPDATE users SET account_disabled=0 WHERE vault_id=?", (vault_id,))
+            # Also clear any temporary login/reset freezes
+            c.execute("UPDATE login_attempts SET frozen_until=0, attempts=0 WHERE vault_id=?", (vault_id,))
+            c.execute("UPDATE reset_attempts SET frozen_until=0, attempts=0 WHERE vault_id=?", (vault_id,))
             c.commit()
         record_stat("account_enabled", telegram_id=u["telegram_id"], vault_id=vault_id)
         try:
@@ -6053,7 +6205,11 @@ async def admin_group_message_handler(update: Update, ctx: ContextTypes.DEFAULT_
             asyncio.create_task(auto_delete_msg(msg, delay=60))
             return
         with get_db() as c:
-            c.execute("UPDATE users SET account_disabled=1 WHERE vault_id=?", (vault_id,))
+            c.execute(
+                "UPDATE users SET account_disabled=1, "
+                "total_disabled_count=COALESCE(total_disabled_count,0)+1 WHERE vault_id=?",
+                (vault_id,)
+            )
             c.execute("DELETE FROM sessions WHERE vault_id=?", (vault_id,))
             c.commit()
         _session_pw_cache.pop(vault_id, None)
@@ -7131,6 +7287,8 @@ def main():
                 CallbackQueryHandler(share_toggle,          pattern=r"^share_toggle_\d+$"),
                 CallbackQueryHandler(share_generate,        pattern="^share_generate$"),
                 CallbackQueryHandler(share_cancel,          pattern="^share_cancel$"),
+                CallbackQueryHandler(share_select_all,     pattern="^share_select_all$"),
+                CallbackQueryHandler(share_unselect_all,   pattern="^share_unselect_all$"),
             ],
             SEARCH_TOTP_INPUT: [
                 MessageHandler(private & filters.TEXT & ~filters.COMMAND, search_totp_input),
