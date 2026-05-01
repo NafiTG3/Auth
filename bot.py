@@ -1239,6 +1239,9 @@ def mark_otp_used(vault_id: str):
 
 # ── Rate limiting ───────────────────────────────────────────
 def record_reset_attempt(vault_id: str) -> bool:
+    """Record failed reset attempt. Returns True if temporarily disabled.
+    On threshold: sets frozen_until AND account_disabled=1.
+    """
     now = int(time.time())
     with get_db() as c:
         row = c.execute("SELECT attempts, frozen_until FROM reset_attempts WHERE vault_id=?", (vault_id,)).fetchone()
@@ -1248,12 +1251,29 @@ def record_reset_attempt(vault_id: str) -> bool:
         frozen_until = now + FREEZE_HOURS * 3600 if attempts >= MAX_RESET_ATTEMPTS else 0
         c.execute("INSERT OR REPLACE INTO reset_attempts (vault_id, attempts, frozen_until) VALUES (?,?,?)",
                   (vault_id, attempts, frozen_until))
+        if frozen_until > now:
+            c.execute(
+                "UPDATE users SET account_disabled=1, "
+                "total_disabled_count=COALESCE(total_disabled_count,0)+1 "
+                "WHERE vault_id=?", (vault_id,)
+            )
         c.commit()
         return frozen_until > now
 
 def reset_attempts_clear(vault_id: str):
+    """Clear reset attempts after successful reset. Also re-enables account if no login freeze."""
     with get_db() as c:
         c.execute("DELETE FROM reset_attempts WHERE vault_id=?", (vault_id,))
+        # Re-enable account if login freeze is also gone
+        row_l = c.execute(
+            "SELECT frozen_until FROM login_attempts WHERE vault_id=?", (vault_id,)
+        ).fetchone()
+        login_still_frozen = bool(row_l and row_l["frozen_until"] > int(time.time()))
+        if not login_still_frozen:
+            c.execute(
+                "UPDATE users SET account_disabled=0 WHERE vault_id=? "
+                "AND account_disabled=1", (vault_id,)
+            )
         c.commit()
 
 def is_reset_frozen(vault_id: str) -> bool:
@@ -1878,8 +1898,8 @@ async def login_auto(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             reply_markup=kb_auth(),
         )
         return AUTH_MENU
-    # Block disabled accounts before they even enter password
-    if u["account_disabled"]:
+    # Block disabled AND temporarily frozen accounts
+    if u["account_disabled"] or is_login_frozen(u["vault_id"]) or is_reset_frozen(u["vault_id"]):
         await q.edit_message_text(
             "🚫 *This account has been disabled\\.* Please contact support\\.",
             parse_mode="MarkdownV2",
@@ -1920,8 +1940,8 @@ async def login_id_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             reply_markup=kb_cancel(),
         )
         return LOGIN_ID_INPUT
-    # Block disabled accounts before password entry
-    if u["account_disabled"]:
+    # Block disabled AND temporarily frozen accounts
+    if u["account_disabled"] or is_login_frozen(u["vault_id"]) or is_reset_frozen(u["vault_id"]):
         await update.message.reply_text(
             "🚫 *This account has been disabled\\.* Please contact support\\.",
             parse_mode="MarkdownV2",
@@ -1938,26 +1958,47 @@ async def login_id_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 # ── Login Rate Limiting ────────────────────────────────────
 def record_login_failure(vault_id: str) -> bool:
-    """Record a failed login attempt. Returns True if account is now frozen."""
+    """Record a failed login attempt. Returns True if account is now temporarily disabled.
+    On threshold: sets frozen_until AND account_disabled=1 so it shows as Disabled everywhere.
+    """
     now = int(time.time())
     with get_db() as c:
         row = c.execute(
             "SELECT attempts, frozen_until FROM login_attempts WHERE vault_id=?", (vault_id,)
         ).fetchone()
         if row and row["frozen_until"] > now:
-            return True  # already frozen
+            return True  # already disabled
         attempts     = (row["attempts"] if row else 0) + 1
         frozen_until = now + LOGIN_FREEZE_HOURS * 3600 if attempts >= MAX_LOGIN_ATTEMPTS else 0
         c.execute(
             "INSERT OR REPLACE INTO login_attempts (vault_id, attempts, frozen_until) VALUES (?,?,?)",
             (vault_id, attempts, frozen_until),
         )
+        if frozen_until > now:
+            # Mark account as disabled; increment total_disabled_count
+            c.execute(
+                "UPDATE users SET account_disabled=1, "
+                "total_disabled_count=COALESCE(total_disabled_count,0)+1 "
+                "WHERE vault_id=?", (vault_id,)
+            )
         c.commit()
         return frozen_until > now
 
 def clear_login_failures(vault_id: str):
     with get_db() as c:
         c.execute("DELETE FROM login_attempts WHERE vault_id=?", (vault_id,))
+        # Re-enable account if it was disabled only by a login freeze (not manually)
+        # We only clear if reset_attempts is also not frozen
+        row_r = c.execute(
+            "SELECT frozen_until FROM reset_attempts WHERE vault_id=?", (vault_id,)
+        ).fetchone()
+        reset_still_frozen = bool(row_r and row_r["frozen_until"] > int(time.time()))
+        if not reset_still_frozen:
+            c.execute(
+                "UPDATE users SET account_disabled=0 WHERE vault_id=? "
+                "AND account_disabled=1", (vault_id,)
+            )
+        c.commit()
         c.commit()
 
 def is_login_frozen(vault_id: str) -> bool:
@@ -3637,8 +3678,10 @@ async def share_generate(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not selected:
         await q.answer("No accounts selected.", show_alert=True)
         return TOTP_MENU
-    selected_ids = [r["id"] for r in rows if r["id"] in selected]
-    id_to_name   = {r["id"]: r["name"] for r in rows if r["id"] in selected}
+    # Use share_all (all pages), not just current page rows
+    all_rows_for_share = ctx.user_data.get("share_all", rows)
+    selected_ids = [r["id"] for r in all_rows_for_share if r["id"] in selected]
+    id_to_name   = {r["id"]: r["name"] for r in all_rows_for_share if r["id"] in selected}
     with get_db() as c:
         placeholders = ",".join("?" * len(selected_ids))
         db_rows = c.execute(
@@ -3684,20 +3727,23 @@ async def share_generate(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     asyncio.create_task(_cleanup())
     share_url  = f"https://t.me/{BOT_USERNAME}?start={token}"
     exp_min = SHARE_LINK_TTL // 60
-    # Show names in groups of 5 if more than 5
+    # Build account list: show 5 per line for readability
     if len(final_names) > 5:
         name_lines = []
         for i in range(0, len(final_names), 5):
             chunk_names = final_names[i:i+5]
-            name_lines.append(", ".join(em(n) for n in chunk_names))
+            # Numbered entries per chunk of 5
+            for j, n in enumerate(chunk_names):
+                name_lines.append(f"{i+j+1}\\. {em(n)}")
         names_text = "\n".join(name_lines)
         acct_block = f"📋 *Accounts \\({len(final_names)}\\):*\n{names_text}"
     else:
-        names_text = ", ".join(em(n) for n in final_names)
-        acct_block = f"📋 *Accounts:* {names_text}"
+        name_lines = [f"{i+1}\\. {em(n)}" for i, n in enumerate(final_names)]
+        names_text = "\n".join(name_lines)
+        acct_block = f"📋 *Accounts:*\n{names_text}"
     await q.edit_message_text(
         f"🔗 *Share Link Generated\\!*\n\n"
-        f"{acct_block}\n"
+        f"{acct_block}\n\n"
         f"⏳ *Expires in:* {exp_min} minutes\n\n"
         f"`{em(share_url)}`\n\n"
         "_Anyone with this link can view the TOTP codes for 10 minutes\\.\n"
@@ -3741,27 +3787,36 @@ async def handle_share_view(update: Update, token: str):
     remaining_s = max(0, expires_at - int(time.time()))
     rem_min     = remaining_s // 60
     rem_sec     = remaining_s % 60
-    lines = []
+    entries = []
     for i, (name, enc) in enumerate(zip(names, secrets_enc)):
         try:
             secret   = share_decrypt_secret(enc, token)
             code, rm = totp_now(secret)
-            lines.append(
-                f"*{em(name)}*\n"
-                f"`{code}` {bar(rm)} {rm}s"
-            )
+            entries.append(f"*{em(name)}*\n`{code}` {bar(rm)} {rm}s")
         except Exception as e:
             logger.error(f"Share view decrypt error idx={i}: {e}")
-            lines.append(f"*{em(name)}*\n_\\[Unavailable\\]_")
+            entries.append(f"*{em(name)}*\n_\\[Unavailable\\]_")
+
     refresh_url = f"https://t.me/{BOT_USERNAME}?start={token}"
-    text = (
-        "📋 *Shared TOTP Codes*\n\n"
-        + "\n\n".join(lines)
-        + f"\n\n⏳ Link expires in *{rem_min}m {rem_sec}s*\\.\n"
-        "_Tap below to refresh codes\\._"
-    )
-    kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Refresh Codes", url=refresh_url)]])
-    await update.message.reply_text(text, parse_mode="MarkdownV2", reply_markup=kb)
+    exp_line    = f"\n\n⏳ Link expires in *{rem_min}m {rem_sec}s*\\.\n_Tap below to refresh codes\\._"
+    kb          = InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Refresh Codes", url=refresh_url)]])
+
+    # Send in chunks of 5 to avoid Telegram 4096-char message limit
+    per_page = 5
+    chunks   = [entries[i:i+per_page] for i in range(0, len(entries), per_page)]
+    total_pg = len(chunks)
+
+    for pg_idx, chunk in enumerate(chunks):
+        pg_label = f" (Page {pg_idx+1}/{total_pg})" if total_pg > 1 else ""
+        header   = f"📋 *Shared TOTP Codes{em(pg_label)}*\n\n"
+        body     = "\n\n".join(chunk)
+        # Only add expiry line on last page
+        suffix   = exp_line if pg_idx == total_pg - 1 else ""
+        text     = header + body + suffix
+        if pg_idx == total_pg - 1:
+            await update.message.reply_text(text, parse_mode="MarkdownV2", reply_markup=kb)
+        else:
+            await update.message.reply_text(text, parse_mode="MarkdownV2")
 
 # ── EDIT TOTP (FIXED) ───────────────────────────────────────
 async def edit_totp_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -5764,14 +5819,35 @@ def _fmt_user_info(u) -> str:
             # Count secret-based duplicates: same secret_enc (before decryption we count same salt+iv pairs)
             # Fast approach: count distinct (name,issuer) pairs that share same secret_enc bytes
             rows_for_dup = c.execute(
-                "SELECT secret_enc FROM totp_accounts WHERE vault_id=?", (vault_id,)
+                "SELECT secret_enc, salt, iv FROM totp_accounts WHERE vault_id=?", (vault_id,)
             ).fetchall()
-        # Duplicate = same secret_enc content (identical ciphertext = identical secret key)
+        # Duplicate = same DECRYPTED secret key.
+        # We use _session_pw_cache to get the live password (set when user logs in),
+        # then compute vault key inline (sync - unavoidable here, but only run when admin checks).
         _secret_counts = {}
-        for r in rows_for_dup:
-            k = bytes(r["secret_enc"])
-            _secret_counts[k] = _secret_counts.get(k, 0) + 1
-        dup_cnt = sum(v - 1 for v in _secret_counts.values() if v > 1)
+        _pw_for_dup = _session_pw_cache.get(vault_id)
+        if _pw_for_dup:
+            try:
+                _vk_dup = _get_vault_key(vault_id, _pw_for_dup)
+                for r in rows_for_dup:
+                    try:
+                        plain = decrypt(r["secret_enc"], r["salt"], r["iv"], _vk_dup, vault_id)
+                        k = plain.strip().upper()
+                        _secret_counts[k] = _secret_counts.get(k, 0) + 1
+                    except Exception:
+                        k = bytes(r["secret_enc"])
+                        _secret_counts[k] = _secret_counts.get(k, 0) + 1
+            except Exception:
+                for r in rows_for_dup:
+                    k = bytes(r["secret_enc"])
+                    _secret_counts[k] = _secret_counts.get(k, 0) + 1
+        else:
+            # User not logged in: cannot decrypt. Show -1 as "N/A".
+            _secret_counts = {}  # dup_cnt will be "N/A" below
+        if _pw_for_dup:
+            dup_cnt = sum(v - 1 for v in _secret_counts.values() if v > 1)
+        else:
+            dup_cnt = None  # signals "user not active, cannot compute"
         # Backup Reminder status — default is ON/Weekly if no row exists
         if br is None:
             reminder_status = "On - Weekly (default)"
@@ -5791,7 +5867,7 @@ def _fmt_user_info(u) -> str:
             f"Telegram ID    : {tid}\n"
             f"Name           : {tg_name}\n\n"
             f"Total TOTP     : {totp_cnt} Account(s)\n"
-            f"Duplicate TOTP : {dup_cnt} TOTP\n\n"
+            f"Duplicate TOTP : {dup_cnt if dup_cnt is not None else 'N/A (user offline)'} TOTP\n\n"
             f"Created        : {created_at}\n\n"
             f"Last Online    : {last_seen}\n\n"
             f"Account Status : {status}\n"
@@ -6124,7 +6200,9 @@ async def admin_group_message_handler(update: Update, ctx: ContextTypes.DEFAULT_
         if not u:
             msg = await update.message.reply_text(f"User not found: {raw}")
         else:
-            msg = await update.message.reply_text(f"User Info\n\n{_fmt_user_info(u)}")
+            # Run _fmt_user_info in thread so _get_vault_key (Argon2) doesn't block event loop
+            info_text = await asyncio.to_thread(_fmt_user_info, u)
+            msg = await update.message.reply_text(f"User Info\n\n{info_text}")
         asyncio.create_task(auto_delete_msg(msg, delay=120))
         return
 
