@@ -60,6 +60,7 @@ TOTP_PER_PAGE       = 5     # TOTP entries per page in list view
 MAX_TOTP_PER_VAULT  = 200   # max TOTP accounts per vault
 MAX_TOTP_DUPLICATE  = 15    # max duplicate TOTP entries allowed per vault
 TOTP_ADD_ENABLED    = True  # global toggle: False = no user can add new TOTP accounts
+SHARE_MAX_TOTP      = 5     # maximum TOTPs a user can share at once
 NOTE_MAX_LEN        = 10    # max note characters
 BACKUP_REMINDER_WEEKLY  = "weekly"
 BACKUP_REMINDER_MONTHLY = "monthly"
@@ -269,6 +270,25 @@ def get_all_signup_disabled_users() -> list:
             "SELECT telegram_id FROM user_signup_disabled ORDER BY disabled_at DESC"
         ).fetchall()
     return [r["telegram_id"] for r in rows]
+
+
+# ── Activity Log System ────────────────────────────────────────────────────
+
+import collections as _collections
+_activity_log: _collections.deque = _collections.deque(maxlen=5000)  # last 5000 events in RAM
+
+def bot_log(category: str, event: str, **kwargs):
+    """Record a structured activity log entry. Stored in RAM ring buffer."""
+    try:
+        now_bd = _dt.datetime.now(_BDT)
+        ts_str = now_bd.strftime("%Y-%m-%d %H:%M:%S BDT")
+        kv_parts = "  ".join(f"{k}={v}" for k, v in kwargs.items())
+        line = f"[{ts_str}] [{category}] [{event}]"
+        if kv_parts:
+            line += f"  {kv_parts}"
+        _activity_log.append((now_bd.timestamp(), line))
+    except Exception:
+        pass  # logging must never crash the bot
 
 
 # ── Telegram Ban helpers ───────────────────────────────────────────────────
@@ -1428,9 +1448,10 @@ def build_share_selection_kb(
     all_rows: list = None
 ) -> InlineKeyboardMarkup:
     """Paginated checkbox keyboard for Share Codes (5 items per page).
-    Shows Select All / Unselect All and navigation buttons.
+    Max SHARE_MAX_TOTP (5) can be selected at once.
     """
     buttons = []
+    n_selected = len(selected)
     for row in rows:
         tid   = row["id"]
         check = "✅ " if tid in selected else "☐ "
@@ -1447,20 +1468,23 @@ def build_share_selection_kb(
         if page < total_pages - 1:
             nav.append(InlineKeyboardButton("➡️", callback_data=f"share_pg_{page+1}"))
         buttons.append(nav)
-    # Select All / Unselect All row
-    _all = all_rows or rows
-    all_ids = {r["id"] for r in _all}
-    if selected >= all_ids:
-        # All selected → show Unselect All
+    # Select All / Unselect All row (only show Unselect All if something selected)
+    if n_selected > 0:
         buttons.append([InlineKeyboardButton("☐ Unselect All", callback_data="share_unselect_all")])
     else:
         buttons.append([InlineKeyboardButton("✅ Select All", callback_data="share_select_all")])
     # Action row
     action_row = []
-    if selected:
+    if 0 < n_selected <= SHARE_MAX_TOTP:
         action_row.append(InlineKeyboardButton(
-            f"🔗 Share Selected ({len(selected)})",
+            f"🔗 Share Selected ({n_selected}/{SHARE_MAX_TOTP})",
             callback_data="share_generate",
+        ))
+    elif n_selected > SHARE_MAX_TOTP:
+        # Show limit warning instead of share button
+        action_row.append(InlineKeyboardButton(
+            f"⚠️ Max {SHARE_MAX_TOTP} allowed ({n_selected} selected)",
+            callback_data="share_limit_warn",
         ))
     action_row.append(InlineKeyboardButton("❌ Cancel", callback_data="share_cancel"))
     buttons.append(action_row)
@@ -1819,6 +1843,7 @@ async def signup_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     _oab_store_password(uid, vid, pw)       # DB encrypted store for auto-backup
     record_weekly_signup(uid)               # track weekly signup count
     record_stat("signup", telegram_id=uid, vault_id=vid)  # stats tracking
+    bot_log("AUTH", "SIGNUP_OK", tg_id=uid, vault=vid, name=uname)
     record_vault_login(uid, vid)            # track lifetime vault access
 
     sk_display = " ".join(secure_key[i:i+8] for i in range(0, len(secure_key), 8))
@@ -2060,6 +2085,8 @@ async def login_pw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if frozen:
             remaining, _ = get_login_freeze_remaining(vid)
             h, m = remaining // 3600, (remaining % 3600) // 60
+            bot_log("AUTH", "LOGIN_FAIL", tg_id=uid, vault=vid, reason="account_frozen")
+            bot_log("SECURITY", "LOGIN_FREEZE", tg_id=uid, vault=vid, failed_attempts=MAX_LOGIN_ATTEMPTS, frozen_hours=LOGIN_FREEZE_HOURS)
             await update.message.reply_text(
                 f"🔒 *Account disabled for {h}h {m}m* due to {MAX_LOGIN_ATTEMPTS} failed attempts\\.\n\n"
                 "Please wait or use *Forgot Password* to reset\\.",
@@ -2110,6 +2137,7 @@ async def login_pw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     record_vault_login(uid, vid)
     record_stat("login_success", telegram_id=uid, vault_id=vid)
     record_stat("user_active",   telegram_id=uid, vault_id=vid)
+    bot_log("AUTH", "LOGIN_OK", tg_id=uid, vault=vid, method="manual")
 
     # ── Auto-upgrade legacy users to Argon2id + Master Key ──────
     kdf_type = u["kdf_type"] or "pbkdf2"
@@ -3216,6 +3244,7 @@ async def _do_save_totp(update, vault, data, pw):
 
     record_totp_add(vault)
     record_stat("totp_added", vault_id=vault)
+    bot_log("TOTP", "TOTP_ADDED", vault=vault, name=data.get("name","?"), method="manual_or_qr")
 
     # Show different name if it was auto-suffixed
     display_name = final_name
@@ -3248,6 +3277,41 @@ async def _process_input(update, ctx, vault, pw):
             reply_markup=kb_main(),
         )
         return TOTP_MENU, True
+    # Check vault limit BEFORE downloading/scanning the QR image (saves bandwidth + CPU)
+    _is_image = bool(
+        update.message.photo or (
+            update.message.document
+            and update.message.document.mime_type
+            and update.message.document.mime_type.startswith("image")
+        )
+    )
+    if _is_image:
+        with get_db() as _lc_pre:
+            _vcnt_pre = _lc_pre.execute(
+                "SELECT COUNT(*) AS n FROM totp_accounts WHERE vault_id=?", (vault,)
+            ).fetchone()["n"]
+        _eff_max_pre = get_effective_vault_max(vault)
+        if _vcnt_pre >= _eff_max_pre:
+            try:
+                await update.message.delete()
+            except Exception:
+                pass
+            await update.message.reply_text(
+                f"Vault full! Maximum {_eff_max_pre} TOTP accounts per vault. "
+                "Please delete some before adding new ones."
+            )
+            return TOTP_MENU, True
+        # Also check per-minute rate before downloading
+        if not check_totp_add_rate(vault):
+            try:
+                await update.message.delete()
+            except Exception:
+                pass
+            _eff_min_pre = get_effective_per_min_limit(vault)
+            await update.message.reply_text(
+                f"⚠️ Too many accounts added. Maximum {_eff_min_pre} per minute. Try again shortly."
+            )
+            return TOTP_MENU, True
     file_obj = None
     if update.message.photo:
         file_obj = await update.message.photo[-1].get_file()
@@ -3564,19 +3628,24 @@ async def share_codes_open(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     return TOTP_MENU
 
 async def share_toggle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Toggle a TOTP account in/out of the share selection."""
+    """Toggle a TOTP account in/out of the share selection (max SHARE_MAX_TOTP)."""
     q = update.callback_query
-    await q.answer()
     try:
         totp_id = int(q.data.split("_")[2])
     except (IndexError, ValueError):
+        await q.answer()
         return TOTP_MENU
     selected: set = ctx.user_data.get("share_selected", set())
     rows           = ctx.user_data.get("share_all", ctx.user_data.get("share_rows", []))
     if totp_id in selected:
         selected.discard(totp_id)
+        await q.answer()
     else:
+        if len(selected) >= SHARE_MAX_TOTP:
+            await q.answer(f"Maximum {SHARE_MAX_TOTP} accounts allowed per share.", show_alert=True)
+            return TOTP_MENU
         selected.add(totp_id)
+        await q.answer()
     ctx.user_data["share_selected"] = selected
     _pg  = ctx.user_data.get("share_pg", 0)
     _tpg = ctx.user_data.get("share_tpg", 1)
@@ -3639,6 +3708,17 @@ async def share_select_all(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     return TOTP_MENU
 
 
+async def share_limit_warn(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Show alert when user tries to share more than SHARE_MAX_TOTP accounts."""
+    q = update.callback_query
+    await q.answer(
+        f"You can share at most {SHARE_MAX_TOTP} accounts at once. "
+        f"Please deselect some before sharing.",
+        show_alert=True,
+    )
+    return TOTP_MENU
+
+
 async def share_unselect_all(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Deselect all TOTP accounts."""
     q = update.callback_query
@@ -3677,6 +3757,9 @@ async def share_generate(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     rows           = ctx.user_data.get("share_rows", [])
     if not selected:
         await q.answer("No accounts selected.", show_alert=True)
+        return TOTP_MENU
+    if len(selected) > SHARE_MAX_TOTP:
+        await q.answer(f"Maximum {SHARE_MAX_TOTP} accounts allowed per share.", show_alert=True)
         return TOTP_MENU
     # Use share_all (all pages), not just current page rows
     all_rows_for_share = ctx.user_data.get("share_all", rows)
@@ -4553,6 +4636,7 @@ async def delete_account_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
             c.execute("DELETE FROM users WHERE vault_id=?",          (vault,))
             c.commit()
         record_stat("account_deleted", telegram_id=uid, vault_id=vault)
+        bot_log("AUTH", "ACCOUNT_DELETED", tg_id=uid, vault=vault)
     clear_session(uid)
     ctx.user_data.clear()
     if owner_id:
@@ -4592,6 +4676,7 @@ async def global_auto_detect(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await update.message.delete()
         except Exception:
             pass
+        bot_log("SECURITY", "BANNED_USER_BLOCKED", tg_id=uid)
         return
     vault = get_session(uid)
     pw    = ctx.user_data.get("password")
@@ -4860,7 +4945,7 @@ def _adm_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("🛡 User Control",   callback_data="adm_user_control"),
          InlineKeyboardButton("📊 Statistics",     callback_data="adm_statistics")],
         [InlineKeyboardButton("💾 Backup",         callback_data="adm_backup"),
-         InlineKeyboardButton("📋 Log",            callback_data="adm_noop")],
+         InlineKeyboardButton("📋 Log",            callback_data="adm_log")],
     ])
 
 
@@ -5249,6 +5334,41 @@ async def adm_buc_reminder_monthly_cb(update: Update, ctx: ContextTypes.DEFAULT_
         "Please write in integer."
     )
     asyncio.create_task(auto_delete_msg(msg, delay=120))
+
+
+async def adm_log_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Export last 24h activity log as a .txt file to admin group."""
+    q = update.callback_query; await q.answer()
+    chat_id  = update.effective_chat.id
+    now_ts   = _dt.datetime.now(_BDT).timestamp()
+    cutoff   = now_ts - 86400  # 24 hours
+
+    # Filter log entries from last 24h
+    entries = [line for ts, line in _activity_log if ts >= cutoff]
+
+    if not entries:
+        msg = await q.message.reply_text("No activity in the last 24 hours.")
+        asyncio.create_task(auto_delete_msg(msg, delay=60))
+        return
+
+    header_lines = [
+        "=" * 60,
+        f"BOT ACTIVITY LOG - Last 24 Hours",
+        f"Generated: {_dt.datetime.now(_BDT).strftime('%Y-%m-%d %H:%M:%S BDT')}",
+        f"Total entries: {len(entries)}",
+        "=" * 60,
+        "",
+    ]
+    content_bytes = ("\n".join(header_lines + entries) + "\n").encode("utf-8")
+    bio      = BytesIO(content_bytes)
+    bio.name = "bot_activity_log.txt"
+    fname    = f"bot_log_{_dt.datetime.now(_BDT).strftime('%Y%m%d_%H%M')}.txt"
+    await ctx.bot.send_document(
+        chat_id=chat_id,
+        document=bio,
+        filename=fname,
+        caption=f"📋 Activity log: last 24h ({len(entries)} entries)",
+    )
 
 
 async def adm_noop_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -7364,6 +7484,7 @@ def main():
                 CallbackQueryHandler(share_codes_open,      pattern="^share_codes_open$"),
                 CallbackQueryHandler(share_toggle,          pattern=r"^share_toggle_\d+$"),
                 CallbackQueryHandler(share_generate,        pattern="^share_generate$"),
+            CallbackQueryHandler(share_limit_warn,      pattern="^share_limit_warn$"),
                 CallbackQueryHandler(share_cancel,          pattern="^share_cancel$"),
                 CallbackQueryHandler(share_select_all,     pattern="^share_select_all$"),
                 CallbackQueryHandler(share_unselect_all,   pattern="^share_unselect_all$"),
@@ -7506,6 +7627,7 @@ def main():
             return _guarded
 
         app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_noop_cb),                  pattern="^adm_noop$"))
+        app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_log_cb),                  pattern="^adm_log$"))
         app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_backup_cb),                   pattern="^adm_backup$"))
         app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_backup_all_cb),               pattern="^adm_backup_all$"))
         app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_backup_restore_cb),           pattern="^adm_backup_restore$"))
