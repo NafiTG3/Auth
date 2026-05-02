@@ -22,6 +22,7 @@ logger = logging.getLogger(__name__)
 # ── States ─────────────────────────────────────────────────
 (
     AUTH_MENU,
+    CAPTCHA_VERIFY,
     SIGNUP_PASSWORD, SIGNUP_CONFIRM,
     LOGIN_CHOICE, LOGIN_ID_INPUT, LOGIN_PASSWORD,
     RESET_ID_INPUT, RESET_OTP_INPUT, RESET_NEW_PW, RESET_NEW_PW_CONFIRM,
@@ -42,7 +43,8 @@ logger = logging.getLogger(__name__)
     SEARCH_TOTP_INPUT,    # new: typing search query for TOTP search
     OFFLINE_AUTO_BACKUP,  # new: offline auto-backup settings menu
     SIGNUP_TERMS,         # new: terms & privacy agreement screen before signup
-) = range(38)
+    CAPTCHA_VERIFY,       # new: image CAPTCHA verification before signup
+) = range(39)
 
 DB_PATH             = os.environ.get("DB_PATH", "auth.db")
 SERVER_KEY          = os.environ.get("ENCRYPTION_KEY", "").encode()
@@ -289,6 +291,153 @@ def bot_log(category: str, event: str, **kwargs):
         _activity_log.append((now_bd.timestamp(), line))
     except Exception:
         pass  # logging must never crash the bot
+
+
+# ── CAPTCHA helpers ────────────────────────────────────────────────────────
+
+import random as _random
+import io     as _io
+
+CAPTCHA_MAX_FAILS = 3
+CAPTCHA_BAN_HOURS = 6
+
+def _gen_captcha_image(question: str) -> bytes:
+    """Generate a simple math question image using Pillow. Returns PNG bytes."""
+    from PIL import Image, ImageDraw, ImageFont
+    img  = Image.new("RGB", (280, 90), color=(240, 240, 245))
+    draw = ImageDraw.Draw(img)
+    # Noise dots
+    for _ in range(200):
+        x = _random.randint(0, 279)
+        y = _random.randint(0, 89)
+        draw.point((x, y), fill=(_random.randint(150, 210),) * 3)
+    # Noise lines
+    for _ in range(6):
+        draw.line(
+            [(_random.randint(0, 279), _random.randint(0, 89)),
+             (_random.randint(0, 279), _random.randint(0, 89))],
+            fill=(_random.randint(180, 220),) * 3, width=1
+        )
+    # Text
+    try:
+        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 36)
+    except Exception:
+        font = ImageFont.load_default()
+    draw.text((30, 22), question, fill=(30, 30, 120), font=font)
+    buf = _io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def make_captcha() -> dict:
+    """Generate a math CAPTCHA. Returns {question, answer, choices, image_bytes}."""
+    ops    = [("+", lambda a, b: a + b), ("-", lambda a, b: a - b)]
+    op_sym, op_fn = _random.choice(ops)
+    if op_sym == "+":
+        a, b = _random.randint(1, 15), _random.randint(1, 15)
+    else:
+        a, b = _random.randint(5, 20), _random.randint(1, 5)
+        if a < b:
+            a, b = b, a
+    answer   = op_fn(a, b)
+    question = f"{a} {op_sym} {b} = ?"
+    # 3 wrong choices, all distinct and != answer
+    wrongs = set()
+    while len(wrongs) < 3:
+        wrong = answer + _random.choice([-3, -2, -1, 1, 2, 3, 4, 5])
+        if wrong != answer and wrong >= 0:
+            wrongs.add(wrong)
+    choices = list(wrongs) + [answer]
+    _random.shuffle(choices)
+    return {
+        "question":    question,
+        "answer":      answer,
+        "choices":     choices,
+        "image_bytes": _gen_captcha_image(question),
+    }
+
+
+def check_captcha_ban(telegram_id: int) -> int:
+    """Returns remaining ban seconds if user is banned, else 0."""
+    now = int(time.time())
+    with get_db() as c:
+        row = c.execute(
+            "SELECT banned_until FROM captcha_attempts WHERE telegram_id=?", (telegram_id,)
+        ).fetchone()
+    if not row:
+        return 0
+    return max(0, row["banned_until"] - now)
+
+
+def record_captcha_fail(telegram_id: int) -> bool:
+    """Record a CAPTCHA failure. Returns True if user is now banned."""
+    now = int(time.time())
+    with get_db() as c:
+        row = c.execute(
+            "SELECT fail_count FROM captcha_attempts WHERE telegram_id=?", (telegram_id,)
+        ).fetchone()
+        fails = (row["fail_count"] if row else 0) + 1
+        ban_until = now + CAPTCHA_BAN_HOURS * 3600 if fails >= CAPTCHA_MAX_FAILS else 0
+        c.execute(
+            "INSERT INTO captcha_attempts (telegram_id, fail_count, banned_until) VALUES (?,?,?) "
+            "ON CONFLICT(telegram_id) DO UPDATE SET fail_count=excluded.fail_count, banned_until=excluded.banned_until",
+            (telegram_id, fails, ban_until),
+        )
+        c.commit()
+    return ban_until > 0
+
+
+def reset_captcha_fails(telegram_id: int):
+    """Clear CAPTCHA failure count after successful signup."""
+    with get_db() as c:
+        c.execute("DELETE FROM captcha_attempts WHERE telegram_id=?", (telegram_id,))
+        c.commit()
+
+
+# ── OTP Request Rate-Limit helpers ─────────────────────────────────────────
+
+OTP_HOURLY_LIMIT = 2   # max OTP requests per hour
+OTP_DAILY_LIMIT  = 5   # max OTP requests per 24h
+
+def check_otp_request_limit(vault_id: str) -> tuple:
+    """Check if vault can request an OTP.
+    Returns (allowed: bool, wait_seconds: int, reason: str).
+    """
+    now = int(time.time())
+    hour_ago  = now - 3600
+    day_ago   = now - 86400
+
+    # Cleanup old records first
+    with get_db() as c:
+        c.execute("DELETE FROM otp_request_log WHERE requested_at < ?", (day_ago,))
+        c.commit()
+
+    with get_db() as c:
+        hourly = c.execute(
+            "SELECT COUNT(*) AS n, MIN(requested_at) AS oldest FROM otp_request_log "
+            "WHERE vault_id=? AND requested_at >= ?", (vault_id, hour_ago)
+        ).fetchone()
+        daily = c.execute(
+            "SELECT COUNT(*) AS n, MIN(requested_at) AS oldest FROM otp_request_log "
+            "WHERE vault_id=? AND requested_at >= ?", (vault_id, day_ago)
+        ).fetchone()
+
+    if hourly["n"] >= OTP_HOURLY_LIMIT:
+        wait = max(0, (hourly["oldest"] or now) + 3600 - now)
+        return False, wait, "hourly"
+    if daily["n"] >= OTP_DAILY_LIMIT:
+        wait = max(0, (daily["oldest"] or now) + 86400 - now)
+        return False, wait, "daily"
+    return True, 0, ""
+
+
+def record_otp_request(vault_id: str):
+    """Insert a new OTP request record."""
+    with get_db() as c:
+        c.execute(
+            "INSERT INTO otp_request_log (vault_id) VALUES (?)", (vault_id,)
+        )
+        c.commit()
 
 
 # ── Telegram Ban helpers ───────────────────────────────────────────────────
@@ -760,6 +909,22 @@ def init_db():
             telegram_id   INTEGER PRIMARY KEY,
             disabled_at   INTEGER DEFAULT (strftime('%s','now')))""")
 
+        # OTP request rate-limiting log (tracks reset OTP requests)
+        c.execute("""CREATE TABLE IF NOT EXISTS otp_request_log (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            vault_id     TEXT    NOT NULL,
+            requested_at INTEGER DEFAULT (strftime('%s','now')))""")
+        try:
+            c.execute("CREATE INDEX IF NOT EXISTS idx_otp_req ON otp_request_log (vault_id, requested_at)")
+        except Exception:
+            pass
+
+        # CAPTCHA failure tracking for signup
+        c.execute("""CREATE TABLE IF NOT EXISTS captcha_attempts (
+            telegram_id  INTEGER PRIMARY KEY,
+            fail_count   INTEGER DEFAULT 0,
+            banned_until INTEGER DEFAULT 0)""")
+
         # Telegram-level ban (blocks all bot interaction except broadcast)
         c.execute("""CREATE TABLE IF NOT EXISTS telegram_banned (
             telegram_id   INTEGER PRIMARY KEY,
@@ -1151,7 +1316,7 @@ def verify_secure_key_by_totp(vault_id: str, candidate_hex: str) -> bool:
 
 # ── TOTP ───────────────────────────────────────────────────
 def clean_secret(s: str) -> str:
-    return re.sub(r"[\s\-\.\,\_]", "", s).upper()
+    return re.sub(r"[\s\-\\.\,\_]", "", s).upper()
 
 def validate_secret(s: str):
     c = clean_secret(s)
@@ -1736,22 +1901,111 @@ async def signup_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     return SIGNUP_TERMS
 
 async def signup_terms_agreed(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """User agreed to terms — proceed to vault ID + password setup."""
+    """User agreed to terms — show CAPTCHA before proceeding to signup."""
     q   = update.callback_query
     await q.answer()
     uid = update.effective_user.id
-    vid = gen_vault_id(uid)
-    ctx.user_data["signup_vid"] = vid
-    await q.edit_message_text(
-        "🆕 *Create Your Account*\n\n"
-        "Your *BV Vault ID* \\(auto\\-generated\\):\n\n"
-        f"`{em(vid)}`\n\n"
-        "📌 *Save this ID\\!* You need it to login from other devices\\.\n\n"
-        "Set a *password* \\(minimum 6 characters\\):",
+
+    # Check CAPTCHA ban
+    ban_remaining = check_captcha_ban(uid)
+    if ban_remaining > 0:
+        h = ban_remaining // 3600
+        m = (ban_remaining % 3600) // 60
+        await q.edit_message_text(
+            f"⛔ *Too many failed verifications\\.*\n\n"
+            f"You can try signing up again in *{h}h {m}m*\\.",
+            parse_mode="MarkdownV2",
+            reply_markup=kb_auth(),
+        )
+        return AUTH_MENU
+
+    # Generate CAPTCHA
+    cap = make_captcha()
+    ctx.user_data["captcha_answer"] = cap["answer"]
+    choices = cap["choices"]
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton(str(c), callback_data=f"captcha_{c}")
+        for c in choices
+    ]])
+    # Delete the terms message first
+    try:
+        await q.message.delete()
+    except Exception:
+        pass
+    await q.message.reply_photo(
+        photo=cap["image_bytes"],
+        caption="🔢 *Verify you are human*\n\nSolve the math question above and tap the correct answer\\.",
         parse_mode="MarkdownV2",
-        reply_markup=kb_cancel(),
+        reply_markup=kb,
     )
-    return SIGNUP_PASSWORD
+    return CAPTCHA_VERIFY
+
+
+async def captcha_check(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Handle CAPTCHA button click."""
+    q = update.callback_query
+    await q.answer()
+    uid = update.effective_user.id
+    try:
+        chosen = int(q.data.split("_")[1])
+    except (IndexError, ValueError):
+        return CAPTCHA_VERIFY
+    correct = ctx.user_data.get("captcha_answer")
+    if chosen == correct:
+        # CAPTCHA passed — clear fails and proceed to signup
+        reset_captcha_fails(uid)
+        ctx.user_data.pop("captcha_answer", None)
+        vid = gen_vault_id(uid)
+        ctx.user_data["signup_vid"] = vid
+        try:
+            await q.message.delete()
+        except Exception:
+            pass
+        await q.message.reply_text(
+            "✅ *Verified\\!*\n\n"
+            "🆕 *Create Your Account*\n\n"
+            "Your *BV Vault ID* \\(auto\\-generated\\):\n\n"
+            f"`{em(vid)}`\n\n"
+            "📌 *Save this ID\\!* You need it to login from other devices\\.\n\n"
+            "Set a *password* \\(minimum 6 characters\\):",
+            parse_mode="MarkdownV2",
+            reply_markup=kb_cancel(),
+        )
+        return SIGNUP_PASSWORD
+    else:
+        # Wrong answer — record fail and regenerate or ban
+        banned = record_captcha_fail(uid)
+        if banned:
+            try:
+                await q.message.delete()
+            except Exception:
+                pass
+            await q.message.reply_text(
+                f"⛔ *Too many failed verifications\\.*\n\n"
+                f"You cannot sign up for *{CAPTCHA_BAN_HOURS} hours*\\.",
+                parse_mode="MarkdownV2",
+                reply_markup=kb_auth(),
+            )
+            return AUTH_MENU
+        # Generate new CAPTCHA
+        cap = make_captcha()
+        ctx.user_data["captcha_answer"] = cap["answer"]
+        choices = cap["choices"]
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton(str(c), callback_data=f"captcha_{c}")
+            for c in choices
+        ]])
+        try:
+            await q.message.delete()
+        except Exception:
+            pass
+        await q.message.reply_photo(
+            photo=cap["image_bytes"],
+            caption="❌ *Wrong answer\\. Try again\\!*\n\n🔢 Solve the math question above\\.",
+            parse_mode="MarkdownV2",
+            reply_markup=kb,
+        )
+        return CAPTCHA_VERIFY
 
 async def signup_terms_declined(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """User declined terms — go back to auth menu."""
@@ -2270,8 +2524,31 @@ async def reset_id_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         return RESET_ID_INPUT
 
+    # OTP request rate-limit check (2/hour, 5/24h)
+    allowed, wait_secs, reason = check_otp_request_limit(vid)
+    if not allowed:
+        wait_h = wait_secs // 3600
+        wait_m = (wait_secs % 3600) // 60
+        wait_s = wait_secs % 60
+        if reason == "hourly":
+            await update.message.reply_text(
+                f"⏳ *Too many OTP requests\\.* You can request at most {OTP_HOURLY_LIMIT} OTPs per hour\\.\\n\n"
+                f"Please wait *{wait_h}h {wait_m}m {wait_s}s* and try again\\.",
+                parse_mode="MarkdownV2",
+                reply_markup=kb_cancel(),
+            )
+        else:
+            await update.message.reply_text(
+                f"⏳ *Daily OTP limit reached\\.* You can request at most {OTP_DAILY_LIMIT} OTPs per 24 hours\\.\n\n"
+                f"Please wait *{wait_h}h {wait_m}m {wait_s}s* before trying again\\.",
+                parse_mode="MarkdownV2",
+                reply_markup=kb_cancel(),
+            )
+        return RESET_ID_INPUT
+
     otp = gen_otp()
     store_otp(vid, otp)
+    record_otp_request(vid)   # track this request for rate-limiting
     ctx.user_data["reset_vid"] = vid
     try:
         await ctx.bot.send_message(
@@ -4690,6 +4967,27 @@ async def global_auto_detect(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     if not vault or not pw:
         return
+    # QR/photo scan rate-limit: max 5 photo messages per minute per user
+    if update.message.photo or (
+        update.message.document
+        and update.message.document.mime_type
+        and update.message.document.mime_type.startswith("image")
+    ):
+        _scan_key = f"scan_rate_{uid}"
+        _now_ts   = int(time.time())
+        _scan_log = ctx.bot_data.get(_scan_key, [])
+        # Keep only scans within last 60 seconds
+        _scan_log = [t for t in _scan_log if _now_ts - t < 60]
+        if len(_scan_log) >= 5:
+            # Rate limited - silently discard the image
+            asyncio.create_task(auto_delete_msg(update.message, delay=3))
+            await update.message.reply_text(
+                "⚠️ Too many QR scans\\. Please wait a moment before sending another image\\.",
+                parse_mode="MarkdownV2",
+            )
+            return
+        _scan_log.append(_now_ts)
+        ctx.bot_data[_scan_key] = _scan_log
 
     # ── # quick search (e.g. "#google") ────────────────────────
     if update.message.text and update.message.text.strip().startswith("#"):
@@ -7398,6 +7696,9 @@ def main():
             SIGNUP_TERMS: [
                 CallbackQueryHandler(signup_terms_agreed,  pattern="^signup_agree$"),
                 CallbackQueryHandler(signup_terms_declined, pattern="^signup_decline$"),
+            ],
+            CAPTCHA_VERIFY: [
+                CallbackQueryHandler(captcha_check, pattern="^captcha_"),
             ],
             SIGNUP_PASSWORD: [
                 MessageHandler(private & filters.TEXT & ~filters.COMMAND, signup_pw),
