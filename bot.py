@@ -669,16 +669,15 @@ def set_vault_per_min_limit(vault_id: str, limit: int):
         )
         c.commit()
 
-# Per-vault mutex to prevent race conditions when multiple images arrive simultaneously
-import threading as _th_rate
+# Per-vault asyncio lock: ensures scans for the same vault are processed one at a time.
+# 100 images sent at once → each waits its turn → limit check happens BEFORE each scan.
 _vault_add_locks: dict = {}
-_vault_add_locks_mutex = _th_rate.Lock()
 
-def _get_vault_lock(vault_id: str) -> _th_rate.Lock:
-    with _vault_add_locks_mutex:
-        if vault_id not in _vault_add_locks:
-            _vault_add_locks[vault_id] = _th_rate.Lock()
-        return _vault_add_locks[vault_id]
+def _get_vault_lock(vault_id: str):
+    """Return the asyncio.Lock for this vault (creates one if needed)."""
+    if vault_id not in _vault_add_locks:
+        _vault_add_locks[vault_id] = asyncio.Lock()
+    return _vault_add_locks[vault_id]
 
 
 def check_totp_add_rate(vault_id: str) -> bool:
@@ -695,14 +694,14 @@ def check_totp_add_rate(vault_id: str) -> bool:
     return row["count"] < eff_limit
 
 
-def check_and_record_totp_add(vault_id: str) -> bool:
-    """Atomic check-and-increment under a per-vault lock.
+async def check_and_record_totp_add(vault_id: str) -> bool:
+    """Async atomic check-and-increment under a per-vault asyncio.Lock.
     Returns True if allowed (and increments counter), False if limit exceeded.
-    Use this instead of check_totp_add_rate + record_totp_add to prevent race conditions
-    when concurrent_updates=True and multiple images arrive simultaneously.
+    When 100 images arrive simultaneously, each awaits the lock so they process
+    one at a time — limit check always happens BEFORE the scan for each one.
     """
     lock = _get_vault_lock(vault_id)
-    with lock:
+    async with lock:
         now       = int(time.time())
         eff_limit = get_effective_per_min_limit(vault_id)
         with get_db() as c:
@@ -710,15 +709,14 @@ def check_and_record_totp_add(vault_id: str) -> bool:
                 "SELECT count, window_start FROM totp_add_rate WHERE vault_id=?",
                 (vault_id,)
             ).fetchone()
-            # Determine current count in window
             if not row or now - row["window_start"] >= 60:
                 current = 0
             else:
                 current = row["count"]
             if current >= eff_limit:
-                return False  # limit exceeded
-            # Increment atomically
-            if not row or now - row["window_start"] >= 60:
+                return False  # limit exceeded, scan skipped
+            # Increment
+            if current == 0:
                 c.execute(
                     "INSERT INTO totp_add_rate (vault_id, count, window_start) VALUES (?,?,?) "
                     "ON CONFLICT(vault_id) DO UPDATE SET count=1, window_start=excluded.window_start",
@@ -3527,7 +3525,7 @@ async def _do_save_totp(update, vault, data, pw):
         return TOTP_MENU
 
     # Per-minute rate limit: atomic check+increment prevents race conditions
-    if not check_and_record_totp_add(vault):
+    if not await check_and_record_totp_add(vault):
         _eff_per_min = get_effective_per_min_limit(vault)
         await update.message.reply_text(
             f"⚠️ *Too many accounts added\\.*\n\n"
@@ -5107,7 +5105,7 @@ async def global_auto_detect(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ctx.user_data.pop("_global_add", None)
         if raw_name and secret:
             # Rate limit check - atomic to prevent race conditions
-            if not check_and_record_totp_add(vault):
+            if not await check_and_record_totp_add(vault):
                 _eff_per_min2 = get_effective_per_min_limit(vault)
                 await update.message.reply_text(
                     f"⚠️ *Too many accounts added\\.*\n\n"
