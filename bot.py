@@ -329,21 +329,34 @@ def _gen_captcha_image(question: str) -> bytes:
 
 
 def make_captcha() -> dict:
-    """Generate a math CAPTCHA. Returns {question, answer, choices, image_bytes}."""
-    ops    = [("+", lambda a, b: a + b), ("-", lambda a, b: a - b)]
-    op_sym, op_fn = _random.choice(ops)
+    """Generate a math CAPTCHA with +, -, ×, ÷ operators.
+    Returns {question, answer, choices, image_bytes}.
+    """
+    op_sym, op_fn = _random.choice([
+        ("+", lambda a, b: a + b),
+        ("-", lambda a, b: a - b),
+        ("×", lambda a, b: a * b),
+        ("÷", lambda a, b: a // b),
+    ])
     if op_sym == "+":
         a, b = _random.randint(1, 15), _random.randint(1, 15)
-    else:
-        a, b = _random.randint(5, 20), _random.randint(1, 5)
-        if a < b:
-            a, b = b, a
+    elif op_sym == "-":
+        a = _random.randint(5, 20)
+        b = _random.randint(1, a)          # ensure a >= b so result >= 0
+    elif op_sym == "×":
+        a, b = _random.randint(2, 9), _random.randint(2, 9)
+    else:  # ÷
+        b = _random.randint(2, 9)
+        a = b * _random.randint(2, 9)      # ensure exact division
     answer   = op_fn(a, b)
     question = f"{a} {op_sym} {b} = ?"
-    # 3 wrong choices, all distinct and != answer
+    # 3 wrong choices, distinct, non-negative, != answer
     wrongs = set()
-    while len(wrongs) < 3:
-        wrong = answer + _random.choice([-3, -2, -1, 1, 2, 3, 4, 5])
+    attempts = 0
+    while len(wrongs) < 3 and attempts < 50:
+        attempts += 1
+        delta = _random.choice([-4, -3, -2, -1, 1, 2, 3, 4, 5, 6])
+        wrong = answer + delta
         if wrong != answer and wrong >= 0:
             wrongs.add(wrong)
     choices = list(wrongs) + [answer]
@@ -2096,7 +2109,7 @@ async def signup_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     _oab_store_password(uid, vid, pw)       # DB encrypted store for auto-backup
     record_weekly_signup(uid)               # track weekly signup count
     record_stat("signup", telegram_id=uid, vault_id=vid)  # stats tracking
-    bot_log("AUTH", "SIGNUP_OK", tg_id=uid, vault=vid, name=uname)
+    bot_log("AUTH", "SIGNUP_OK", tg_id=uid, vault=vid, name=tg_name)
     record_vault_login(uid, vid)            # track lifetime vault access
 
     sk_display = " ".join(secure_key[i:i+8] for i in range(0, len(secure_key), 8))
@@ -4966,28 +4979,23 @@ async def global_auto_detect(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     if not vault or not pw:
         return
-    # QR/photo scan rate-limit: max 5 photo messages per minute per user
+    # QR/photo scan: check vault limits BEFORE scanning (saves CPU + prevents abuse)
     if update.message.photo or (
         update.message.document
         and update.message.document.mime_type
         and update.message.document.mime_type.startswith("image")
     ):
-        _scan_key = f"scan_rate_{uid}"
-        _now_ts   = int(time.time())
-        _scan_log = ctx.bot_data.get(_scan_key, [])
-        # Keep only scans within last 60 seconds
-        _scan_log = [t for t in _scan_log if _now_ts - t < 60]
-        if len(_scan_log) >= 5:
-            # Rate limited - silently discard the image
-            asyncio.create_task(auto_delete_msg(update.message, delay=3))
-            await update.message.reply_text(
-                "⚠️ Too many QR scans\\. Please wait a moment before sending another image\\.",
-                parse_mode="MarkdownV2",
-            )
-            return
-        _scan_log.append(_now_ts)
-        ctx.bot_data[_scan_key] = _scan_log
-
+        if not TOTP_ADD_ENABLED:
+            return  # TOTP add globally disabled
+        with get_db() as _gad_c:
+            _vcnt_gad = (_gad_c.execute(
+                "SELECT COUNT(*) AS n FROM totp_accounts WHERE vault_id=?", (vault,)
+            ).fetchone() or {}).get("n", 0)
+        _eff_max_gad = get_effective_vault_max(vault)
+        if _vcnt_gad >= _eff_max_gad:
+            return  # vault full - skip scan silently
+        if not check_totp_add_rate(vault):
+            return  # per-minute limit hit - skip scan silently
     # ── # quick search (e.g. "#google") ────────────────────────
     if update.message.text and update.message.text.strip().startswith("#"):
         query = update.message.text.strip().lstrip("#").strip().lower()
