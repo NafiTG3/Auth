@@ -5102,68 +5102,37 @@ async def global_auto_detect(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if ctx.user_data.get("_global_add") and update.message.text:
         raw_name = update.message.text.strip()
         secret   = ctx.user_data.pop("pending_secret", None)
+        issuer   = ctx.user_data.pop("pending_issuer", "")
         ctx.user_data.pop("_global_add", None)
-        if raw_name and secret:
-            # Rate limit check - atomic to prevent race conditions
-            if not await check_and_record_totp_add(vault):
-                _eff_per_min2 = get_effective_per_min_limit(vault)
-                await update.message.reply_text(
-                    f"⚠️ *Too many accounts added\\.*\n\n"
-                    f"Maximum *{_eff_per_min2}* TOTP accounts can be added per minute\\.",
-                    parse_mode="MarkdownV2",
-                    reply_markup=kb_main(),
-                )
-                return
-            # Name length check
-            if len(raw_name) > TOTP_NAME_MAX_LEN:
-                await update.message.reply_text(
-                    f"⚠️ Name too long\\. Maximum *{TOTP_NAME_MAX_LEN}* characters\\.\n\nPlease try again with a shorter name:",
-                    parse_mode="MarkdownV2",
-                    reply_markup=InlineKeyboardMarkup([[
-                        InlineKeyboardButton("❌ Cancel", callback_data="global_add_cancel"),
-                    ]]),
-                )
-                ctx.user_data["pending_secret"] = secret
-                ctx.user_data["_global_add"]    = True
-                return
-            name = _auto_suffix_name(vault, raw_name)
-            vault_key = _get_vault_key(vault, pw)
-            ct, salt, iv = encrypt(secret, vault_key, vault)
-            sk = load_user_secure_key(vault, pw)
-            if sk:
-                sk_ct, sk_s, sk_iv = sk_encrypt_totp(secret.encode(), sk, vault)
-            else:
-                sk_ct = sk_s = sk_iv = None
-            with get_db() as c:
-                c.execute(
-                    "INSERT INTO totp_accounts (vault_id, name, issuer, secret_enc, salt, iv, "
-                    "sk_enc, sk_salt, sk_iv, note, account_type, hotp_counter) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-                    (vault, name, "", ct, salt, iv, sk_ct, sk_s, sk_iv, "", "totp", 0),
-                )
-                c.commit()
-            record_stat("totp_added", vault_id=vault)
-            try:
-                code, remain, _ = generate_code(secret)
-            except Exception:
-                code, remain = "------", 30
-            suffix_note = f"\n_\\(Renamed: {em(name)}\\)_" if name != raw_name else ""
+        if not raw_name or not secret:
+            return
+        # Name length check
+        if len(raw_name) > TOTP_NAME_MAX_LEN:
             await update.message.reply_text(
-                f"✅ *{em(name)}* added\\!{suffix_note}\n\n"
-                f"🔢 `{code}`\n"
-                f"⏱ {bar(remain)} {remain}s\n\n"
-                f"🔒 _Encrypted with AES\\-256\\-GCM \\+ Secure Key_",
+                f"⚠️ Name too long\\. Maximum *{TOTP_NAME_MAX_LEN}* characters\\.\n\nPlease try again with a shorter name:",
                 parse_mode="MarkdownV2",
-                reply_markup=kb_main(),
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("❌ Cancel", callback_data="global_add_cancel"),
+                ]]),
             )
+            ctx.user_data["pending_secret"] = secret
+            ctx.user_data["pending_issuer"] = issuer
+            ctx.user_data["_global_add"]    = True
+            return
+        # Use _do_save_totp so vault full, per-minute limit, duplicate, SK — all handled identically
+        data = {"name": raw_name, "issuer": issuer, "secret": secret, "note": ""}
+        await _do_save_totp(update, vault, data, pw)
         return
     result, handled = await _process_input(update, ctx, vault, pw)
     if handled and result is None and ctx.user_data.get("pending_secret"):
         ctx.user_data["_global_add"] = True
+    # result may be TOTP_MENU or AUTH_MENU if an error occurred — nothing more to do
 
 async def global_add_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     ctx.user_data.pop("pending_secret", None)
+    ctx.user_data.pop("pending_issuer", None)
     ctx.user_data.pop("_global_add", None)
     await q.edit_message_text("❌ Cancelled\\.", parse_mode="MarkdownV2", reply_markup=kb_main())
 
