@@ -5034,9 +5034,10 @@ async def global_auto_detect(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if not TOTP_ADD_ENABLED:
             return  # TOTP add globally disabled
         with get_db() as _gad_c:
-            _vcnt_gad = (_gad_c.execute(
+            _row_gad  = _gad_c.execute(
                 "SELECT COUNT(*) AS n FROM totp_accounts WHERE vault_id=?", (vault,)
-            ).fetchone() or {}).get("n", 0)
+            ).fetchone()
+            _vcnt_gad = _row_gad["n"] if _row_gad else 0
         _eff_max_gad = get_effective_vault_max(vault)
         if _vcnt_gad >= _eff_max_gad:
             return  # vault full - skip scan silently
