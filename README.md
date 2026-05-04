@@ -283,7 +283,7 @@ Refer to the deployment documentation in this repository for environment variabl
 
 <br>
 
-[![Open in Telegram](https://img.shields.io/badge/Open%20BV%20Authenticator-2CA5E0?style=for-the-badge&logo=telegram&logoColor=white)](https://t.me/TotpNafiBot)
+[![Open in Telegram](https://img.shields.io/badge/Open%20BlockVeil%20Authenticator-2CA5E0?style=for-the-badge&logo=telegram&logoColor=white)](https://t.me/TotpNafiBot)
 
 <br>
 
