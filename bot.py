@@ -3962,17 +3962,17 @@ async def share_toggle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         selected.add(totp_id)
         await q.answer()
     ctx.user_data["share_selected"] = selected
-all_rows_list = ctx.user_data.get("share_all", [])
-_pg  = ctx.user_data.get("share_pg", 0)
-_tpg = ctx.user_data.get("share_tpg", 1)
-per_pg = 5
-rows = all_rows_list[_pg*per_pg:(_pg+1)*per_pg]
-try:
-    await q.edit_message_reply_markup(
-        reply_markup=build_share_selection_kb(rows, selected, page=_pg, total_pages=_tpg, all_rows=all_rows_list),
-    )
-except Exception:
-    pass
+    all_rows_list = ctx.user_data.get("share_all", [])
+    _pg  = ctx.user_data.get("share_pg", 0)
+    _tpg = ctx.user_data.get("share_tpg", 1)
+    per_pg = 5
+    rows = all_rows_list[_pg*per_pg:(_pg+1)*per_pg]  # বর্তমান পেজের ৫টা আইটেম
+    try:
+        await q.edit_message_reply_markup(
+            reply_markup=build_share_selection_kb(rows, selected, page=_pg, total_pages=_tpg, all_rows=all_rows_list),
+        )
+    except Exception:
+        pass
     return TOTP_MENU
 
 async def share_pg_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
