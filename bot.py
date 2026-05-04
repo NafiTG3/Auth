@@ -335,29 +335,33 @@ def make_captcha() -> dict:
     op_sym, op_fn = _random.choice([
         ("+", lambda a, b: a + b),
         ("-", lambda a, b: a - b),
-        ("×", lambda a, b: a * b),
-        ("÷", lambda a, b: a // b),
+        ("*", lambda a, b: a * b),   # * shown in image, easy to type in buttons
+        ("/", lambda a, b: a // b),  # / shown in image, easy to type in buttons
     ])
     if op_sym == "+":
         a, b = _random.randint(1, 15), _random.randint(1, 15)
     elif op_sym == "-":
         a = _random.randint(5, 20)
         b = _random.randint(1, a)          # ensure a >= b so result >= 0
-    elif op_sym == "×":
+    elif op_sym == "*":
         a, b = _random.randint(2, 9), _random.randint(2, 9)
-    else:  # ÷
+    else:  # /
         b = _random.randint(2, 9)
         a = b * _random.randint(2, 9)      # ensure exact division
     answer   = op_fn(a, b)
     question = f"{a} {op_sym} {b} = ?"
     # 3 wrong choices, distinct, non-negative, != answer
+    # For larger answers (multiplication), use wider deltas
+    max_delta = max(5, answer // 3)
     wrongs = set()
     attempts = 0
-    while len(wrongs) < 3 and attempts < 50:
+    while len(wrongs) < 3 and attempts < 100:
         attempts += 1
-        delta = _random.choice([-4, -3, -2, -1, 1, 2, 3, 4, 5, 6])
+        delta = _random.randint(-max_delta, max_delta)
+        if delta == 0:
+            continue
         wrong = answer + delta
-        if wrong != answer and wrong >= 0:
+        if wrong > 0 and wrong != answer:
             wrongs.add(wrong)
     choices = list(wrongs) + [answer]
     _random.shuffle(choices)
@@ -3536,31 +3540,6 @@ async def _do_save_totp(update, vault, data, pw):
         )
         return TOTP_MENU
 
-    # Block duplicate by SECRET KEY (same secret = duplicate regardless of name)
-    _new_secret = data["secret"]
-    with get_db() as _dc:
-        _existing = _dc.execute(
-            "SELECT secret_enc, salt, iv FROM totp_accounts WHERE vault_id=?", (vault,)
-        ).fetchall()
-    # We need vault_key to decrypt and compare - compute once
-    vault_key = _get_vault_key(vault, pw)
-    _new_secret_hash = hashlib.sha256(_new_secret.encode()).hexdigest()
-    _dup_count = 0
-    for _row in _existing:
-        try:
-            _existing_secret = decrypt(_row["secret_enc"], _row["salt"], _row["iv"], vault_key, vault)
-            if hashlib.sha256(_existing_secret.encode()).hexdigest() == _new_secret_hash:
-                _dup_count += 1
-        except Exception:
-            pass
-    if _dup_count >= MAX_TOTP_DUPLICATE:
-        await update.message.reply_text(
-            f"⚠️ This TOTP secret key already exists {_dup_count} time(s) in your vault.\n"
-            f"Maximum {MAX_TOTP_DUPLICATE} duplicate(s) allowed per secret key.",
-            reply_markup=kb_main(),
-        )
-        return TOTP_MENU
-
     # Auto-suffix name if duplicate name, enforce max 20 chars
     final_name = _auto_suffix_name(vault, data["name"])
     ct, salt, iv = encrypt(data["secret"], vault_key, vault)
@@ -5713,7 +5692,6 @@ async def adm_totp_limit_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("⏱ Per Minute Limit",              callback_data="adm_min_limit")],
         [InlineKeyboardButton("👤 Specific User Vault Max Limit",callback_data="adm_specific_vault_max")],
         [InlineKeyboardButton("⏱ Specific User Vault Per Minute Limit", callback_data="adm_specific_vault_min")],
-        [InlineKeyboardButton(f"🔁 TOTP Duplicate Limit  (currently {MAX_TOTP_DUPLICATE})", callback_data="adm_totp_dup_limit")],
         [InlineKeyboardButton(totp_add_label,                    callback_data="adm_totp_onoff")],
         [InlineKeyboardButton("⬅️ Back",                         callback_data="adm_back")],
     ])
@@ -5721,7 +5699,6 @@ async def adm_totp_limit_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await q.message.reply_text(
         f"TOTP Limit Settings\n\nGlobal Vault Max: {MAX_TOTP_PER_VAULT} per vault\n"
         f"Global Per-Minute: {MAX_TOTP_PER_MINUTE} per vault/min\n"
-        f"Duplicate Limit: {MAX_TOTP_DUPLICATE} per vault\n"
         f"TOTP Add: {totp_status}\n\n"
         f"Use Specific User buttons to override limits for individual vaults.",
         reply_markup=kb,
@@ -5742,7 +5719,6 @@ async def adm_totp_onoff_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("⏱ Per Minute Limit",              callback_data="adm_min_limit")],
         [InlineKeyboardButton("👤 Specific User Vault Max Limit",callback_data="adm_specific_vault_max")],
         [InlineKeyboardButton("⏱ Specific User Vault Per Minute Limit", callback_data="adm_specific_vault_min")],
-        [InlineKeyboardButton(f"🔁 TOTP Duplicate Limit  (currently {MAX_TOTP_DUPLICATE})", callback_data="adm_totp_dup_limit")],
         [InlineKeyboardButton(totp_add_label,                    callback_data="adm_totp_onoff")],
         [InlineKeyboardButton("⬅️ Back",                         callback_data="adm_back")],
     ])
@@ -6239,11 +6215,6 @@ def _fmt_user_info(u) -> str:
             totp_cnt = c.execute(
                 "SELECT COUNT(*) AS n FROM totp_accounts WHERE vault_id=?", (vault_id,)
             ).fetchone()["n"]
-            # Count duplicate TOTP entries (same SECRET KEY — not just same name)
-            dup_cnt = c.execute(
-                "SELECT COUNT(*) AS n FROM totp_accounts WHERE vault_id=?", (vault_id,)
-            ).fetchone()["n"]
-            # We'll compute secret-based duplicates below after decryption
             br = c.execute(
                 "SELECT frequency, enabled FROM backup_reminders WHERE telegram_id=?", (tid,)
             ).fetchone()
@@ -6258,36 +6229,8 @@ def _fmt_user_info(u) -> str:
             ).fetchone()
             # Count secret-based duplicates: same secret_enc (before decryption we count same salt+iv pairs)
             # Fast approach: count distinct (name,issuer) pairs that share same secret_enc bytes
-            rows_for_dup = c.execute(
-                "SELECT secret_enc, salt, iv FROM totp_accounts WHERE vault_id=?", (vault_id,)
-            ).fetchall()
-        # Duplicate = same DECRYPTED secret key.
-        # We use _session_pw_cache to get the live password (set when user logs in),
-        # then compute vault key inline (sync - unavoidable here, but only run when admin checks).
-        _secret_counts = {}
-        _pw_for_dup = _session_pw_cache.get(vault_id)
-        if _pw_for_dup:
-            try:
-                _vk_dup = _get_vault_key(vault_id, _pw_for_dup)
-                for r in rows_for_dup:
-                    try:
-                        plain = decrypt(r["secret_enc"], r["salt"], r["iv"], _vk_dup, vault_id)
-                        k = plain.strip().upper()
-                        _secret_counts[k] = _secret_counts.get(k, 0) + 1
-                    except Exception:
-                        k = bytes(r["secret_enc"])
-                        _secret_counts[k] = _secret_counts.get(k, 0) + 1
-            except Exception:
-                for r in rows_for_dup:
-                    k = bytes(r["secret_enc"])
-                    _secret_counts[k] = _secret_counts.get(k, 0) + 1
-        else:
-            # User not logged in: cannot decrypt. Show -1 as "N/A".
-            _secret_counts = {}  # dup_cnt will be "N/A" below
-        if _pw_for_dup:
-            dup_cnt = sum(v - 1 for v in _secret_counts.values() if v > 1)
-        else:
-            dup_cnt = None  # signals "user not active, cannot compute"
+    
+
         # Backup Reminder status — default is ON/Weekly if no row exists
         if br is None:
             reminder_status = "On - Weekly (default)"
@@ -6307,7 +6250,7 @@ def _fmt_user_info(u) -> str:
             f"Telegram ID    : {tid}\n"
             f"Name           : {tg_name}\n\n"
             f"Total TOTP     : {totp_cnt} Account(s)\n"
-            f"Duplicate TOTP : {dup_cnt if dup_cnt is not None else 'N/A (user offline)'} TOTP\n\n"
+
             f"Created        : {created_at}\n\n"
             f"Last Online    : {last_seen}\n\n"
             f"Account Status : {status}\n"
