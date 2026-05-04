@@ -3542,6 +3542,7 @@ async def _do_save_totp(update, vault, data, pw):
 
     # Auto-suffix name if duplicate name, enforce max 20 chars
     final_name = _auto_suffix_name(vault, data["name"])
+    vault_key = await asyncio.to_thread(_get_vault_key, vault, pw)  # derive key (Argon2 blocking, run in thread)
     ct, salt, iv = encrypt(data["secret"], vault_key, vault)
     sk = load_user_secure_key(vault, pw)
     if sk:
@@ -4122,7 +4123,7 @@ async def share_generate(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             c2.execute("DELETE FROM share_links WHERE token=?", (token,))
             c2.commit()
     asyncio.create_task(_cleanup())
-    share_url  = f"https://t.me/{BOT_USERNAME}?start={token}"
+    share_url  = f"https://t.me/{ctx.bot.username}?start={token}"
     exp_min = SHARE_LINK_TTL // 60
     # Build account list: show 5 per line for readability
     if len(final_names) > 5:
@@ -4194,7 +4195,7 @@ async def handle_share_view(update: Update, token: str):
             logger.error(f"Share view decrypt error idx={i}: {e}")
             entries.append(f"*{em(name)}*\n_\\[Unavailable\\]_")
 
-    refresh_url = f"https://t.me/{BOT_USERNAME}?start={token}"
+    refresh_url = f"https://t.me/{(await update.get_bot()).username}?start={token}"
     exp_line    = f"\n\n⏳ Link expires in *{rem_min}m {rem_sec}s*\\.\n_Tap below to refresh codes\\._"
     kb          = InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Refresh Codes", url=refresh_url)]])
 
