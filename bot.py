@@ -4195,7 +4195,7 @@ async def handle_share_view(update: Update, token: str):
             logger.error(f"Share view decrypt error idx={i}: {e}")
             entries.append(f"*{em(name)}*\n_\\[Unavailable\\]_")
 
-    refresh_url = f"https://t.me/{(await update.get_bot()).username}?start={token}"
+    refresh_url = f"https://t.me/{update.get_bot().username}?start={token}"
     exp_line    = f"\n\n⏳ Link expires in *{rem_min}m {rem_sec}s*\\.\n_Tap below to refresh codes\\._"
     kb          = InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Refresh Codes", url=refresh_url)]])
 
