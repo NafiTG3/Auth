@@ -7001,15 +7001,16 @@ async def admin_group_message_handler(update: Update, ctx: ContextTypes.DEFAULT_
         uname_str = f"@{u['tg_username']}" if u["tg_username"] else str(u["telegram_id"])
         result_lines = [
             f"TOTP Duplicate Report",
-            f"Vault      : {vault_id}",
-            f"User       : {uname_str}",
             f"",
-            f"Total TOTP       : {total}",
-            f"Decrypted OK     : {decrypted_count}",
-            f"Unique Secrets   : {unique_secrets}",
-            f"Duplicate Entries: {duplicate_entries}",
+            f"User Vault ID   : {vault_id}",
+            f"Username        : {uname_str}",
             f"",
-            f"Duplicate %: {dup_percent:.1f}%",
+            f"Total TOTP            : {total}",
+            f"Decryption Complected : {decrypted_count}",
+            f"Total Unique TOTP     : {unique_secrets}",
+            f"Total Duplicate TOTP  : {duplicate_entries}",
+            f"",
+            f"Total Duplicate TOTP in Percentage: {dup_percent:.1f}%",
         ]
         if failed > 0:
             result_lines.append(f"(Failed to decrypt: {failed} entries)")
