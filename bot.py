@@ -4815,7 +4815,7 @@ async def _do_import(update_or_cb, ctx, vault: str, accounts: list, mode: str = 
                     nonlocal_import()
                     record_stat("totp_added", vault_id=vault)
                 except Exception as e:
-                    logger.error(f"Import entry '{acc.get("name","?")}': {e}")
+                    logger.error(f"Import entry '{acc.get('name','?')}': {e}")
                     nonlocal_skip()
             c.commit()
     # nonlocal helpers (closures can't assign to outer nonlocal in nested def easily)
