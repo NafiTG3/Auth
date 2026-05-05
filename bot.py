@@ -7006,7 +7006,7 @@ async def admin_group_message_handler(update: Update, ctx: ContextTypes.DEFAULT_
         duplicate_entries = sum(count for count in hash_counts.values() if count > 1)
         # Duplicate percentage: what fraction of all decrypted entries are duplicates
         dup_percent = (duplicate_entries / decrypted_count) * 100 if decrypted_count > 0 else 0
-        uname_str = f"@{u['tg_username']}" if u.get("tg_username") else str(u["telegram_id"])
+        uname_str = f"@{u['tg_username']}" if u["tg_username"] else str(u["telegram_id"])
         result_lines = [
             f"TOTP Duplicate Report",
             f"Vault      : {vault_id}",
