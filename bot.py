@@ -6937,98 +6937,86 @@ async def admin_group_message_handler(update: Update, ctx: ContextTypes.DEFAULT_
         return
 
     if step == "adm_totp_dup_check_wait":
-    _admin_import_pending.pop(chat_id, None)
-    asyncio.create_task(auto_delete_msg(update.message, delay=5))
-    u = _resolve_user(raw)
-    if not u:
-        msg = await update.message.reply_text(f"User not found: {raw}")
-        asyncio.create_task(auto_delete_msg(msg, delay=60))
+        _admin_import_pending.pop(chat_id, None)
+        asyncio.create_task(auto_delete_msg(update.message, delay=5))
+        u = _resolve_user(raw)
+        if not u:
+            msg = await update.message.reply_text(f"User not found: {raw}")
+            asyncio.create_task(auto_delete_msg(msg, delay=60))
+            return
+        vault_id = u["vault_id"]
+        with get_db() as c:
+            totp_rows = c.execute(
+                "SELECT id, name, secret_enc, salt, iv FROM totp_accounts WHERE vault_id=?",
+                (vault_id,)
+            ).fetchall()
+        total = len(totp_rows)
+        if total == 0:
+            msg = await update.message.reply_text(
+                f"Vault {vault_id} has no TOTP accounts. Duplicate check: 0%."
+            )
+            asyncio.create_task(auto_delete_msg(msg, delay=120))
+            return
+        live_pw = _session_pw_cache.get(vault_id)
+        if not live_pw:
+            live_pw = _oab_load_password(u["telegram_id"], vault_id)
+        if not live_pw:
+            msg = await update.message.reply_text(
+                f"Cannot check TOTP duplicates for vault {vault_id}.\n"
+                "User must log in at least once for their password to be available."
+            )
+            asyncio.create_task(auto_delete_msg(msg, delay=120))
+            return
+        progress = await update.message.reply_text("Decrypting TOTP entries, please wait...")
+        def _decrypt_and_check():
+            vault_key = _get_vault_key(vault_id, live_pw)
+            secret_hashes = []
+            failed = 0
+            for row in totp_rows:
+                try:
+                    plain = decrypt(row["secret_enc"], row["salt"], row["iv"], vault_key, vault_id)
+                    normalized = clean_secret(plain)
+                    secret_hashes.append(hashlib.sha256(normalized.encode()).hexdigest())
+                except Exception:
+                    failed += 1
+            return secret_hashes, failed
+        secret_hashes, failed = await asyncio.to_thread(_decrypt_and_check)
+        try:
+            await progress.delete()
+        except Exception:
+            pass
+        decrypted_count = len(secret_hashes)
+        if decrypted_count == 0:
+            msg = await update.message.reply_text(
+                f"Could not decrypt any TOTP entries for vault {vault_id}.\n"
+                f"Total entries: {total}, Failed: {failed}"
+            )
+            asyncio.create_task(auto_delete_msg(msg, delay=120))
+            return
+        from collections import Counter
+        hash_counts = Counter(secret_hashes)
+        unique_secrets = len(hash_counts)
+        duplicate_entries = decrypted_count - unique_secrets
+        dup_percent = (duplicate_entries / decrypted_count) * 100 if decrypted_count > 0 else 0
+        uname_str = f"@{u['tg_username']}" if u["tg_username"] else str(u["telegram_id"])
+        result_lines = [
+            f"TOTP Duplicate Report",
+            f"Vault      : {vault_id}",
+            f"User       : {uname_str}",
+            f"",
+            f"Total TOTP       : {total}",
+            f"Decrypted OK     : {decrypted_count}",
+            f"Unique Secrets   : {unique_secrets}",
+            f"Duplicate Entries: {duplicate_entries}",
+            f"",
+            f"Duplicate %: {dup_percent:.1f}%",
+        ]
+        if failed > 0:
+            result_lines.append(f"(Failed to decrypt: {failed} entries)")
+        result_text = "\n".join(result_lines)
+        msg = await update.message.reply_text(result_text)
+        asyncio.create_task(auto_delete_msg(msg, delay=300))
         return
-    vault_id = u["vault_id"]
-    # Load all TOTP entries for this vault
-    with get_db() as c:
-        totp_rows = c.execute(
-            "SELECT id, name, secret_enc, salt, iv FROM totp_accounts WHERE vault_id=?",
-            (vault_id,)
-        ).fetchall()
-    total = len(totp_rows)
-    if total == 0:
-        msg = await update.message.reply_text(
-            f"Vault {vault_id} has no TOTP accounts. Duplicate check: 0%."
-        )
-        asyncio.create_task(auto_delete_msg(msg, delay=120))
-        return
-    # Decrypt all secrets and find duplicates
-    # We need the live password from RAM cache to decrypt
-    live_pw = _session_pw_cache.get(vault_id)
-    if not live_pw:
-        live_pw = _oab_load_password(u["telegram_id"], vault_id)
-    if not live_pw:
-        msg = await update.message.reply_text(
-            f"Cannot check TOTP duplicates for vault {vault_id}.\n"
-            "User must log in at least once for their password to be available in the current session."
-        )
-        asyncio.create_task(auto_delete_msg(msg, delay=120))
-        return
-    progress = await update.message.reply_text("Decrypting TOTP entries, please wait...")
-    def _decrypt_and_check():
-        vault_key = _get_vault_key(vault_id, live_pw)
-        secret_hashes = []
-        failed = 0
-        for row in totp_rows:
-            try:
-                plain = decrypt(row["secret_enc"], row["salt"], row["iv"], vault_key, vault_id)
-                # Normalize: clean the secret before hashing so JBSWY3DPEHPK3PXP and
-                # jbswy3dpehpk3pxp are treated as the same secret
-                normalized = clean_secret(plain)
-                secret_hashes.append(hashlib.sha256(normalized.encode()).hexdigest())
-            except Exception:
-                failed += 1
-        return secret_hashes, failed
-    secret_hashes, failed = await asyncio.to_thread(_decrypt_and_check)
-    try:
-        await progress.delete()
-    except Exception:
-        pass
-    decrypted_count = len(secret_hashes)
-    if decrypted_count == 0:
-        msg = await update.message.reply_text(
-            f"Could not decrypt any TOTP entries for vault {vault_id}.\n"
-            f"Total entries: {total}, Failed: {failed}"
-        )
-        asyncio.create_task(auto_delete_msg(msg, delay=120))
-        return
-    # Count unique vs duplicate secrets
-    from collections import Counter
-    hash_counts = Counter(secret_hashes)
-    unique_secrets = len(hash_counts)
-
-    # Duplicate entries: entries beyond the first unique secret (extra copies)
-    duplicate_entries = decrypted_count - unique_secrets
-    # Duplicate % = (duplicate_entries / total decrypted) * 100
-    dup_percent = (duplicate_entries / decrypted_count) * 100 if decrypted_count > 0 else 0
-
-    uname_str = f"@{u['tg_username']}" if u["tg_username"] else str(u["telegram_id"])
-
-    result_lines = [
-        f"TOTP Duplicate Report",
-        f"Vault      : {vault_id}",
-        f"User       : {uname_str}",
-        f"",
-        f"Total TOTP       : {total}",
-        f"Decrypted OK     : {decrypted_count}",
-        f"Unique Secrets   : {unique_secrets}",
-        f"Duplicate Entries: {duplicate_entries}",
-        f"",
-        f"Duplicate %: {dup_percent:.1f}%",
-    ]
-    if failed > 0:
-        result_lines.append(f"(Failed to decrypt: {failed} entries)")
-
-    result_text = "\n".join(result_lines)
-    msg = await update.message.reply_text(result_text)
-    asyncio.create_task(auto_delete_msg(msg, delay=300))
-    return
 
     if step == "adm_buc_offline_weekly_wait":
         _admin_import_pending.pop(chat_id, None)
