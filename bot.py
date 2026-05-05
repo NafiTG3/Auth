@@ -4793,65 +4793,31 @@ async def _do_import(update_or_cb, ctx, vault: str, accounts: list, mode: str = 
     def _do_all_crypto():
         nonlocal imported, skipped, replaced
         with get_db() as c:
-            existing_rows = c.execute(
-                "SELECT id, name, secret_enc, salt, iv FROM totp_accounts WHERE vault_id=?", (vault,)
-            ).fetchall()
-            existing_by_name    = {r["name"]: r["id"] for r in existing_rows}
-            existing_secrets    = set()
-            undecryptable_names = set()
-            for r in existing_rows:
-                try:
-                    plain = decrypt(r["secret_enc"], r["salt"], r["iv"], vault_key, vault)
-                    existing_secrets.add(hashlib.sha256(plain.encode()).hexdigest())
-                except Exception as e:
-                    logger.warning(f"Import dup check: decrypt failed for '{r['name']}': {e}")
-                    undecryptable_names.add(r["name"])
-
             for acc in accounts:
                 try:
                     ok, secret = validate_secret(acc.get("secret", ""))
                     if not ok:
                         nonlocal_skip()
                         continue
-                    note        = (acc.get("note", "") or "")[:NOTE_MAX_LEN]
+                    note  = (acc.get("note", "") or "")[:NOTE_MAX_LEN]
                     totp_now(secret)
-                    secret_hash = hashlib.sha256(secret.encode()).hexdigest()
-                    ct, s, iv   = encrypt(secret, vault_key, vault)
+                    ct, s, iv = encrypt(secret, vault_key, vault)
                     sk_ct = sk_s = sk_iv = None
                     if sk:
                         sk_ct, sk_s, sk_iv = sk_encrypt_totp(secret.encode(), sk, vault)
-                    name_exists   = acc["name"] in existing_by_name
-                    secret_exists = secret_hash in existing_secrets
-                    if name_exists and acc["name"] in undecryptable_names:
-                        nonlocal_skip()
-                    elif name_exists and secret_exists:
-                        if mode == "replace":
-                            c.execute(
-                                "UPDATE totp_accounts SET issuer=?, secret_enc=?, salt=?, iv=?, "
-                                "sk_enc=?, sk_salt=?, sk_iv=?, note=?, account_type='totp', hotp_counter=0 "
-                                "WHERE id=?",
-                                (acc.get("issuer", ""), ct, s, iv, sk_ct, sk_s, sk_iv,
-                                 note, existing_by_name[acc["name"]]),
-                            )
-                            nonlocal_replace()
-                        else:
-                            nonlocal_skip()
-                    else:
-                        c.execute(
-                            "INSERT INTO totp_accounts "
-                            "(vault_id, name, issuer, secret_enc, salt, iv, sk_enc, sk_salt, sk_iv, "
-                            "note, account_type, hotp_counter) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-                            (vault, acc["name"], acc.get("issuer", ""), ct, s, iv,
-                             sk_ct, sk_s, sk_iv, note, "totp", 0),
-                        )
-                        existing_secrets.add(secret_hash)
-                        nonlocal_import()
-                        record_stat("totp_added", vault_id=vault)  # count imports same as manual adds
+                    c.execute(
+                        "INSERT INTO totp_accounts "
+                        "(vault_id, name, issuer, secret_enc, salt, iv, sk_enc, sk_salt, sk_iv, "
+                        "note, account_type, hotp_counter) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                        (vault, acc["name"], acc.get("issuer", ""), ct, s, iv,
+                         sk_ct, sk_s, sk_iv, note, "totp", 0),
+                    )
+                    nonlocal_import()
+                    record_stat("totp_added", vault_id=vault)
                 except Exception as e:
-                    logger.error(f"Import entry '{acc.get('name','?')}': {e}")
+                    logger.error(f"Import entry '{acc.get("name","?")}': {e}")
                     nonlocal_skip()
             c.commit()
-
     # nonlocal helpers (closures can't assign to outer nonlocal in nested def easily)
     _counts = [0, 0, 0]  # [imported, skipped, replaced]
     def nonlocal_import():  _counts[0] += 1
