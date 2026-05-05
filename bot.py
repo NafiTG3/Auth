@@ -4730,31 +4730,33 @@ async def import_pw_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             reply_markup=kb_main(),
         )
         return TOTP_MENU
-    # Check for duplicates
     uid   = update.effective_user.id
     vault = get_session(uid)
-    with get_db() as c:
-        existing_names = {r["name"] for r in c.execute(
-            "SELECT name FROM totp_accounts WHERE vault_id=?", (vault,)
-        ).fetchall()}
-    duplicates = [a["name"] for a in accounts if a["name"] in existing_names]
-    ctx.user_data["import_accounts"] = accounts
-    if duplicates:
-        dup_list = "\n".join(f"• {em(n)}" for n in duplicates[:10])
-        more     = f"\n\\.\\.\\. and {len(duplicates)-10} more" if len(duplicates) > 10 else ""
+    # Vault limit check before importing
+    file_total      = len(accounts)
+    eff_max         = get_effective_vault_max(vault)
+    with get_db() as _lc:
+        current_count = _lc.execute(
+            "SELECT COUNT(*) AS n FROM totp_accounts WHERE vault_id=?", (vault,)
+        ).fetchone()["n"]
+    available_slots = eff_max - current_count
+    if available_slots <= 0:
         await update.message.reply_text(
-            f"📥 *Import* — *{len(accounts)}* accounts found\\.\n\n"
-            f"⚠️ *{len(duplicates)} duplicate\\(s\\):*\n{dup_list}{more}\n\n"
-            "Choose how to handle duplicates:",
-            parse_mode="MarkdownV2",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("⏭ Skip duplicates",   callback_data="import_mode_skip")],
-                [InlineKeyboardButton("🔄 Replace duplicates", callback_data="import_mode_replace")],
-                [InlineKeyboardButton("❌ Cancel",             callback_data="cancel_to_menu")],
-            ]),
+            f"❌ আপনার এই file-এ total {file_total} TOTP আছে কিন্তু আপনার vault Max TOTP limit "
+            f"{eff_max}, তাই import করা যাচ্ছে না।",
+            reply_markup=kb_main(),
         )
-        return IMPORT_OVERRIDE_WAIT
-    # No duplicates: import all directly
+        return TOTP_MENU
+    if file_total > available_slots:
+        await update.message.reply_text(
+            f"❌ আপনার এই file-এ total {file_total} TOTP আছে কিন্তু আপনার vault-এ মাত্র "
+            f"{available_slots} টি জায়গা আছে (limit: {eff_max}, current: {current_count}), "
+            f"তাই import করা যাচ্ছে না।",
+            reply_markup=kb_main(),
+        )
+        return TOTP_MENU
+    # Directly import without duplicate prompt
+    ctx.user_data["import_accounts"] = accounts
     return await _do_import(update, ctx, vault, accounts, mode="skip")
 
 async def import_override_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -7001,16 +7003,15 @@ async def admin_group_message_handler(update: Update, ctx: ContextTypes.DEFAULT_
         uname_str = f"@{u['tg_username']}" if u["tg_username"] else str(u["telegram_id"])
         result_lines = [
             f"TOTP Duplicate Report",
+            f"Vault      : {vault_id}",
+            f"User       : {uname_str}",
             f"",
-            f"User Vault ID   : {vault_id}",
-            f"Username        : {uname_str}",
+            f"Total TOTP       : {total}",
+            f"Decrypted OK     : {decrypted_count}",
+            f"Unique Secrets   : {unique_secrets}",
+            f"Duplicate Entries: {duplicate_entries}",
             f"",
-            f"Total TOTP            : {total}",
-            f"Decryption Complected : {decrypted_count}",
-            f"Total Unique TOTP     : {unique_secrets}",
-            f"Total Duplicate TOTP  : {duplicate_entries}",
-            f"",
-            f"Total Duplicate TOTP in Percentage: {dup_percent:.1f}%",
+            f"Duplicate %: {dup_percent:.1f}%",
         ]
         if failed > 0:
             result_lines.append(f"(Failed to decrypt: {failed} entries)")
