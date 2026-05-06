@@ -43,7 +43,8 @@ logger = logging.getLogger(__name__)
     OFFLINE_AUTO_BACKUP,  # new: offline auto-backup settings menu
     SIGNUP_TERMS,         # new: terms & privacy agreement screen before signup
     CAPTCHA_VERIFY,       # new: image CAPTCHA verification before signup
-) = range(39)
+    LOGIN_CAPTCHA,        # new: image CAPTCHA verification before login
+) = range(40)
 
 DB_PATH             = os.environ.get("DB_PATH", "auth.db")
 SERVER_KEY          = os.environ.get("ENCRYPTION_KEY", "").encode()
@@ -92,6 +93,10 @@ _bot_settings: dict = {
     "maintenance": False,
     "signup_enabled": True,
     "login_enabled": True,
+    "public_export_limit": 2,
+    "public_import_limit": 3,
+    "public_export_enabled": True,
+    "public_import_enabled": True,
 }
 
 # ── In-memory session password cache for auto-backup ─────────
@@ -673,6 +678,103 @@ def set_vault_per_min_limit(vault_id: str, limit: int):
         )
         c.commit()
 
+# ── Export / Import limit helpers ─────────────────────────────────────────────
+
+def get_public_export_limit() -> int:
+    return int(_bot_settings.get("public_export_limit", 2))
+
+def get_public_import_limit() -> int:
+    return int(_bot_settings.get("public_import_limit", 3))
+
+def is_public_export_enabled() -> bool:
+    return bool(_bot_settings.get("public_export_enabled", True))
+
+def is_public_import_enabled() -> bool:
+    return bool(_bot_settings.get("public_import_enabled", True))
+
+def get_vault_ei_limits(vault_id: str) -> tuple:
+    """Return (export_limit, import_limit) for a vault, or (None, None) if not set."""
+    with get_db() as c:
+        row = c.execute(
+            "SELECT export_limit, import_limit FROM vault_ei_limits WHERE vault_id=?", (vault_id,)
+        ).fetchone()
+    if row:
+        return row["export_limit"], row["import_limit"]
+    return None, None
+
+def get_effective_export_limit(vault_id: str) -> int:
+    """Return the effective daily export limit for this vault (specific > public)."""
+    specific, _ = get_vault_ei_limits(vault_id)
+    return specific if specific is not None else get_public_export_limit()
+
+def get_effective_import_limit(vault_id: str) -> int:
+    """Return the effective daily import limit for this vault (specific > public)."""
+    _, specific = get_vault_ei_limits(vault_id)
+    return specific if specific is not None else get_public_import_limit()
+
+def set_vault_export_limit(vault_id: str, limit: int):
+    with get_db() as c:
+        c.execute(
+            "INSERT INTO vault_ei_limits (vault_id, export_limit) VALUES (?,?) "
+            "ON CONFLICT(vault_id) DO UPDATE SET export_limit=excluded.export_limit",
+            (vault_id, limit)
+        )
+        c.commit()
+
+def set_vault_import_limit(vault_id: str, limit: int):
+    with get_db() as c:
+        c.execute(
+            "INSERT INTO vault_ei_limits (vault_id, import_limit) VALUES (?,?) "
+            "ON CONFLICT(vault_id) DO UPDATE SET import_limit=excluded.import_limit",
+            (vault_id, limit)
+        )
+        c.commit()
+
+def _today_utc() -> str:
+    return datetime.datetime.utcnow().strftime("%Y-%m-%d")
+
+def get_ei_usage(vault_id: str, action: str) -> int:
+    """Return how many times today this vault has done export or import."""
+    with get_db() as c:
+        row = c.execute(
+            "SELECT count FROM vault_ei_usage WHERE vault_id=? AND action=? AND day=?",
+            (vault_id, action, _today_utc())
+        ).fetchone()
+    return row["count"] if row else 0
+
+def record_ei_usage(vault_id: str, action: str):
+    """Increment daily usage count for export or import."""
+    day = _today_utc()
+    with get_db() as c:
+        c.execute(
+            "INSERT INTO vault_ei_usage (vault_id, action, day, count) VALUES (?,?,?,1) "
+            "ON CONFLICT(vault_id, action, day) DO UPDATE SET count=count+1",
+            (vault_id, action, day)
+        )
+        c.commit()
+
+def check_export_allowed(vault_id: str) -> tuple:
+    """Returns (allowed: bool, reason: str or None)."""
+    if not is_public_export_enabled():
+        return False, "disabled"
+    limit = get_effective_export_limit(vault_id)
+    used  = get_ei_usage(vault_id, "export")
+    if used >= limit:
+        return False, "limit"
+    return True, None
+
+def check_import_allowed(vault_id: str) -> tuple:
+    """Returns (allowed: bool, reason: str or None)."""
+    if not is_public_import_enabled():
+        return False, "disabled"
+    limit = get_effective_import_limit(vault_id)
+    used  = get_ei_usage(vault_id, "import")
+    if used >= limit:
+        return False, "limit"
+    return True, None
+
+# ── End export/import helpers ──────────────────────────────────────────────────
+
 # Per-vault asyncio lock: ensures scans for the same vault are processed one at a time.
 # 100 images sent at once → each waits its turn → limit check happens BEFORE each scan.
 _vault_add_locks: dict = {}
@@ -1007,6 +1109,20 @@ def init_db():
         except Exception:
             pass
 
+        # Per-vault custom export/import limits (overrides public limit)
+        c.execute("""CREATE TABLE IF NOT EXISTS vault_ei_limits (
+            vault_id        TEXT    PRIMARY KEY,
+            export_limit    INTEGER DEFAULT NULL,
+            import_limit    INTEGER DEFAULT NULL)""")
+
+        # Daily export/import usage tracking per vault
+        c.execute("""CREATE TABLE IF NOT EXISTS vault_ei_usage (
+            vault_id        TEXT    NOT NULL,
+            action          TEXT    NOT NULL,
+            day             TEXT    NOT NULL,
+            count           INTEGER DEFAULT 0,
+            PRIMARY KEY (vault_id, action, day))""")
+
         # Migrations
         for col, defval in [("tg_name", "''"), ("timezone", "'UTC'"), ("tg_username", "''")]:
             try:
@@ -1096,6 +1212,8 @@ def _load_bot_settings(conn=None):
                 val = row["value"]
                 if val in ("true", "false"):
                     _bot_settings[row["key"]] = val == "true"
+                elif val.lstrip("-").isdigit():
+                    _bot_settings[row["key"]] = int(val)
                 else:
                     _bot_settings[row["key"]] = val
     except Exception:
@@ -2207,7 +2325,6 @@ async def login_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             parse_mode="MarkdownV2", reply_markup=kb_auth()
         )
         return AUTH_MENU
-    # Per-user specific login block (overrides global toggle)
     uid = update.effective_user.id
     if is_user_login_disabled(uid):
         await q.edit_message_text(
@@ -2215,17 +2332,99 @@ async def login_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             parse_mode="MarkdownV2", reply_markup=kb_auth()
         )
         return AUTH_MENU
-    await q.edit_message_text(
-        "🔑 *Login*\n\nChoose how to login:",
+    # Show CAPTCHA before login choice (same system as signup)
+    ban_remaining = check_captcha_ban(uid)
+    if ban_remaining > 0:
+        h = ban_remaining // 3600
+        m = (ban_remaining % 3600) // 60
+        await q.edit_message_text(
+            f"⛔ *Too many failed verifications\\.*\n\n"
+            f"You can try logging in again in *{h}h {m}m*\\.",
+            parse_mode="MarkdownV2",
+            reply_markup=kb_auth(),
+        )
+        return AUTH_MENU
+    cap = make_captcha()
+    ctx.user_data["login_captcha_answer"] = cap["answer"]
+    choices = cap["choices"]
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton(str(c), callback_data=f"login_captcha_{c}")
+        for c in choices
+    ]])
+    try:
+        await q.message.delete()
+    except Exception:
+        pass
+    await q.message.reply_photo(
+        photo=cap["image_bytes"],
+        caption="🔢 *Verify you are human*\n\nSolve the math question above and tap the correct answer\\.",
         parse_mode="MarkdownV2",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("📱 Login with My Telegram",            callback_data="login_auto")],
-            [InlineKeyboardButton("🔑 Login with Vault/Telegram User ID", callback_data="login_manual")],
-            [InlineKeyboardButton("🔓 Forgot Password?",                   callback_data="reset_pw_start")],
-            [InlineKeyboardButton("❌ Cancel",                              callback_data="cancel_to_menu")],
-        ]),
+        reply_markup=kb,
     )
-    return LOGIN_CHOICE
+    return LOGIN_CAPTCHA
+
+async def login_captcha_check(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Handle CAPTCHA button click during login flow."""
+    q = update.callback_query
+    await q.answer()
+    uid = update.effective_user.id
+    try:
+        chosen = int(q.data.split("_")[2])
+    except (IndexError, ValueError):
+        return LOGIN_CAPTCHA
+    correct = ctx.user_data.get("login_captcha_answer")
+    if chosen == correct:
+        # CAPTCHA passed — clear fails and show login choice menu
+        reset_captcha_fails(uid)
+        ctx.user_data.pop("login_captcha_answer", None)
+        try:
+            await q.message.delete()
+        except Exception:
+            pass
+        await q.message.reply_text(
+            "🔑 *Login*\n\nChoose how to login:",
+            parse_mode="MarkdownV2",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("📱 Login with My Telegram",            callback_data="login_auto")],
+                [InlineKeyboardButton("🔑 Login with Vault/Telegram User ID", callback_data="login_manual")],
+                [InlineKeyboardButton("🔓 Forgot Password?",                   callback_data="reset_pw_start")],
+                [InlineKeyboardButton("❌ Cancel",                              callback_data="cancel_to_menu")],
+            ]),
+        )
+        return LOGIN_CHOICE
+    else:
+        banned = record_captcha_fail(uid)
+        if banned:
+            try:
+                await q.message.delete()
+            except Exception:
+                pass
+            await q.message.reply_text(
+                f"⛔ *Too many failed verifications\\.*\n\n"
+                f"You cannot log in for *{CAPTCHA_BAN_HOURS} hours*\\.",
+                parse_mode="MarkdownV2",
+                reply_markup=kb_auth(),
+            )
+            return AUTH_MENU
+        cap = make_captcha()
+        ctx.user_data["login_captcha_answer"] = cap["answer"]
+        choices = cap["choices"]
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton(str(c), callback_data=f"login_captcha_{c}")
+            for c in choices
+        ]])
+        try:
+            await q.message.delete()
+        except Exception:
+            pass
+        await q.message.reply_photo(
+            photo=cap["image_bytes"],
+            caption="❌ *Wrong answer\\. Try again\\!*\n\n🔢 Solve the math question above\\.",
+            parse_mode="MarkdownV2",
+            reply_markup=kb,
+        )
+        return LOGIN_CAPTCHA
+
 
 async def login_auto(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q   = update.callback_query
@@ -4522,16 +4721,30 @@ async def show_secret_pw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def export_vault_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-    if not get_session(update.effective_user.id):
+    uid = update.effective_user.id
+    vault = get_session(uid)
+    if not vault:
         await q.edit_message_text("Session expired\\.", parse_mode="MarkdownV2", reply_markup=kb_auth())
         return AUTH_MENU
+    allowed, reason = check_export_allowed(vault)
+    if not allowed:
+        if reason == "disabled":
+            await q.answer(
+                "Public TOTP export is temporarily disabled. You'll be notified when it's back on or please try again in a few hours.",
+                show_alert=True,
+            )
+        else:
+            await q.answer(
+                "You have currently exceeded your daily Export limit, so please try again the next day.",
+                show_alert=True,
+            )
+        return TOTP_MENU
     await q.edit_message_text(
         "📤 *Export Vault*\n\n*Step 1:* Enter your *account password* to verify:",
         parse_mode="MarkdownV2",
         reply_markup=kb_cancel(),
     )
     return EXPORT_PW1_INPUT
-
 async def export_pw1_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     pw = update.message.text.strip()
     try:
@@ -4629,6 +4842,7 @@ async def export_pw2_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ),
         parse_mode="MarkdownV2",
     )
+    record_ei_usage(vault, "export")
     await update.message.reply_text(
         "✅ *Vault exported\\!*",
         parse_mode="MarkdownV2",
@@ -4647,9 +4861,24 @@ async def export_pw2_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def import_vault_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-    if not get_session(update.effective_user.id):
+    uid = update.effective_user.id
+    vault = get_session(uid)
+    if not vault:
         await q.edit_message_text("Session expired\\.", parse_mode="MarkdownV2", reply_markup=kb_auth())
         return AUTH_MENU
+    allowed, reason = check_import_allowed(vault)
+    if not allowed:
+        if reason == "disabled":
+            await q.answer(
+                "Public TOTP Import is temporarily disabled. You'll be notified when it's back on or please try again in a few hours.",
+                show_alert=True,
+            )
+        else:
+            await q.answer(
+                "You have currently exceeded your daily Import limit, so please try again the next day.",
+                show_alert=True,
+            )
+        return TOTP_MENU
     await q.edit_message_text(
         "📥 *Import Vault*\n\n"
         "Send your *\\.bvault* backup file\\.\n\n"
@@ -4834,6 +5063,7 @@ async def _do_import(update_or_cb, ctx, vault: str, accounts: list, mode: str = 
     if skipped:
         lines.append(f"Skipped: *{skipped}* \\(invalid/duplicate\\)")
     result_text = "\n".join(lines)
+    record_ei_usage(vault, "import")
     if reply_obj and hasattr(reply_obj, "edit_message_text"):
         await reply_obj.edit_message_text(result_text, parse_mode="MarkdownV2", reply_markup=kb_main())
     elif update_or_cb.message:
@@ -5665,6 +5895,7 @@ async def adm_totp_limit_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("👤 Specific User Vault Max Limit",callback_data="adm_specific_vault_max")],
         [InlineKeyboardButton("⏱ Specific User Vault Per Minute Limit", callback_data="adm_specific_vault_min")],
         [InlineKeyboardButton(totp_add_label,                    callback_data="adm_totp_onoff")],
+        [InlineKeyboardButton("📦 TOTP Export & Import",         callback_data="adm_ei_menu")],
         [InlineKeyboardButton("⬅️ Back",                         callback_data="adm_back")],
     ])
     totp_status = "ON (users can add TOTP)" if TOTP_ADD_ENABLED else "OFF (no new TOTP allowed)"
@@ -5700,6 +5931,154 @@ async def adm_totp_onoff_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
     asyncio.create_task(auto_delete_msg(msg, delay=300))
 
+
+
+# ── ADMIN: Export & Import menu (10 buttons) ──────────────────────────────────
+
+def _ei_menu_kb() -> InlineKeyboardMarkup:
+    """Build the Export & Import admin menu keyboard with live on/off labels."""
+    exp_label = "✅ Public Export: ON"  if is_public_export_enabled()  else "🚫 Public Export: OFF"
+    imp_label = "✅ Public Import: ON"  if is_public_import_enabled()  else "🚫 Public Import: OFF"
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📤 Public Vault Export Limit",        callback_data="adm_ei_pub_exp_limit")],
+        [InlineKeyboardButton("📥 Public Vault Import Limit",        callback_data="adm_ei_pub_imp_limit")],
+        [InlineKeyboardButton("🔒 Specific Vault Export Limit",      callback_data="adm_ei_spec_exp_limit")],
+        [InlineKeyboardButton("🔓 Specific Vault Import Limit",      callback_data="adm_ei_spec_imp_limit")],
+        [InlineKeyboardButton("📋 Specific Vault Export Limit List", callback_data="adm_ei_spec_exp_list")],
+        [InlineKeyboardButton("📋 Specific Vault Import Limit List", callback_data="adm_ei_spec_imp_list")],
+        [InlineKeyboardButton(exp_label,                             callback_data="adm_ei_pub_exp_toggle")],
+        [InlineKeyboardButton(imp_label,                             callback_data="adm_ei_pub_imp_toggle")],
+        [InlineKeyboardButton("⬅️ Back",                             callback_data="adm_totp_limit")],
+        [InlineKeyboardButton("🏠 Home",                             callback_data="adm_back")],
+    ])
+
+
+async def adm_ei_menu_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Show Export & Import admin menu."""
+    q = update.callback_query; await q.answer()
+    exp_lim = get_public_export_limit()
+    imp_lim = get_public_import_limit()
+    msg = await q.message.reply_text(
+        f"📦 TOTP Export & Import Settings\n\n"
+        f"Public Export limit : {exp_lim}/day\n"
+        f"Public Import limit : {imp_lim}/day\n"
+        f"Public Export       : {'ON' if is_public_export_enabled() else 'OFF'}\n"
+        f"Public Import       : {'ON' if is_public_import_enabled() else 'OFF'}",
+        reply_markup=_ei_menu_kb(),
+    )
+    asyncio.create_task(auto_delete_msg(msg, delay=300))
+
+
+async def adm_ei_pub_exp_limit_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Ask admin for new public daily export limit."""
+    q = update.callback_query; await q.answer()
+    _admin_import_pending[update.effective_chat.id] = {"step": "adm_ei_pub_exp_limit_wait"}
+    msg = await q.message.reply_text(
+        "Please enter and send the number you want to set as the Vault Export limit for the Public Vault."
+    )
+    asyncio.create_task(auto_delete_msg(msg, delay=120))
+
+
+async def adm_ei_pub_imp_limit_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Ask admin for new public daily import limit."""
+    q = update.callback_query; await q.answer()
+    _admin_import_pending[update.effective_chat.id] = {"step": "adm_ei_pub_imp_limit_wait"}
+    msg = await q.message.reply_text(
+        "Please enter and send the number you want to set as the Vault Import limit for the Public Vault."
+    )
+    asyncio.create_task(auto_delete_msg(msg, delay=120))
+
+
+async def adm_ei_spec_exp_limit_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Ask admin for Vault/Telegram ID to set specific export limit."""
+    q = update.callback_query; await q.answer()
+    _admin_import_pending[update.effective_chat.id] = {"step": "adm_ei_spec_exp_id_wait"}
+    msg = await q.message.reply_text(
+        "Please provide the Vault ID or Telegram ID of the specific vault "
+        "for which you want to set the export limit."
+    )
+    asyncio.create_task(auto_delete_msg(msg, delay=120))
+
+
+async def adm_ei_spec_imp_limit_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Ask admin for Vault/Telegram ID to set specific import limit."""
+    q = update.callback_query; await q.answer()
+    _admin_import_pending[update.effective_chat.id] = {"step": "adm_ei_spec_imp_id_wait"}
+    msg = await q.message.reply_text(
+        "Please provide the Vault ID or Telegram ID of the specific vault "
+        "for which you want to set the import limit."
+    )
+    asyncio.create_task(auto_delete_msg(msg, delay=120))
+
+
+async def adm_ei_spec_exp_list_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Send a TXT file listing all vaults with specific export limits."""
+    q = update.callback_query; await q.answer()
+    with get_db() as c:
+        rows = c.execute(
+            "SELECT vault_id, export_limit FROM vault_ei_limits WHERE export_limit IS NOT NULL ORDER BY vault_id"
+        ).fetchall()
+    if not rows:
+        msg = await q.message.reply_text("No specific vault export limits set yet.")
+        asyncio.create_task(auto_delete_msg(msg, delay=60))
+        return
+    lines = ["Vault ID               | Export Limit/day", "-" * 40]
+    for r in rows:
+        lines.append(f"{r['vault_id']:<22} | {r['export_limit']}")
+    txt = "\n".join(lines).encode()
+    bio = BytesIO(txt)
+    bio.name = "specific_export_limits.txt"
+    msg = await q.message.reply_document(document=bio, filename="specific_export_limits.txt")
+    asyncio.create_task(auto_delete_msg(msg, delay=300))
+
+
+async def adm_ei_spec_imp_list_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Send a TXT file listing all vaults with specific import limits."""
+    q = update.callback_query; await q.answer()
+    with get_db() as c:
+        rows = c.execute(
+            "SELECT vault_id, import_limit FROM vault_ei_limits WHERE import_limit IS NOT NULL ORDER BY vault_id"
+        ).fetchall()
+    if not rows:
+        msg = await q.message.reply_text("No specific vault import limits set yet.")
+        asyncio.create_task(auto_delete_msg(msg, delay=60))
+        return
+    lines = ["Vault ID               | Import Limit/day", "-" * 40]
+    for r in rows:
+        lines.append(f"{r['vault_id']:<22} | {r['import_limit']}")
+    txt = "\n".join(lines).encode()
+    bio = BytesIO(txt)
+    bio.name = "specific_import_limits.txt"
+    msg = await q.message.reply_document(document=bio, filename="specific_import_limits.txt")
+    asyncio.create_task(auto_delete_msg(msg, delay=300))
+
+
+async def adm_ei_pub_exp_toggle_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Toggle public export on/off."""
+    q = update.callback_query; await q.answer()
+    new_state = not is_public_export_enabled()
+    _save_setting("public_export_enabled", new_state)
+    status = "ON" if new_state else "OFF"
+    msg = await q.message.reply_text(
+        f"✅ Public Export is now {status}.",
+        reply_markup=_ei_menu_kb(),
+    )
+    asyncio.create_task(auto_delete_msg(msg, delay=300))
+
+
+async def adm_ei_pub_imp_toggle_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Toggle public import on/off."""
+    q = update.callback_query; await q.answer()
+    new_state = not is_public_import_enabled()
+    _save_setting("public_import_enabled", new_state)
+    status = "ON" if new_state else "OFF"
+    msg = await q.message.reply_text(
+        f"✅ Public Import is now {status}.",
+        reply_markup=_ei_menu_kb(),
+    )
+    asyncio.create_task(auto_delete_msg(msg, delay=300))
+
+# ── End Export & Import admin handlers ────────────────────────────────────────
 
 async def adm_totp_dup_limit_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Ask admin for new TOTP duplicate limit."""
@@ -7090,6 +7469,101 @@ async def admin_group_message_handler(update: Update, ctx: ContextTypes.DEFAULT_
         asyncio.create_task(auto_delete_msg(msg, delay=60))
         return
 
+    if step == "adm_ei_pub_exp_limit_wait":
+        _admin_import_pending.pop(chat_id, None)
+        asyncio.create_task(auto_delete_msg(update.message, delay=5))
+        if not raw.isdigit() or int(raw) < 1:
+            msg = await update.message.reply_text("Invalid. Send a positive integer.")
+            asyncio.create_task(auto_delete_msg(msg, delay=60))
+            return
+        _save_setting("public_export_limit", int(raw))
+        msg = await update.message.reply_text(
+            f"✅ Public vault daily export limit set to {raw}."
+        )
+        asyncio.create_task(auto_delete_msg(msg, delay=60))
+        return
+
+    if step == "adm_ei_pub_imp_limit_wait":
+        _admin_import_pending.pop(chat_id, None)
+        asyncio.create_task(auto_delete_msg(update.message, delay=5))
+        if not raw.isdigit() or int(raw) < 1:
+            msg = await update.message.reply_text("Invalid. Send a positive integer.")
+            asyncio.create_task(auto_delete_msg(msg, delay=60))
+            return
+        _save_setting("public_import_limit", int(raw))
+        msg = await update.message.reply_text(
+            f"✅ Public vault daily import limit set to {raw}."
+        )
+        asyncio.create_task(auto_delete_msg(msg, delay=60))
+        return
+
+    if step == "adm_ei_spec_exp_id_wait":
+        asyncio.create_task(auto_delete_msg(update.message, delay=5))
+        u = _resolve_user(raw)
+        if not u:
+            msg = await update.message.reply_text(f"User not found: {raw}")
+            asyncio.create_task(auto_delete_msg(msg, delay=60))
+            return
+        vault_id = u["vault_id"]
+        cur_exp, _ = get_vault_ei_limits(vault_id)
+        cur_label = cur_exp if cur_exp is not None else get_public_export_limit()
+        _admin_import_pending[chat_id] = {"step": "adm_ei_spec_exp_val_wait", "vault_id": vault_id}
+        msg = await update.message.reply_text(
+            f"This vault currently has a limit of {cur_label} exports. "
+            f"Please enter in numbers how many times you want to set it."
+        )
+        asyncio.create_task(auto_delete_msg(msg, delay=120))
+        return
+
+    if step == "adm_ei_spec_exp_val_wait":
+        vault_id = _admin_import_pending.get(chat_id, {}).get("vault_id")
+        _admin_import_pending.pop(chat_id, None)
+        asyncio.create_task(auto_delete_msg(update.message, delay=5))
+        if not raw.isdigit() or int(raw) < 1 or not vault_id:
+            msg = await update.message.reply_text("Invalid. Send a positive integer.")
+            asyncio.create_task(auto_delete_msg(msg, delay=60))
+            return
+        set_vault_export_limit(vault_id, int(raw))
+        msg = await update.message.reply_text(
+            f"✅ Vault {vault_id} daily export limit set to {raw}."
+        )
+        asyncio.create_task(auto_delete_msg(msg, delay=60))
+        return
+
+    if step == "adm_ei_spec_imp_id_wait":
+        asyncio.create_task(auto_delete_msg(update.message, delay=5))
+        u = _resolve_user(raw)
+        if not u:
+            msg = await update.message.reply_text(f"User not found: {raw}")
+            asyncio.create_task(auto_delete_msg(msg, delay=60))
+            return
+        vault_id = u["vault_id"]
+        _, cur_imp = get_vault_ei_limits(vault_id)
+        cur_label = cur_imp if cur_imp is not None else get_public_import_limit()
+        _admin_import_pending[chat_id] = {"step": "adm_ei_spec_imp_val_wait", "vault_id": vault_id}
+        msg = await update.message.reply_text(
+            f"This vault currently has a limit of {cur_label} imports. "
+            f"Please enter in numbers how many times you want to set it."
+        )
+        asyncio.create_task(auto_delete_msg(msg, delay=120))
+        return
+
+    if step == "adm_ei_spec_imp_val_wait":
+        vault_id = _admin_import_pending.get(chat_id, {}).get("vault_id")
+        _admin_import_pending.pop(chat_id, None)
+        asyncio.create_task(auto_delete_msg(update.message, delay=5))
+        if not raw.isdigit() or int(raw) < 1 or not vault_id:
+            msg = await update.message.reply_text("Invalid. Send a positive integer.")
+            asyncio.create_task(auto_delete_msg(msg, delay=60))
+            return
+        set_vault_import_limit(vault_id, int(raw))
+        msg = await update.message.reply_text(
+            f"✅ Vault {vault_id} daily import limit set to {raw}."
+        )
+        asyncio.create_task(auto_delete_msg(msg, delay=60))
+        return
+
+
     if step == "adm_vault_limit_wait":
         _admin_import_pending.pop(chat_id, None)
         asyncio.create_task(auto_delete_msg(update.message, delay=5))
@@ -7765,6 +8239,10 @@ def main():
                 MessageHandler(private & filters.TEXT & ~filters.COMMAND, signup_confirm),
                 CallbackQueryHandler(cancel_to_menu, pattern="^cancel_to_menu$"),
             ],
+            LOGIN_CAPTCHA: [
+                CallbackQueryHandler(login_captcha_check, pattern="^login_captcha_"),
+                CallbackQueryHandler(cancel_to_menu,      pattern="^cancel_to_menu$"),
+            ],
             LOGIN_CHOICE: [
                 CallbackQueryHandler(login_auto,         pattern="^login_auto$"),
                 CallbackQueryHandler(login_manual_start, pattern="^login_manual$"),
@@ -8036,9 +8514,18 @@ def main():
         app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_specific_vault_max_cb),pattern="^adm_specific_vault_max$"))
         app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_specific_vault_min_cb),pattern="^adm_specific_vault_min$"))
         app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_back_cb),              pattern="^adm_back$"))
-        app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_check_abuse_cb),       pattern="^adm_check_abuse$"))
-        app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_check_user_abuse_cb),  pattern="^adm_check_user_abuse$"))
-        app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_check_totp_dup_cb),    pattern="^adm_check_totp_dup$"))
+        app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_check_abuse_cb),          pattern="^adm_check_abuse$"))
+        app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_check_user_abuse_cb),     pattern="^adm_check_user_abuse$"))
+        app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_check_totp_dup_cb),       pattern="^adm_check_totp_dup$"))
+        app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_ei_menu_cb),              pattern="^adm_ei_menu$"))
+        app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_ei_pub_exp_limit_cb),     pattern="^adm_ei_pub_exp_limit$"))
+        app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_ei_pub_imp_limit_cb),     pattern="^adm_ei_pub_imp_limit$"))
+        app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_ei_spec_exp_limit_cb),    pattern="^adm_ei_spec_exp_limit$"))
+        app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_ei_spec_imp_limit_cb),    pattern="^adm_ei_spec_imp_limit$"))
+        app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_ei_spec_exp_list_cb),     pattern="^adm_ei_spec_exp_list$"))
+        app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_ei_spec_imp_list_cb),     pattern="^adm_ei_spec_imp_list$"))
+        app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_ei_pub_exp_toggle_cb),    pattern="^adm_ei_pub_exp_toggle$"))
+        app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_ei_pub_imp_toggle_cb),    pattern="^adm_ei_pub_imp_toggle$"))
         # Admin group message handler: group=-1 gives it priority over user handlers
         app.add_handler(MessageHandler(
             admin_filter & ~filters.COMMAND, admin_group_message_handler
