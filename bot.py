@@ -6805,10 +6805,30 @@ async def admin_group_message_handler(update: Update, ctx: ContextTypes.DEFAULT_
             return
         progress = await update.message.reply_text("⏳ Creating backup, please wait...")
         _backup_tables = [
-            "users", "totp_accounts", "sessions", "reset_otps",
-            "reset_attempts", "login_alerts", "share_links",
-            "login_attempts", "backup_reminders", "bot_settings",
+            "users",
+            "totp_accounts",
+            "sessions",
+            "reset_otps",
+            "reset_attempts",
+            "login_alerts",
+            "share_links",
+            "login_attempts",
+            "backup_reminders",
+            "bot_settings",
             "auto_backup_settings",
+            "daily_login_counts",
+            "weekly_signup_counts",
+            "vault_login_history",
+            "totp_add_rate",
+            "vault_custom_limits",
+            "user_signup_disabled",
+            "user_login_disabled",
+            "otp_request_log",
+            "captcha_attempts",
+            "telegram_banned",
+            "stats_events",
+            "vault_ei_limits",
+            "vault_ei_usage",
         ]
         dump = {}
         with get_db() as c:
@@ -6871,10 +6891,30 @@ async def admin_group_message_handler(update: Update, ctx: ContextTypes.DEFAULT_
             return
         progress = await update.message.reply_text("⏳ Restoring data, please wait...")
         _restore_tables = [
-            "users", "totp_accounts", "sessions", "reset_otps",
-            "reset_attempts", "login_alerts", "share_links",
-            "login_attempts", "backup_reminders", "bot_settings",
+            "users",
+            "totp_accounts",
+            "sessions",
+            "reset_otps",
+            "reset_attempts",
+            "login_alerts",
+            "share_links",
+            "login_attempts",
+            "backup_reminders",
+            "bot_settings",
             "auto_backup_settings",
+            "daily_login_counts",
+            "weekly_signup_counts",
+            "vault_login_history",
+            "totp_add_rate",
+            "vault_custom_limits",
+            "user_signup_disabled",
+            "user_login_disabled",
+            "otp_request_log",
+            "captcha_attempts",
+            "telegram_banned",
+            "stats_events",
+            "vault_ei_limits",
+            "vault_ei_usage",
         ]
         restored = []
         with get_db() as c:
@@ -8360,15 +8400,18 @@ def main():
             ADD_WAITING: [
                 MessageHandler(private & (filters.PHOTO | filters.Document.IMAGE), handle_add_input),
                 MessageHandler(private & filters.TEXT & ~filters.COMMAND, handle_add_input),
+                CallbackQueryHandler(main_menu_cb,   pattern="^main_menu$"),
                 CallbackQueryHandler(cancel_to_menu, pattern="^cancel_to_menu$"),
             ],
             ADD_MANUAL_NAME: [
                 MessageHandler(private & filters.TEXT & ~filters.COMMAND, handle_manual_name),
-                CallbackQueryHandler(cancel_to_menu, pattern="^cancel_to_menu$"),
+                CallbackQueryHandler(add_totp_start,  pattern="^add_totp$"),
+                CallbackQueryHandler(cancel_to_menu,  pattern="^cancel_to_menu$"),
             ],
             ADD_MANUAL_SECRET: [
                 MessageHandler(private & filters.TEXT & ~filters.COMMAND, handle_manual_secret),
-                CallbackQueryHandler(cancel_to_menu, pattern="^cancel_to_menu$"),
+                CallbackQueryHandler(add_totp_start,  pattern="^add_totp$"),
+                CallbackQueryHandler(cancel_to_menu,  pattern="^cancel_to_menu$"),
             ],
             EDIT_PICK: [
                 CallbackQueryHandler(edit_pick,    pattern=r"^editpick_\d+$"),
@@ -8383,63 +8426,79 @@ def main():
             ],
             EDIT_RENAME_INPUT: [
                 MessageHandler(private & filters.TEXT & ~filters.COMMAND, edit_rename_input),
-                CallbackQueryHandler(cancel_to_menu, pattern="^cancel_to_menu$"),
+                CallbackQueryHandler(edit_totp_start, pattern="^edit_totp$"),
+                CallbackQueryHandler(cancel_to_menu,  pattern="^cancel_to_menu$"),
             ],
             NOTE_INPUT: [
                 MessageHandler(private & filters.TEXT & ~filters.COMMAND, note_input),
-                CallbackQueryHandler(cancel_to_menu, pattern="^cancel_to_menu$"),
+                CallbackQueryHandler(edit_totp_start, pattern="^edit_totp$"),
+                CallbackQueryHandler(cancel_to_menu,  pattern="^cancel_to_menu$"),
             ],
             SHOW_SECRET_PW: [
                 MessageHandler(private & filters.TEXT & ~filters.COMMAND, show_secret_pw),
-                CallbackQueryHandler(cancel_to_menu, pattern="^cancel_to_menu$"),
+                CallbackQueryHandler(edit_totp_start,  pattern="^edit_totp$"),
+                CallbackQueryHandler(cancel_to_menu,   pattern="^cancel_to_menu$"),
             ],
             CHANGE_PW_OLD: [
                 MessageHandler(private & filters.TEXT & ~filters.COMMAND, change_pw_old),
-                CallbackQueryHandler(cancel_to_menu, pattern="^cancel_to_menu$"),
+                CallbackQueryHandler(settings_security_menu, pattern="^settings_security$"),
+                CallbackQueryHandler(cancel_to_menu,         pattern="^cancel_to_menu$"),
             ],
             CHANGE_PW_NEW: [
                 MessageHandler(private & filters.TEXT & ~filters.COMMAND, change_pw_new),
-                CallbackQueryHandler(cancel_to_menu, pattern="^cancel_to_menu$"),
+                CallbackQueryHandler(settings_security_menu, pattern="^settings_security$"),
+                CallbackQueryHandler(cancel_to_menu,         pattern="^cancel_to_menu$"),
             ],
             CHANGE_PW_CONFIRM: [
                 MessageHandler(private & filters.TEXT & ~filters.COMMAND, change_pw_confirm),
-                CallbackQueryHandler(cancel_to_menu, pattern="^cancel_to_menu$"),
+                CallbackQueryHandler(settings_security_menu, pattern="^settings_security$"),
+                CallbackQueryHandler(cancel_to_menu,         pattern="^cancel_to_menu$"),
             ],
             SETTINGS_RESET_OTP: [
                 MessageHandler(private & filters.TEXT & ~filters.COMMAND, settings_reset_otp),
-                CallbackQueryHandler(cancel_to_menu, pattern="^cancel_to_menu$"),
+                CallbackQueryHandler(settings_security_menu, pattern="^settings_security$"),
+                CallbackQueryHandler(cancel_to_menu,         pattern="^cancel_to_menu$"),
             ],
             SETTINGS_RESET_PW: [
                 MessageHandler(private & filters.TEXT & ~filters.COMMAND, settings_reset_pw_input),
-                CallbackQueryHandler(cancel_to_menu, pattern="^cancel_to_menu$"),
+                CallbackQueryHandler(settings_security_menu, pattern="^settings_security$"),
+                CallbackQueryHandler(cancel_to_menu,         pattern="^cancel_to_menu$"),
             ],
             SETTINGS_RESET_PW_CONFIRM: [
                 MessageHandler(private & filters.TEXT & ~filters.COMMAND, settings_reset_pw_confirm),
-                CallbackQueryHandler(cancel_to_menu, pattern="^cancel_to_menu$"),
+                CallbackQueryHandler(settings_security_menu, pattern="^settings_security$"),
+                CallbackQueryHandler(cancel_to_menu,         pattern="^cancel_to_menu$"),
             ],
             DELETE_ACCOUNT_PASSWORD: [
                 MessageHandler(private & filters.TEXT & ~filters.COMMAND, delete_account_password),
-                CallbackQueryHandler(cancel_to_menu, pattern="^cancel_to_menu$"),
+                CallbackQueryHandler(settings_account_menu, pattern="^settings_account$"),
+                CallbackQueryHandler(cancel_to_menu,        pattern="^cancel_to_menu$"),
             ],
             DELETE_ACCOUNT_CONFIRM: [
                 MessageHandler(private & filters.TEXT & ~filters.COMMAND, delete_account_confirm),
-                CallbackQueryHandler(cancel_to_menu, pattern="^cancel_to_menu$"),
+                CallbackQueryHandler(settings_account_menu, pattern="^settings_account$"),
+                CallbackQueryHandler(main_menu_cb,          pattern="^main_menu$"),
+                CallbackQueryHandler(cancel_to_menu,        pattern="^cancel_to_menu$"),
             ],
             EXPORT_PW1_INPUT: [
                 MessageHandler(private & filters.TEXT & ~filters.COMMAND, export_pw1_input),
-                CallbackQueryHandler(cancel_to_menu, pattern="^cancel_to_menu$"),
+                CallbackQueryHandler(settings_backup_menu, pattern="^settings_backup$"),
+                CallbackQueryHandler(cancel_to_menu,       pattern="^cancel_to_menu$"),
             ],
             EXPORT_PW2_INPUT: [
                 MessageHandler(private & filters.TEXT & ~filters.COMMAND, export_pw2_input),
-                CallbackQueryHandler(cancel_to_menu, pattern="^cancel_to_menu$"),
+                CallbackQueryHandler(settings_backup_menu, pattern="^settings_backup$"),
+                CallbackQueryHandler(cancel_to_menu,       pattern="^cancel_to_menu$"),
             ],
             IMPORT_FILE_WAIT: [
                 MessageHandler(private & filters.Document.ALL, import_file_recv),
-                CallbackQueryHandler(cancel_to_menu, pattern="^cancel_to_menu$"),
+                CallbackQueryHandler(settings_backup_menu, pattern="^settings_backup$"),
+                CallbackQueryHandler(cancel_to_menu,       pattern="^cancel_to_menu$"),
             ],
             IMPORT_PW_INPUT: [
                 MessageHandler(private & filters.TEXT & ~filters.COMMAND, import_pw_input),
-                CallbackQueryHandler(cancel_to_menu, pattern="^cancel_to_menu$"),
+                CallbackQueryHandler(settings_backup_menu, pattern="^settings_backup$"),
+                CallbackQueryHandler(cancel_to_menu,       pattern="^cancel_to_menu$"),
             ],
             IMPORT_OVERRIDE_WAIT: [
                 CallbackQueryHandler(import_override_cb, pattern="^import_mode_(skip|replace)$"),
@@ -8451,7 +8510,8 @@ def main():
             ],
             SECURE_KEY_VIEW_PW: [
                 MessageHandler(private & filters.TEXT & ~filters.COMMAND, view_secure_key_pw),
-                CallbackQueryHandler(cancel_to_menu, pattern="^cancel_to_menu$"),
+                CallbackQueryHandler(settings_security_menu, pattern="^settings_security$"),
+                CallbackQueryHandler(cancel_to_menu,         pattern="^cancel_to_menu$"),
             ],
         },
         fallbacks=[CommandHandler("start", start, filters=private)],
