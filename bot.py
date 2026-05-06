@@ -1750,7 +1750,7 @@ def kb_settings_security():
         [InlineKeyboardButton("🔓 Reset Password",   callback_data="settings_reset_pw")],
         [InlineKeyboardButton("🛡 View Secure Key",  callback_data="view_secure_key")],
         [InlineKeyboardButton("⬅️ Back",             callback_data="settings")],
-        [InlineKeyboardButton("❌ Cancel",            callback_data="main_menu")],
+        [InlineKeyboardButton("🏠 Home",              callback_data="main_menu")],
     ])
 
 def kb_settings_backup():
@@ -1761,7 +1761,7 @@ def kb_settings_backup():
         [InlineKeyboardButton("💾 Offline Auto Backup", callback_data="offline_auto_backup")],
         [InlineKeyboardButton("🔔 Backup Reminder",    callback_data="backup_reminder")],
         [InlineKeyboardButton("⬅️ Back",              callback_data="settings")],
-        [InlineKeyboardButton("❌ Cancel",             callback_data="main_menu")],
+        [InlineKeyboardButton("🏠 Home",               callback_data="main_menu")],
     ])
 
 def kb_settings_account():
@@ -1770,7 +1770,7 @@ def kb_settings_account():
         [InlineKeyboardButton("🚪 Logout",         callback_data="logout")],
         [InlineKeyboardButton("🗑 Delete Account", callback_data="delete_account")],
         [InlineKeyboardButton("⬅️ Back",          callback_data="settings")],
-        [InlineKeyboardButton("❌ Cancel",         callback_data="main_menu")],
+        [InlineKeyboardButton("🏠 Home",           callback_data="main_menu")],
     ])
 
 def kb_cancel():
@@ -1832,7 +1832,7 @@ def build_share_selection_kb(
             f"⚠️ Max {SHARE_MAX_TOTP} allowed ({n_selected} selected)",
             callback_data="share_limit_warn",
         ))
-    action_row.append(InlineKeyboardButton("❌ Cancel", callback_data="share_cancel"))
+    action_row.append(InlineKeyboardButton("⬅️ Back", callback_data="main_menu"))
     buttons.append(action_row)
     return InlineKeyboardMarkup(buttons)
 
@@ -2104,10 +2104,10 @@ async def signup_terms_agreed(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     cap = make_captcha()
     ctx.user_data["captcha_answer"] = cap["answer"]
     choices = cap["choices"]
-    kb = InlineKeyboardMarkup([[
-        InlineKeyboardButton(str(c), callback_data=f"captcha_{c}")
-        for c in choices
-    ]])
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton(str(c), callback_data=f"captcha_{c}") for c in choices],
+        [InlineKeyboardButton("⬅️ Back", callback_data="signup_back_to_terms")],
+    ])
     # Delete the terms message first
     try:
         await q.message.delete()
@@ -2172,10 +2172,10 @@ async def captcha_check(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         cap = make_captcha()
         ctx.user_data["captcha_answer"] = cap["answer"]
         choices = cap["choices"]
-        kb = InlineKeyboardMarkup([[
-            InlineKeyboardButton(str(c), callback_data=f"captcha_{c}")
-            for c in choices
-        ]])
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton(str(c), callback_data=f"captcha_{c}") for c in choices],
+            [InlineKeyboardButton("⬅️ Back", callback_data="signup_back_to_terms")],
+        ])
         try:
             await q.message.delete()
         except Exception:
@@ -2198,6 +2198,26 @@ async def signup_terms_declined(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         reply_markup=kb_auth(),
     )
     return AUTH_MENU
+
+async def signup_back_to_terms(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Back from captcha to terms screen during signup."""
+    q = update.callback_query
+    await q.answer()
+    ctx.user_data.pop("captcha_answer", None)
+    try:
+        await q.message.delete()
+    except Exception:
+        pass
+    await q.message.reply_text(
+        "📜 *Terms of Service*\n\nPlease read our terms before signing up\\.",
+        parse_mode="MarkdownV2",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ I Agree", callback_data="signup_agree")],
+            [InlineKeyboardButton("❌ Decline", callback_data="signup_decline")],
+        ]),
+    )
+    return SIGNUP_TERMS
+
 
 async def signup_pw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     pw = update.message.text.strip()
@@ -2347,10 +2367,10 @@ async def login_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     cap = make_captcha()
     ctx.user_data["login_captcha_answer"] = cap["answer"]
     choices = cap["choices"]
-    kb = InlineKeyboardMarkup([[
-        InlineKeyboardButton(str(c), callback_data=f"login_captcha_{c}")
-        for c in choices
-    ]])
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton(str(c), callback_data=f"login_captcha_{c}") for c in choices],
+        [InlineKeyboardButton("⬅️ Back", callback_data="cancel_to_menu")],
+    ])
     try:
         await q.message.delete()
     except Exception:
@@ -2409,10 +2429,10 @@ async def login_captcha_check(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         cap = make_captcha()
         ctx.user_data["login_captcha_answer"] = cap["answer"]
         choices = cap["choices"]
-        kb = InlineKeyboardMarkup([[
-            InlineKeyboardButton(str(c), callback_data=f"login_captcha_{c}")
-            for c in choices
-        ]])
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton(str(c), callback_data=f"login_captcha_{c}") for c in choices],
+            [InlineKeyboardButton("⬅️ Back", callback_data="cancel_to_menu")],
+        ])
         try:
             await q.message.delete()
         except Exception:
@@ -3158,7 +3178,7 @@ async def settings_reset_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "✅ *OTP sent to your Telegram account\\!*\n\n"
             "Enter the one\\-time code here:",
             parse_mode="MarkdownV2",
-            reply_markup=kb_cancel(),
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="settings_security")]]),
         )
     except Exception as e:
         logger.error(f"Settings reset OTP send failed: {e}")
@@ -3316,7 +3336,7 @@ async def view_secure_key_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "Enter your *account password* to reveal your Secure Key:\n\n"
         "_The Secure Key will auto\\-delete after 60 seconds\\._",
         parse_mode="MarkdownV2",
-        reply_markup=kb_cancel(),
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="settings_security")]]),
     )
     return SECURE_KEY_VIEW_PW
 
@@ -3408,7 +3428,7 @@ async def show_donate(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         body,
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("🏠 Home", callback_data="main_menu")],
+            [InlineKeyboardButton("⬅️ Back", callback_data="settings")],
         ]),
     )
     return TOTP_MENU
@@ -3541,7 +3561,7 @@ async def change_pw_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await q.edit_message_text(
         "🔑 *Change Password*\n\nEnter your *current password:*",
         parse_mode="MarkdownV2",
-        reply_markup=kb_cancel(),
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="settings_security")]]),
     )
     return CHANGE_PW_OLD
 
@@ -3705,7 +3725,7 @@ async def add_totp_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "⌨️ Type `manual` to enter step by step\n\n"
         "_Your message will be auto\\-deleted_",
         parse_mode="MarkdownV2",
-        reply_markup=kb_cancel(),
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="main_menu")]]),
     )
     return ADD_WAITING
 
@@ -3910,7 +3930,7 @@ async def handle_add_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "⌨️ Enter *account name:*",
             parse_mode="MarkdownV2",
-            reply_markup=kb_cancel(),
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="add_totp")]]),
         )
         return ADD_MANUAL_NAME
     result, handled = await _process_input(update, ctx, vault, pw)
@@ -3922,7 +3942,7 @@ async def handle_add_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "⚠️ *Could not recognize input\\.*\n\n"
         "Send: QR image, `otpauth://` URI, Base32 secret, or type `manual`",
         parse_mode="MarkdownV2",
-        reply_markup=kb_cancel(),
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="main_menu")]]),
     )
     return ADD_WAITING
 
@@ -4449,7 +4469,7 @@ async def edit_totp_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             if page < total_pg - 1:
                 nav.append(InlineKeyboardButton("➡️", callback_data=f"edit_pg_{page+1}"))
             kb.append(nav)
-        kb.append([InlineKeyboardButton("❌ Cancel", callback_data="main_menu")])
+        kb.append([InlineKeyboardButton("⬅️ Back", callback_data="main_menu")])
         await q.edit_message_text(
             "✏️ *Edit TOTP* \\-\\- Select account:",
             parse_mode="MarkdownV2",
@@ -4496,7 +4516,7 @@ async def edit_pg_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if page < total_pg - 1:
             nav.append(InlineKeyboardButton("➡️", callback_data=f"edit_pg_{page+1}"))
         kb.append(nav)
-    kb.append([InlineKeyboardButton("❌ Cancel", callback_data="main_menu")])
+    kb.append([InlineKeyboardButton("⬅️ Back", callback_data="main_menu")])
     await q.edit_message_text(
         "✏️ *Edit TOTP* \\-\\- Select account:",
         parse_mode="MarkdownV2",
@@ -4532,7 +4552,7 @@ async def edit_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("🗑 Delete",           callback_data="edit_action_delete")],
             [InlineKeyboardButton("🔍 Show Secret Key", callback_data="edit_action_showsecret")],
             [InlineKeyboardButton("📝 Note",            callback_data="edit_action_note")],
-            [InlineKeyboardButton("❌ Cancel",           callback_data="edit_totp")],
+            [InlineKeyboardButton("⬅️ Back",             callback_data="edit_totp")],
         ]),
     )
     return EDIT_ACTION
@@ -4549,7 +4569,7 @@ async def edit_action(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text(
             "✏️ Enter *new name:*",
             parse_mode="MarkdownV2",
-            reply_markup=kb_cancel(),
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="edit_totp")]]),
         )
         return EDIT_RENAME_INPUT
     elif action == "showsecret":
@@ -4559,7 +4579,7 @@ async def edit_action(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"Account: *{em(name)}*\n\n"
             "🔒 Enter your *account password* to reveal the secret key:",
             parse_mode="MarkdownV2",
-            reply_markup=kb_cancel(),
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="edit_totp")]]),
         )
         return SHOW_SECRET_PW
     elif action == "note":
@@ -4586,7 +4606,10 @@ async def edit_action(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text(
             f"🗑 Delete *{em(name)}*?\n\n_This cannot be undone\\._",
             parse_mode="MarkdownV2",
-            reply_markup=kb_danger("edit_action_delete_confirm", "edit_totp"),
+            reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Confirm", callback_data="edit_action_delete_confirm")],
+            [InlineKeyboardButton("⬅️ Back",   callback_data="edit_totp")],
+        ]),
         )
         return EDIT_ACTION
 
@@ -4742,7 +4765,7 @@ async def export_vault_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await q.edit_message_text(
         "📤 *Export Vault*\n\n*Step 1:* Enter your *account password* to verify:",
         parse_mode="MarkdownV2",
-        reply_markup=kb_cancel(),
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="settings_backup")]]),
     )
     return EXPORT_PW1_INPUT
 async def export_pw1_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -4775,7 +4798,7 @@ async def export_pw1_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "_This password protects the backup file\\.\n"
         "Anyone importing this file will need it\\._",
         parse_mode="MarkdownV2",
-        reply_markup=kb_cancel(),
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="settings_backup")]]),
     )
     return EXPORT_PW2_INPUT
 
@@ -4885,7 +4908,7 @@ async def import_vault_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "_You will need the file's encryption password\\.\n"
         "Works with backups from any user\\._",
         parse_mode="MarkdownV2",
-        reply_markup=kb_cancel(),
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="settings_backup")]]),
     )
     return IMPORT_FILE_WAIT
 
@@ -5083,7 +5106,7 @@ async def delete_account_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "⚠️ *This will permanently delete your account and ALL TOTP data\\.*\n\n"
         "Enter your *current password* to continue:",
         parse_mode="MarkdownV2",
-        reply_markup=kb_cancel(),
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="settings_account")]]),
     )
     return DELETE_ACCOUNT_PASSWORD
 
@@ -5118,7 +5141,10 @@ async def delete_account_password(update: Update, ctx: ContextTypes.DEFAULT_TYPE
         "This action *cannot be undone*\\. All TOTP data will be lost forever\\.\n\n"
         "Type exactly `YES DELETE` to confirm, or tap Cancel:",
         parse_mode="MarkdownV2",
-        reply_markup=kb_cancel(),
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("⬅️ Back", callback_data="settings_account")],
+            [InlineKeyboardButton("🏠 Home", callback_data="main_menu")],
+        ]),
     )
     return DELETE_ACCOUNT_CONFIRM
 
@@ -7782,7 +7808,7 @@ async def offline_auto_backup_menu(update: Update, ctx: ContextTypes.DEFAULT_TYP
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton(toggle_lbl, callback_data="oab_toggle")],
             [InlineKeyboardButton(switch_lbl, callback_data="oab_freq")],
-            [InlineKeyboardButton("⚙️ Settings", callback_data="settings")],
+            [InlineKeyboardButton("⬅️ Back", callback_data="settings_backup")],
             [InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")],
         ]),
     )
@@ -8057,7 +8083,7 @@ async def backup_reminder_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 "📆 Switch to Monthly" if freq == BACKUP_REMINDER_WEEKLY else "📅 Switch to Weekly",
                 callback_data="backup_rem_freq",
             )],
-            [InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")],
+            [InlineKeyboardButton("⬅️ Back", callback_data="settings_backup")],
         ]),
     )
     return TOTP_MENU
@@ -8229,7 +8255,8 @@ def main():
                 CallbackQueryHandler(signup_terms_declined, pattern="^signup_decline$"),
             ],
             CAPTCHA_VERIFY: [
-                CallbackQueryHandler(captcha_check, pattern="^captcha_"),
+                CallbackQueryHandler(captcha_check,        pattern="^captcha_"),
+                CallbackQueryHandler(signup_back_to_terms, pattern="^signup_back_to_terms$"),
             ],
             SIGNUP_PASSWORD: [
                 MessageHandler(private & filters.TEXT & ~filters.COMMAND, signup_pw),
