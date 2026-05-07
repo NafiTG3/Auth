@@ -97,8 +97,7 @@ _bot_settings: dict = {
     "public_import_limit": 3,
     "public_export_enabled": True,
     "public_import_enabled": True,
-    "donate_msg_chat_id": None,
-    "donate_msg_id": None,
+    "donate_message": None,
 }
 
 # ── In-memory session password cache for auto-backup ─────────
@@ -3413,38 +3412,46 @@ DONATE_LINK    = "https://nowpayments.io/donation/antonysrm"
 
 
 async def show_donate(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Donate/support page. Uses admin-set message if available, else default text."""
     q = update.callback_query
     await q.answer()
-    donate_chat_id = _bot_settings.get("donate_msg_chat_id")
-    donate_msg_id  = _bot_settings.get("donate_msg_id")
+
+    raw = _bot_settings.get("donate_message")
+    if raw:
+        try:
+            data = json.loads(raw)
+            text = data.get("text", "No Payments Method Available")
+            entities_list = data.get("entities", [])
+            from telegram import MessageEntity
+            entities = [MessageEntity(**e) for e in entities_list] if entities_list else None
+        except Exception:
+            text = "No Payments Method Available"
+            entities = None
+    else:
+        text = "No Payments Method Available"
+        entities = None
+
+    try:
+        await q.message.delete()
+    except Exception:
+        pass
+
     back_kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("⬅️ Back", callback_data="settings")],
     ])
-    if donate_chat_id and donate_msg_id:
-        try:
-            try:
-                await q.message.delete()
-            except Exception:
-                pass
-            await ctx.bot.copy_message(
-                chat_id=update.effective_chat.id,
-                from_chat_id=int(donate_chat_id),
-                message_id=int(donate_msg_id),
-            )
-            await ctx.bot.send_message(
-                chat_id=update.effective_chat.id,
-                text="​",
-                reply_markup=back_kb,
-            )
-            return TOTP_MENU
-        except Exception as e:
-            logger.warning(f"show_donate copy_message failed: {e}")
-    # Fallback: default message
-    await q.edit_message_text(
-        "No Payments Method Available",
-        reply_markup=back_kb,
-    )
+    try:
+        await ctx.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=text,
+            entities=entities,
+            reply_markup=back_kb,
+        )
+    except Exception:
+        await ctx.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text="No Payments Method Available",
+            reply_markup=back_kb,
+        )
+
     return TOTP_MENU
 
 
@@ -7581,19 +7588,18 @@ async def admin_group_message_handler(update: Update, ctx: ContextTypes.DEFAULT_
         return
 
     if step == "adm_set_donate_msg_wait":
-        # Store the message reference (chat_id + message_id) to copy_message later
-        # This preserves all formatting: bold, italic, hyperlink, spoiler, etc.
         _admin_import_pending.pop(chat_id, None)
+        raw_text = update.message.text or ""
+        entities = update.message.entities
+        entities_data = [e.to_dict() for e in entities] if entities else []
+        donate_json = json.dumps({"text": raw_text, "entities": entities_data})
+        _save_setting("donate_message", donate_json)
         asyncio.create_task(auto_delete_msg(update.message, delay=5))
-        src_chat_id = update.message.chat_id
-        src_msg_id  = update.message.message_id
-        _save_setting("donate_msg_chat_id", str(src_chat_id))
-        _save_setting("donate_msg_id",      str(src_msg_id))
-        msg = await ctx.bot.send_message(
+        success_msg = await ctx.bot.send_message(
             chat_id=chat_id,
-            text="✅ Donate message saved. Users will now see this message when they tap Donate.",
+            text="Donate message saved successfully.",
         )
-        asyncio.create_task(auto_delete_msg(msg, delay=60))
+        asyncio.create_task(auto_delete_msg(success_msg, delay=10))
         return
 
 
