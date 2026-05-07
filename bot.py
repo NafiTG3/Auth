@@ -4409,9 +4409,13 @@ async def handle_share_view(update: Update, token: str):
     entries = []
     for i, (name, enc) in enumerate(zip(names, secrets_enc)):
         try:
-            secret   = share_decrypt_secret(enc, token)
-            code, rm = totp_now(secret)
-            entries.append(f"*{em(name)}*\n`{code}` {bar(rm)} {rm}s")
+            secret             = share_decrypt_secret(enc, token)
+            code, rm, nxt     = generate_code(secret)
+            entries.append(
+                f"*{em(name)}*\n"
+                f"Current Code: `{code}` {bar(rm)} {rm}s\n"
+                f"Next code: `{nxt}`"
+            )
         except Exception as e:
             logger.error(f"Share view decrypt error idx={i}: {e}")
             entries.append(f"*{em(name)}*\n_\\[Unavailable\\]_")
@@ -4433,9 +4437,10 @@ async def handle_share_view(update: Update, token: str):
         suffix   = exp_line if pg_idx == total_pg - 1 else ""
         text     = header + body + suffix
         if pg_idx == total_pg - 1:
-            await update.message.reply_text(text, parse_mode="MarkdownV2", reply_markup=kb)
+            msg = await update.message.reply_text(text, parse_mode="MarkdownV2", reply_markup=kb)
         else:
-            await update.message.reply_text(text, parse_mode="MarkdownV2")
+            msg = await update.message.reply_text(text, parse_mode="MarkdownV2")
+        asyncio.create_task(auto_delete_msg(msg, delay=remaining_s + 5))
 
 # ── EDIT TOTP (FIXED) ───────────────────────────────────────
 async def edit_totp_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
