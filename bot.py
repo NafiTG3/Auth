@@ -4743,10 +4743,10 @@ async def show_secret_pw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ── EXPORT VAULT ────────────────────────────────────────────
 async def export_vault_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
-    await q.answer()
     uid = update.effective_user.id
     vault = get_session(uid)
     if not vault:
+        await q.answer()
         await q.edit_message_text("Session expired\\.", parse_mode="MarkdownV2", reply_markup=kb_auth())
         return AUTH_MENU
     allowed, reason = check_export_allowed(vault)
@@ -4762,6 +4762,7 @@ async def export_vault_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 show_alert=True,
             )
         return TOTP_MENU
+    await q.answer()
     await q.edit_message_text(
         "📤 *Export Vault*\n\n*Step 1:* Enter your *account password* to verify:",
         parse_mode="MarkdownV2",
@@ -4883,10 +4884,10 @@ async def export_pw2_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ── IMPORT VAULT ────────────────────────────────────────────
 async def import_vault_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
-    await q.answer()
     uid = update.effective_user.id
     vault = get_session(uid)
     if not vault:
+        await q.answer()
         await q.edit_message_text("Session expired\\.", parse_mode="MarkdownV2", reply_markup=kb_auth())
         return AUTH_MENU
     allowed, reason = check_import_allowed(vault)
@@ -4902,6 +4903,7 @@ async def import_vault_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 show_alert=True,
             )
         return TOTP_MENU
+    await q.answer()
     await q.edit_message_text(
         "📥 *Import Vault*\n\n"
         "Send your *\\.bvault* backup file\\.\n\n"
