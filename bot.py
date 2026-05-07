@@ -2560,7 +2560,6 @@ def clear_login_failures(vault_id: str):
                 "AND account_disabled=1", (vault_id,)
             )
         c.commit()
-        c.commit()
 
 def is_login_frozen(vault_id: str) -> bool:
     with get_db() as c:
@@ -7762,10 +7761,30 @@ async def admin_group_message_handler(update: Update, ctx: ContextTypes.DEFAULT_
         return
     _admin_import_pending.pop(chat_id, None)
     tables = [
-        "users", "totp_accounts", "sessions", "reset_otps",
-        "reset_attempts", "login_alerts", "share_links",
-        "login_attempts", "backup_reminders", "bot_settings",
+        "users",
+        "totp_accounts",
+        "sessions",
+        "reset_otps",
+        "reset_attempts",
+        "login_alerts",
+        "share_links",
+        "login_attempts",
+        "backup_reminders",
+        "bot_settings",
         "auto_backup_settings",
+        "daily_login_counts",
+        "weekly_signup_counts",
+        "vault_login_history",
+        "totp_add_rate",
+        "vault_custom_limits",
+        "user_signup_disabled",
+        "user_login_disabled",
+        "otp_request_log",
+        "captcha_attempts",
+        "telegram_banned",
+        "stats_events",
+        "vault_ei_limits",
+        "vault_ei_usage",
     ]
     with get_db() as c:
         for tbl in tables:
@@ -8048,7 +8067,7 @@ async def send_auto_backups(app):
     """
     Job callback: check who needs a weekly or monthly auto-backup and send it.
     Weekly:  Every Saturday, BD time 20:00
-    Monthly: First Sunday of month, BD time 18:00
+    Monthly: DEFAULT_OFFLINE_BACKUP_MONTHLY_DATE (default 1st) of month, BD time 20:00
     Runs every 5 minutes; checks if current BDT time is within the target window.
     """
     try:
@@ -8636,7 +8655,7 @@ def main():
 
         jq.run_repeating(
             _reminder_job,
-            interval=86400,
+            interval=300,
             first=60,
             name="backup_reminder_job",
         )
