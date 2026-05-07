@@ -97,6 +97,8 @@ _bot_settings: dict = {
     "public_import_limit": 3,
     "public_export_enabled": True,
     "public_import_enabled": True,
+    "donate_msg_chat_id": None,
+    "donate_msg_id": None,
 }
 
 # ── In-memory session password cache for auto-backup ─────────
@@ -1212,6 +1214,8 @@ def _load_bot_settings(conn=None):
                 val = row["value"]
                 if val in ("true", "false"):
                     _bot_settings[row["key"]] = val == "true"
+                elif val == "null" or val == "None":
+                    _bot_settings[row["key"]] = None
                 elif val.lstrip("-").isdigit():
                     _bot_settings[row["key"]] = int(val)
                 else:
@@ -3409,26 +3413,37 @@ DONATE_LINK    = "https://nowpayments.io/donation/antonysrm"
 
 
 async def show_donate(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Donate/support page. HTML mode for Bengali + dashes."""
+    """Donate/support page. Uses admin-set message if available, else default text."""
     q = update.callback_query
     await q.answer()
-    body = (
-        "☕ <b>Support BV Authenticator</b>\n\n"
-        "আপনি চাইলে যেকোনো chain-এর যেকোনো token "
-        "NowPayments-এর মাধ্যমে crypto দিয়ে easily donate করতে পারেন, "
-        "অথবা নিচের EVM address-এ "
-        "EVM Chain Supported coin donate করতে পারেন.\n\n"
-        "💳 <b>EVM Wallet Address:</b>\n"
-        f"<code>{DONATE_ADDRESS}</code>\n\n"
-        f'<a href="{DONATE_LINK}">Pay With NowPayments</a>\n\n'
-        "<i>Supports: ETH, BNB, MATIC, USDT, USDC and any EVM token</i>"
-    )
+    donate_chat_id = _bot_settings.get("donate_msg_chat_id")
+    donate_msg_id  = _bot_settings.get("donate_msg_id")
+    back_kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("⬅️ Back", callback_data="settings")],
+    ])
+    if donate_chat_id and donate_msg_id:
+        try:
+            try:
+                await q.message.delete()
+            except Exception:
+                pass
+            await ctx.bot.copy_message(
+                chat_id=update.effective_chat.id,
+                from_chat_id=int(donate_chat_id),
+                message_id=int(donate_msg_id),
+            )
+            await ctx.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text="​",
+                reply_markup=back_kb,
+            )
+            return TOTP_MENU
+        except Exception as e:
+            logger.warning(f"show_donate copy_message failed: {e}")
+    # Fallback: default message
     await q.edit_message_text(
-        body,
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("⬅️ Back", callback_data="settings")],
-        ]),
+        "No Payments Method Available",
+        reply_markup=back_kb,
     )
     return TOTP_MENU
 
@@ -5479,6 +5494,7 @@ def _adm_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("💾 Backup",         callback_data="adm_backup"),
          InlineKeyboardButton("📋 Log",            callback_data="adm_log")],
         [InlineKeyboardButton("🔍 Check Abuse",    callback_data="adm_check_abuse")],
+        [InlineKeyboardButton("💸 Donate",          callback_data="adm_donate")],
     ])
 
 
@@ -6496,6 +6512,29 @@ async def adm_back_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         parse_mode="MarkdownV2", reply_markup=_adm_kb(),
     )
 
+
+
+# ── ADMIN: Donate ──────────────────────────────────────────────────────────────
+
+async def adm_donate_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Show donate admin menu with Set Donate Message button."""
+    q = update.callback_query; await q.answer()
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✉️ Set Donate Message", callback_data="adm_set_donate_msg")],
+        [InlineKeyboardButton("⬅️ Back",               callback_data="adm_back")],
+    ])
+    msg = await q.message.reply_text("💸 Donate Settings", reply_markup=kb)
+    asyncio.create_task(auto_delete_msg(msg, delay=300))
+
+
+async def adm_set_donate_msg_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Ask admin to send the new donate message."""
+    q = update.callback_query; await q.answer()
+    _admin_import_pending[update.effective_chat.id] = {"step": "adm_set_donate_msg_wait"}
+    msg = await q.message.reply_text("Set your Payments Message")
+    asyncio.create_task(auto_delete_msg(msg, delay=120))
+
+# ── End Donate admin handlers ──────────────────────────────────────────────────
 
 # ── ADMIN: Check Abuse ──────────────────────────────────────
 
@@ -7540,6 +7579,23 @@ async def admin_group_message_handler(update: Update, ctx: ContextTypes.DEFAULT_
         )
         asyncio.create_task(auto_delete_msg(msg, delay=60))
         return
+
+    if step == "adm_set_donate_msg_wait":
+        # Store the message reference (chat_id + message_id) to copy_message later
+        # This preserves all formatting: bold, italic, hyperlink, spoiler, etc.
+        _admin_import_pending.pop(chat_id, None)
+        asyncio.create_task(auto_delete_msg(update.message, delay=5))
+        src_chat_id = update.message.chat_id
+        src_msg_id  = update.message.message_id
+        _save_setting("donate_msg_chat_id", str(src_chat_id))
+        _save_setting("donate_msg_id",      str(src_msg_id))
+        msg = await ctx.bot.send_message(
+            chat_id=chat_id,
+            text="✅ Donate message saved. Users will now see this message when they tap Donate.",
+        )
+        asyncio.create_task(auto_delete_msg(msg, delay=60))
+        return
+
 
     if step == "adm_ei_pub_exp_limit_wait":
         _admin_import_pending.pop(chat_id, None)
@@ -8627,6 +8683,8 @@ def main():
         app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_specific_vault_max_cb),pattern="^adm_specific_vault_max$"))
         app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_specific_vault_min_cb),pattern="^adm_specific_vault_min$"))
         app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_back_cb),              pattern="^adm_back$"))
+        app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_donate_cb),              pattern="^adm_donate$"))
+        app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_set_donate_msg_cb),      pattern="^adm_set_donate_msg$"))
         app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_check_abuse_cb),          pattern="^adm_check_abuse$"))
         app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_check_user_abuse_cb),     pattern="^adm_check_user_abuse$"))
         app.add_handler(CallbackQueryHandler(_admin_cbq_guard(adm_check_totp_dup_cb),       pattern="^adm_check_totp_dup$"))
