@@ -4999,18 +4999,18 @@ async def import_pw_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "SELECT COUNT(*) AS n FROM totp_accounts WHERE vault_id=?", (vault,)
         ).fetchone()["n"]
     available_slots = eff_max - current_count
-    if available_slots <= 0:
+    if available_slots <= 0 or file_total > available_slots:
         await update.message.reply_text(
-            f"❌ আপনার এই file-এ total {file_total} TOTP আছে কিন্তু আপনার vault Max TOTP limit "
-            f"{eff_max}, তাই import করা যাচ্ছে না।",
-            reply_markup=kb_main(),
-        )
-        return TOTP_MENU
-    if file_total > available_slots:
-        await update.message.reply_text(
-            f"❌ আপনার এই file-এ total {file_total} TOTP আছে কিন্তু আপনার vault-এ মাত্র "
-            f"{available_slots} টি জায়গা আছে (limit: {eff_max}, current: {current_count}), "
-            f"তাই import করা যাচ্ছে না।",
+            f"Import Failed : Vault Limit Exceeded\n\n"
+            f"You're trying to import {file_total:,} TOTPs, but you only have {available_slots:,} free slots in your vault.\n\n"
+            f"Your Vault Details :\n"
+            f"- Total Capacity : {eff_max:,} TOTPs\n"
+            f"- Currently Used : {current_count:,} TOTPs\n"
+            f"- Available Space : {available_slots:,} TOTPs\n\n"
+            f"What you can do :\n\n"
+            f"1. Remove Some TOTPs from your Vault or import a file with up to {available_slots:,} TOTPs.\n"
+            f"2. Contact the Support Team to request a limit increase.\n"
+            f"3. Upgrade to Premium for more storage",
             reply_markup=kb_main(),
         )
         return TOTP_MENU
