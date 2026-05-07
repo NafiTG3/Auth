@@ -9,6 +9,7 @@ from telegram.ext import (
     ApplicationBuilder, CommandHandler, CallbackQueryHandler,
     MessageHandler, ConversationHandler, ContextTypes, filters
 )
+from utils import SlidingWindowRateLimiter, RateLimitedRetrySender
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -3430,30 +3431,29 @@ async def show_donate(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         text = "No Payments Method Available"
         entities = None
 
-    try:
-        await q.message.delete()
-    except Exception:
-        pass
-
     back_kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("⬅️ Back", callback_data="settings")],
     ])
+
     try:
+        await q.edit_message_text(
+            text=text,
+            entities=entities,
+            reply_markup=back_kb,
+        )
+    except Exception:
+        try:
+            await q.message.delete()
+        except Exception:
+            pass
         await ctx.bot.send_message(
             chat_id=update.effective_chat.id,
             text=text,
             entities=entities,
             reply_markup=back_kb,
         )
-    except Exception:
-        await ctx.bot.send_message(
-            chat_id=update.effective_chat.id,
-            text="No Payments Method Available",
-            reply_markup=back_kb,
-        )
 
     return TOTP_MENU
-
 
 async def settings_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -6780,6 +6780,12 @@ async def admin_user_info(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # managed via the Dashboard Backup button (adm_backup_cb and sub-callbacks).
 
 # Admin pending state dict (kept here for reference by all step handlers)
+# Global rate limiter: max 28 API calls per second (Telegram limit is 30, keep 2 buffer)
+outbound_limiter = SlidingWindowRateLimiter(max_calls=28)
+# Retry sender with rate limiting and up to 3 retries on flood/network errors
+retry_sender = RateLimitedRetrySender(outbound_limiter, max_retries=3)
+
+
 _admin_import_pending: dict = {}   # chat_id -> {step: str, ...}
 
 async def admin_group_message_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -6809,7 +6815,7 @@ async def admin_group_message_handler(update: Update, ctx: ContextTypes.DEFAULT_
         for row in users:
             tid = row["telegram_id"]
             try:
-                await update.message.copy(chat_id=tid)
+                await retry_sender.send(update.message.copy, chat_id=tid)
                 sent += 1
             except Exception:
                 failed += 1
@@ -6833,7 +6839,8 @@ async def admin_group_message_handler(update: Update, ctx: ContextTypes.DEFAULT_
             content_bytes = (header + lines_txt + "\n").encode("utf-8")
             bio           = BytesIO(content_bytes)
             bio.name      = "broadcast_failed_ids.txt"
-            await ctx.bot.send_document(
+            await retry_sender.send(
+                ctx.bot.send_document,
                 chat_id=chat_id,
                 document=bio,
                 filename="broadcast_failed_ids.txt",
@@ -8003,7 +8010,8 @@ async def run_auto_backup_for_user(bot, tid: int, vault_id: str, freq_label: str
             except Exception:
                 bd_now = datetime.datetime.utcnow() + datetime.timedelta(hours=6)
             bd_str = bd_now.strftime("%d %b %Y, %I:%M %p (BDT)")
-            await bot.send_message(
+            await retry_sender.send(
+                bot.send_message,
                 chat_id=tid,
                 text=(
                     "💾 *Auto Backup \\— Action Required*\n\n"
@@ -8085,7 +8093,8 @@ async def run_auto_backup_for_user(bot, tid: int, vault_id: str, freq_label: str
 
         AUTO_DELETE_SECONDS = 3 * 24 * 3600   # 3 days
 
-        msg = await bot.send_document(
+        msg = await retry_sender.send(
+            bot.send_document,
             chat_id=tid,
             document=bio,
             filename=filename,
@@ -8298,7 +8307,8 @@ async def send_backup_reminders(app):
             continue
         tid = row["telegram_id"]
         try:
-            await app.bot.send_message(
+            await retry_sender.send(
+                app.bot.send_message,
                 chat_id=tid,
                 text=(
                     "🔔 *Backup Reminder*\n\n"
